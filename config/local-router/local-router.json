@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "providers": [
+    {
+      "id": "local-router",
+      "displayName": "Local Router (OpenAI-compatible)",
+      "kind": "openai-compatible",
+      "protocol": "openai-responses",
+      "ownedBy": "local",
+      "baseUrl": "http://127.0.0.1:15721/v1",
+      "baseUrlEnv": "MODEL_ROUTER_LOCAL_OPENAI_BASE_URL",
+      "keyless": true,
+      "planNote": "Runs through the OpenAI-compatible service on this machine."
+    }
+  ]
+}
