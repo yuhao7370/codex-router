@@ -541,6 +541,7 @@ for (const provider of PROVIDERS.values()) {
   const session = cliSessionDescriptor(provider);
   const credentialType = credentialLabel(provider);
   const credentialNoun = credentialType === "API key" ? "key" : credentialType.toLowerCase();
+  const ollamaLocal = provider.id === "local";
   // A keyless provider has no key to name, so calling its row a "key" and
   // telling the operator to run `provider-key` sends them at a command that
   // refuses them. What decides whether it works is its local runtime.
@@ -551,7 +552,9 @@ for (const provider of PROVIDERS.values()) {
       : `${provider.displayName} ${credentialNoun}`,
     status.configured ? status.source : "not configured",
     provider.keyless
-      ? "Start Ollama, then run ./bin/control local-models list."
+      ? ollamaLocal
+        ? "Start Ollama, then run ./bin/control local-models list."
+        : `Start ${provider.displayName} at ${provider.baseUrl}.`
       : session
         ? `Run ${session.loginCommand}, or ./bin/provider-key ${provider.id} set.`
         : `Run ./bin/provider-key ${provider.id} set.`,
@@ -570,12 +573,16 @@ for (const provider of PROVIDERS.values()) {
       "warn",
       `${provider.displayName} models`,
       provider.keyless
-        ? "no local models are checked, so the picker stays empty"
+        ? ollamaLocal
+          ? "no local models are checked, so the picker stays empty"
+          : "no models curated; the picker stays empty"
         : `${credentialNoun} stored but no models curated; the picker stays empty`,
       // Local models are downloaded and checked, never curated from a remote
       // catalog, so naming `curate-models` here points at the wrong command.
       provider.keyless
-        ? `Download one with ./bin/control local-models install <tag>, then check it with ./bin/control local-models set <tag> on.`
+        ? ollamaLocal
+          ? `Download one with ./bin/control local-models install <tag>, then check it with ./bin/control local-models set <tag> on.`
+          : `Run ./bin/curate-models ${provider.id} in an interactive terminal.`
         : `Run ./bin/curate-models ${provider.id} in an interactive terminal.`,
     );
   }

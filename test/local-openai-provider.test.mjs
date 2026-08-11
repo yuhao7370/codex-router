@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -73,4 +73,32 @@ test("local-router uses the Responses forwarder while local stays on Ollama", ()
   assert.match(rendered, /os\.environ\/CODEX_ROUTER_API_FORWARD_BASE_URL/);
   assert.doesNotMatch(rendered, /ollama_chat\/deepseek-v4-flash/);
   assert.match(rendered, /ollama_chat\/llama3\.2:3b/);
+});
+
+test("doctor sends catalog-only local-router users to curation instead of Ollama", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "local-router-doctor-test-"));
+  writeFileSync(
+    path.join(directory, "enabled-providers.json"),
+    JSON.stringify({ version: 1, providers: ["local-router"] }),
+  );
+  try {
+    const result = spawnSync(process.execPath, [path.join(root, "src", "doctor.mjs"), "--json"], {
+      cwd: root,
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        CODEX_HOME: path.join(directory, "codex-home"),
+        MODEL_ROUTER_STATE_DIR: directory,
+      },
+    });
+    const report = JSON.parse(result.stdout);
+    const check = report.checks.find(
+      (entry) => entry.name === "Local Router (OpenAI-compatible) models",
+    );
+    assert.ok(check);
+    assert.match(check.fix, /curate-models local-router/);
+    assert.doesNotMatch(check.fix, /Ollama|local-models install/);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
