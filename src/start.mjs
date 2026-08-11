@@ -16,6 +16,7 @@ import {
 } from "./paths.mjs";
 import { waitForHealth as pollHealth } from "./health-probe.mjs";
 import { writeLiteLlmConfig } from "./litellm-config.mjs";
+import { nativeProxyEnvironment } from "./native-proxy.mjs";
 
 const litellm =
   process.env.MODEL_ROUTER_LITELLM_BIN ||
@@ -179,7 +180,11 @@ async function main() {
 
   const frontend = FRONTEND;
   const frontendService = frontend.service;
-  const router = run(process.execPath, [path.join(SOURCE_ROOT, "src", frontend.script)]);
+  const router = run(
+    process.execPath,
+    [path.join(SOURCE_ROOT, "src", frontend.script)],
+    nativeProxyEnvironment(),
+  );
   await waitForHealth(
     frontend.label,
     loopback(PORTS.router, "/health"),
