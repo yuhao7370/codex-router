@@ -36,6 +36,22 @@ function vbsEscape(value) {
   return String(value).replaceAll('"', '""');
 }
 
+function nativeProxyUrl() {
+  const value = process.env.CODEX_ROUTER_NATIVE_PROXY_URL || "http://127.0.0.1:7897";
+  let parsed;
+  try {
+    parsed = new URL(value);
+  } catch {
+    return value;
+  }
+  if (parsed.username || parsed.password) {
+    throw new Error(
+      "CODEX_ROUTER_NATIVE_PROXY_URL must not include username or password credentials.",
+    );
+  }
+  return value;
+}
+
 function wrapper() {
   const start = path.join(SOURCE_ROOT, "src", "start.mjs");
   const variables = {
@@ -53,8 +69,7 @@ function wrapper() {
     CODEX_ROUTER_OAUTH_PORT: String(PORTS.oauth),
     CODEX_ROUTER_PORT: String(PORTS.router),
     CODEX_ROUTER_API_PORT: String(PORTS.api),
-    CODEX_ROUTER_NATIVE_PROXY_URL:
-      process.env.CODEX_ROUTER_NATIVE_PROXY_URL || "http://127.0.0.1:7897",
+    CODEX_ROUTER_NATIVE_PROXY_URL: nativeProxyUrl(),
     CODEX_ROUTER_NATIVE_RETRIES: process.env.CODEX_ROUTER_NATIVE_RETRIES || "5",
     CODEX_ROUTER_NATIVE_RETRY_BACKOFF_MS:
       process.env.CODEX_ROUTER_NATIVE_RETRY_BACKOFF_MS || "100",

@@ -16,7 +16,7 @@ import {
 } from "./paths.mjs";
 import { waitForHealth as pollHealth } from "./health-probe.mjs";
 import { writeLiteLlmConfig } from "./litellm-config.mjs";
-import { nativeProxyEnvironment } from "./native-proxy.mjs";
+import { nativeProxyEnvironmentForChild } from "./native-proxy.mjs";
 
 const litellm =
   process.env.MODEL_ROUTER_LITELLM_BIN ||
@@ -93,10 +93,10 @@ const commonEnv = {
 const children = [];
 let shuttingDown = false;
 
-function run(command, args, extraEnv = {}) {
+function run(command, args) {
   const child = spawn(command, args, {
     cwd: SOURCE_ROOT,
-    env: { ...process.env, ...commonEnv, ...extraEnv },
+    env: { ...process.env, ...commonEnv, ...nativeProxyEnvironmentForChild(args[0]) },
     stdio: "inherit",
   });
   children.push(child);
@@ -180,11 +180,7 @@ async function main() {
 
   const frontend = FRONTEND;
   const frontendService = frontend.service;
-  const router = run(
-    process.execPath,
-    [path.join(SOURCE_ROOT, "src", frontend.script)],
-    nativeProxyEnvironment(),
-  );
+  const router = run(process.execPath, [path.join(SOURCE_ROOT, "src", frontend.script)]);
   await waitForHealth(
     frontend.label,
     loopback(PORTS.router, "/health"),

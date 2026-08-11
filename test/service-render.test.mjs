@@ -113,6 +113,59 @@ test("background service definitions render for macOS, Linux, and Windows", () =
   }
 });
 
+test("the Windows service preserves an explicit credential-free native proxy", () => {
+  const testRoot = mkdtempSync(path.join(os.tmpdir(), "codex-router-proxy-override-"));
+  try {
+    const windows = serviceCommand(
+      "service-windows.mjs",
+      "win32",
+      testRoot,
+      "render",
+      "codex",
+      root,
+      { CODEX_ROUTER_NATIVE_PROXY_URL: "http://proxy.internal:7897" },
+    );
+    assert.match(
+      windows,
+      /set "CODEX_ROUTER_NATIVE_PROXY_URL=http:\/\/proxy\.internal:7897"/,
+    );
+  } finally {
+    rmSync(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("the Windows service refuses to persist native proxy credentials", () => {
+  const testRoot = mkdtempSync(path.join(os.tmpdir(), "codex-router-proxy-credentials-"));
+  try {
+    for (const proxy of [
+      "http://proxy-user@proxy.internal:7897",
+      "http://:proxy-pass@proxy.internal:7897",
+    ]) {
+      const result = spawnSync(
+        process.execPath,
+        [path.join(root, "src", "service-windows.mjs"), "render"],
+        {
+          cwd: root,
+          encoding: "utf8",
+          env: {
+            ...serviceEnv("win32", testRoot),
+            CODEX_ROUTER_NATIVE_PROXY_URL: proxy,
+          },
+        },
+      );
+      assert.notEqual(result.status, 0);
+      assert.match(
+        result.stderr,
+        /CODEX_ROUTER_NATIVE_PROXY_URL must not include username or password credentials/,
+      );
+      assert.equal(result.stdout, "");
+      assert.doesNotMatch(result.stderr, /proxy-user|proxy-pass/);
+    }
+  } finally {
+    rmSync(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("packaged services preserve wrapper and PATH values with service-safe quoting", () => {
   const testRoot = mkdtempSync(path.join(os.tmpdir(), "codex-router-packaged-service-"));
   const stableRoot = path.join(testRoot, "opt % router", "libexec");
