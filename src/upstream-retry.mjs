@@ -15,20 +15,19 @@
 // single retry. Retrying after partial output would duplicate the stream.
 
 const DEFAULT_RETRIES = 2;
-const DEFAULT_BACKOFF_MS = 250;
-// Backoff grows 250ms -> 750ms, so two retries add at most one second of
-// waiting to a request that was going to fail anyway. Codex retries roughly
-// five times on its own and the two loops multiply, so the router's share has
-// to stay small enough that the product is still a fast failure.
+const DEFAULT_BACKOFF_MS = 100;
+// Backoff grows 100ms -> 300ms; every individual wait is capped below so a
+// retryable native request stays bounded even when the retry count is raised.
 const BACKOFF_FACTOR = 3;
 // Retry only while the request has been cheap so far. Most of the retryable
 // failures below arrive in milliseconds, but two do not: a 504 the edge spent
 // half a minute producing, and a connect timeout. Tripling either turns a slow
 // failure into a hang, which is worse than the 503 this exists to absorb.
-const DEFAULT_BUDGET_MS = 5_000;
-const MAX_RETRIES = 5;
+const DEFAULT_BUDGET_MS = 60_000;
+const MAX_RETRIES = 20;
 const MAX_BACKOFF_MS = 5_000;
 const MAX_BUDGET_MS = 60_000;
+const MAX_RETRY_DELAY_MS = 3_000;
 const MAX_CAUSE_DEPTH = 8;
 
 function clampedInteger(raw, fallback, min, max) {
@@ -196,11 +195,18 @@ export async function fetchWithRetry(target, init = {}, options = {}) {
     if (signal?.aborted || canRetry?.() === false) {
       return settle(response, failure, attempt);
     }
-    // This attempt was not cheap, so the failure was not the fast one a retry
-    // absorbs. Relay it rather than spending the same time again.
-    if (now() - startedAt >= budgetMs) return settle(response, failure, attempt);
+    // Keep the final upstream response relayable when the schedule cannot fit
+    // another retry. Check before cancelling its body.
+    const elapsedMs = now() - startedAt;
+    const remainingMs = Math.max(0, budgetMs - elapsedMs);
+    if (remainingMs === 0) return settle(response, failure, attempt);
+    const delayMs = Math.min(
+      backoffMs * BACKOFF_FACTOR ** attempt,
+      MAX_RETRY_DELAY_MS,
+      remainingMs,
+    );
+    if (!(delayMs < remainingMs)) return settle(response, failure, attempt);
     await discardBody(response);
-    const delayMs = backoffMs * BACKOFF_FACTOR ** attempt;
     attempt += 1;
     onRetry?.({
       attempt,

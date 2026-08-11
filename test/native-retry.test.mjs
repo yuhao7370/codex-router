@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import http from "node:http";
 import os from "node:os";
@@ -161,6 +161,58 @@ test("only a Cloudflare-marked HTML 403 is retryable", () => {
   assert.equal(isRetryableResponse(response("text/html", undefined)), false);
   assert.equal(isRetryableResponse(new Response("error", { status: 500 })), false);
   assert.equal(isRetryableResponse(new Response("edge", { status: 503 })), true);
+});
+
+test("twenty retries permit a successful twenty-first attempt", async () => {
+  let attempts = 0;
+  const result = await fetchWithRetry("https://native.invalid", {}, {
+    retries: 20,
+    backoffMs: 0,
+    budgetMs: 60_000,
+    fetchImpl: async () => new Response("edge", { status: attempts++ < 20 ? 503 : 200 }),
+  });
+  assert.equal(result.response.status, 200);
+  assert.equal(attempts, 21);
+  assert.equal(result.retries, 20);
+});
+
+test("retry sleeps are capped at three seconds and stay inside the remaining budget", async () => {
+  let clock = 0;
+  let calls = 0;
+  const delays = [];
+  const result = await fetchWithRetry("https://native.invalid", {}, {
+    retries: 20,
+    backoffMs: 100,
+    budgetMs: 10_000,
+    now: () => clock,
+    sleepImpl: async (delay) => {
+      delays.push(delay);
+      clock += delay;
+    },
+    fetchImpl: async () => {
+      calls += 1;
+      return new Response("edge", { status: 503 });
+    },
+  });
+  assert.deepEqual(delays, [100, 300, 900, 2_700, 3_000]);
+  assert.equal(Math.max(...delays), 3_000);
+  assert.equal(delays.reduce((sum, delay) => sum + delay, 0), 7_000);
+  assert.equal(calls, 6);
+  assert.equal(result.response.status, 503);
+});
+
+test("native retry configuration accepts twenty retries", () => {
+  const result = spawnSync(
+    process.execPath,
+    ["--input-type=module", "-e", "import('./src/upstream-retry.mjs').then(m=>console.log(m.NATIVE_RETRY_LIMIT))"],
+    {
+      cwd: root,
+      encoding: "utf8",
+      env: { ...process.env, CODEX_ROUTER_NATIVE_RETRIES: "20" },
+    },
+  );
+  assert.equal(result.status, 0);
+  assert.equal(result.stdout.trim(), "20");
 });
 
 // The reported failure: ChatGPT's edge answers a native turn with a 503 whose
