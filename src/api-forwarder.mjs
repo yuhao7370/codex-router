@@ -519,11 +519,13 @@ function upstreamHeaders(requestHeaders, body, apiKey, provider, extraHeaders = 
     }
     if (value !== undefined) headers[name] = Array.isArray(value) ? value.join(", ") : value;
   }
-  if (provider.protocol === "anthropic") {
-    headers["x-api-key"] = apiKey;
-    headers["anthropic-version"] ||= "2023-06-01";
-  } else {
-    headers.Authorization = `Bearer ${apiKey}`;
+  if (!provider.keyless) {
+    if (provider.protocol === "anthropic") {
+      headers["x-api-key"] = apiKey;
+      headers["anthropic-version"] ||= "2023-06-01";
+    } else {
+      headers.Authorization = `Bearer ${apiKey}`;
+    }
   }
   headers["User-Agent"] = `codex-router/${VERSION}`;
   headers["Accept-Encoding"] = "identity";

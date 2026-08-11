@@ -1553,6 +1553,84 @@ function curatedCopilotModel() {
   return { dir, file, gatewayModel: "github-copilot-gpt-test" };
 }
 
+function curatedLocalRouterModel() {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "routing-local-router-models-"));
+  const file = path.join(dir, "user-models.json");
+  writeFileSync(
+    file,
+    JSON.stringify({
+      version: 1,
+      models: [
+        {
+          slug: "local-router/deepseek-v4-pro",
+          gatewayModel: "local-router-deepseek-v4-pro",
+          upstreamModel: "deepseek-v4-pro",
+          provider: "local-router",
+          listed: true,
+          displayName: "DeepSeek V4 Pro (local router)",
+          description: "Test fixture.",
+          priority: 500,
+          defaultEffort: "high",
+          reasoningLevels: [{ effort: "high", description: "Adaptive reasoning" }],
+          contextWindow: 131072,
+          autoCompact: 110000,
+          inputModalities: ["text"],
+          compHash: "local-router-deepseek-v4-pro-user-v1",
+        },
+      ],
+    }),
+    "utf8",
+  );
+  return { dir, file, gatewayModel: "local-router-deepseek-v4-pro" };
+}
+
+test("API forwarder sends no provider authorization to a keyless local router", async () => {
+  let upstreamHeaders;
+  const upstream = await mockServer(async (request, response) => {
+    upstreamHeaders = request.headers;
+    await bodyJson(request);
+    json(response, 200, {
+      id: "resp_local",
+      object: "response",
+      status: "completed",
+      model: "deepseek-v4-pro",
+      output: [],
+    });
+  });
+  const curated = curatedLocalRouterModel();
+  const forwarderPort = await openPort();
+  const forwarder = run("api-forwarder.mjs", {
+    CODEX_ROUTER_API_PORT: String(forwarderPort),
+    MODEL_ROUTER_USER_MODELS: curated.file,
+    MODEL_ROUTER_LOCAL_OPENAI_BASE_URL: `http://127.0.0.1:${upstream.port}/v1`,
+    CODEX_ROUTER_QUIET: "1",
+  });
+
+  try {
+    await waitFor(`http://127.0.0.1:${forwarderPort}/health`, forwarder, {
+      Authorization: `Bearer ${INTERNAL_KEY}`,
+    });
+    const response = await fetch(`http://127.0.0.1:${forwarderPort}/v1/responses`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${INTERNAL_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: `responses/${curated.gatewayModel}`,
+        input: "hello",
+      }),
+    });
+    assert.equal(response.status, 200, forwarder.testErrors());
+    assert.equal(upstreamHeaders.authorization, undefined);
+    assert.equal(upstreamHeaders["x-api-key"], undefined);
+  } finally {
+    await stopChild(forwarder);
+    await closeServer(upstream.server);
+    rmSync(curated.dir, { recursive: true, force: true });
+  }
+});
+
 test("API forwarder validates Copilot auth, sets identity headers, and retries routing once", async () => {
   const userRequests = [];
   const upstreamRequests = [];

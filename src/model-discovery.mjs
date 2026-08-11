@@ -30,7 +30,10 @@ export function modelIds(payload, provider) {
         item.supported_endpoints.includes("/responses")
       )
     : data;
-  return [...new Set(candidates.map((item) => String(item?.id || "").trim()).filter(Boolean))].sort();
+  const visible = provider?.id === "local-router"
+    ? candidates.filter((item) => !String(item?.id || "").startsWith("anthropic/"))
+    : candidates;
+  return [...new Set(visible.map((item) => String(item?.id || "").trim()).filter(Boolean))].sort();
 }
 
 async function providerPayload(provider) {
@@ -39,9 +42,11 @@ async function providerPayload(provider) {
   const credential = resolveProviderCredential(provider);
   if (!credential) throw new Error(credentialStatus(provider).setup);
   let baseUrl = String(process.env[provider.baseUrlEnv] || provider.baseUrl).replace(/\/+$/, "");
-  let headers = provider.protocol === "anthropic"
-    ? { "x-api-key": credential.value, "anthropic-version": "2023-06-01" }
-    : { Authorization: `Bearer ${credential.value}` };
+  let headers = provider.keyless
+    ? {}
+    : provider.protocol === "anthropic"
+      ? { "x-api-key": credential.value, "anthropic-version": "2023-06-01" }
+      : { Authorization: `Bearer ${credential.value}` };
   if (provider.authProfile === "github-copilot") {
     const session = await ensureFreshGitHubCopilotSession(credential.value);
     if (!process.env[provider.baseUrlEnv]) baseUrl = session.baseUrl;

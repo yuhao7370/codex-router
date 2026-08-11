@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -8,7 +9,18 @@ import { fileURLToPath } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const { PROVIDERS } = await import("../src/model-registry.mjs");
-const { modelIds } = await import("../src/model-discovery.mjs");
+const { discoverProviderModels, modelIds } = await import("../src/model-discovery.mjs");
+
+async function localServer(handler) {
+  const server = http.createServer(handler);
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  const address = server.address();
+  assert.ok(typeof address === "object" && address);
+  return { server, port: address.port };
+}
 
 test("model discovery compares fixtures without needing or exposing a key", () => {
   const testRoot = mkdtempSync(path.join(os.tmpdir(), "codex-router-discovery-"));
@@ -123,4 +135,31 @@ test("Copilot discovery exposes only account-enabled Responses models with tools
     ],
   };
   assert.deepEqual(modelIds(payload, PROVIDERS.get("github-copilot")), ["gpt-responses"]);
+});
+
+test("local-router discovery is unauthenticated and drops anthropic aliases", async () => {
+  let headers;
+  const local = await localServer((request, response) => {
+    headers = request.headers;
+    response.writeHead(200, { "Content-Type": "application/json" });
+    response.end(JSON.stringify({
+      object: "list",
+      data: [
+        { id: "deepseek-v4-pro", object: "model" },
+        { id: "anthropic/deepseek-v4-pro", object: "model" },
+      ],
+    }));
+  });
+  const previous = process.env.MODEL_ROUTER_LOCAL_OPENAI_BASE_URL;
+  process.env.MODEL_ROUTER_LOCAL_OPENAI_BASE_URL = `http://127.0.0.1:${local.port}/v1`;
+  try {
+    const result = await discoverProviderModels("local-router");
+    assert.deepEqual(result.unregistered, ["deepseek-v4-pro"]);
+    assert.equal(headers.authorization, undefined);
+    assert.equal(headers["x-api-key"], undefined);
+  } finally {
+    if (previous === undefined) delete process.env.MODEL_ROUTER_LOCAL_OPENAI_BASE_URL;
+    else process.env.MODEL_ROUTER_LOCAL_OPENAI_BASE_URL = previous;
+    await new Promise((resolve) => local.server.close(resolve));
+  }
 });
