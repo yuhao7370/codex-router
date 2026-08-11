@@ -267,6 +267,74 @@ test("a native 503 that outlives the retry bound is relayed unchanged", async ()
   }
 });
 
+test("five native retries can rescue the sixth attempt", async () => {
+  let attempts = 0;
+  const native = await mockServer((_request, response) => {
+    attempts += 1;
+    response.writeHead(attempts <= 5 ? 503 : 200, {
+      "Content-Type": "application/json",
+    });
+    response.end(JSON.stringify(attempts <= 5
+      ? { error: { message: EDGE_503_BODY } }
+      : { id: "resp-sixth-attempt", output: [] }));
+  });
+  const stateDir = stateDirectory();
+  const routerPort = await openPort();
+  const router = startRouter({
+    nativePort: native.port,
+    routerPort,
+    stateDir,
+    retries: 5,
+    backoffMs: 1,
+  });
+  try {
+    await waitFor(`${routerBase(routerPort)}/models`, router);
+    const result = await fetch(`${routerBase(routerPort)}/responses`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: "gpt-5.6-sol", input: [] }),
+    });
+    assert.equal(result.status, 200);
+    assert.equal(attempts, 6);
+  } finally {
+    await stopChild(router);
+    await closeServer(native.server);
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("a native 403 is not retried even when five retries are configured", async () => {
+  let attempts = 0;
+  const native = await mockServer((_request, response) => {
+    attempts += 1;
+    response.writeHead(403, { "Content-Type": "text/html" });
+    response.end("<html>forbidden</html>");
+  });
+  const stateDir = stateDirectory();
+  const routerPort = await openPort();
+  const router = startRouter({
+    nativePort: native.port,
+    routerPort,
+    stateDir,
+    retries: 5,
+    backoffMs: 1,
+  });
+  try {
+    await waitFor(`${routerBase(routerPort)}/models`, router);
+    const result = await fetch(`${routerBase(routerPort)}/responses`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: "gpt-5.6-sol", input: [] }),
+    });
+    assert.equal(result.status, 403);
+    assert.equal(attempts, 1);
+  } finally {
+    await stopChild(router);
+    await closeServer(native.server);
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
 // The constraint that must never break. Once any byte is on the wire the
 // request is no longer replayable: a retry would append a second response to a
 // stream the client is already reading.
