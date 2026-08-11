@@ -7,7 +7,7 @@
       "upstreamModel": "deepseek-v4-flash",
       "provider": "deepseek",
       "listed": true,
-      "displayName": "DeepSeek V4 Flash (API)",
+      "displayName": "DeepSeek V4 Flash (Official)",
       "description": "DeepSeek V4 Flash via the DeepSeek API; fast reasoning, tool calls, and a 1M context window.",
       "priority": 6,
       "defaultEffort": "high",

@@ -7,7 +7,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const { PROVIDERS } = await import("../src/model-registry.mjs");
+const { MODEL_BY_SLUG, PROVIDERS } = await import("../src/model-registry.mjs");
 
 function userModel(provider, upstreamModel) {
   const gatewayModel = `${provider}-${upstreamModel}`;
@@ -101,4 +101,16 @@ test("doctor sends catalog-only local-router users to curation instead of Ollama
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
+});
+
+test("official DeepSeek routes are labeled Official", () => {
+  assert.equal(PROVIDERS.get("deepseek").displayName, "DeepSeek Official API");
+  assert.equal(
+    MODEL_BY_SLUG.get("deepseek/deepseek-v4-flash").displayName,
+    "DeepSeek V4 Flash (Official)",
+  );
+  assert.equal(
+    MODEL_BY_SLUG.get("deepseek/deepseek-v4-pro").displayName,
+    "DeepSeek V4 Pro (Official)",
+  );
 });

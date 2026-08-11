@@ -3,7 +3,7 @@
   "providers": [
     {
       "id": "deepseek",
-      "displayName": "DeepSeek API",
+      "displayName": "DeepSeek Official API",
       "kind": "openai-compatible",
       "ownedBy": "deepseek",
       "baseUrl": "https://api.deepseek.com",
