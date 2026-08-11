@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url";
 import { zstdDecompressSync } from "node:zlib";
 
 import { callerBaseUrl } from "../src/caller-auth.mjs";
-import { fetchWithRetry } from "../src/upstream-retry.mjs";
+import { fetchWithRetry, isRetryableResponse } from "../src/upstream-retry.mjs";
 import { openPort } from "./port-pool.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -146,6 +146,22 @@ function startRouter({ nativePort, routerPort, stateDir, backoffMs = 20, retries
 function stateDirectory() {
   return mkdtempSync(path.join(os.tmpdir(), "native-retry-state-"));
 }
+
+test("only a Cloudflare-marked HTML 403 is retryable", () => {
+  const response = (contentType, cfRay) => new Response("blocked", {
+    status: 403,
+    headers: {
+      ...(contentType ? { "Content-Type": contentType } : {}),
+      ...(cfRay ? { "cf-ray": cfRay } : {}),
+    },
+  });
+
+  assert.equal(isRetryableResponse(response("text/html; charset=utf-8", "edge-ray")), true);
+  assert.equal(isRetryableResponse(response("application/json", "edge-ray")), false);
+  assert.equal(isRetryableResponse(response("text/html", undefined)), false);
+  assert.equal(isRetryableResponse(new Response("error", { status: 500 })), false);
+  assert.equal(isRetryableResponse(new Response("edge", { status: 503 })), true);
+});
 
 // The reported failure: ChatGPT's edge answers a native turn with a 503 whose
 // body says the connection reset *before headers*. Nothing was relayed, so the
@@ -303,12 +319,20 @@ test("five native retries can rescue the sixth attempt", async () => {
   }
 });
 
-test("a native 403 is not retried even when five retries are configured", async () => {
+async function native403Scenario({ contentType, cfRay, failures }) {
   let attempts = 0;
   const native = await mockServer((_request, response) => {
     attempts += 1;
-    response.writeHead(403, { "Content-Type": "text/html" });
-    response.end("<html>forbidden</html>");
+    if (attempts <= failures) {
+      response.writeHead(403, {
+        "Content-Type": contentType,
+        ...(cfRay ? { "cf-ray": cfRay } : {}),
+      });
+      response.end("<html>blocked</html>");
+      return;
+    }
+    response.writeHead(200, { "Content-Type": "application/json" });
+    response.end(JSON.stringify({ id: "resp-after-edge-block", output: [] }));
   });
   const stateDir = stateDirectory();
   const routerPort = await openPort();
@@ -326,13 +350,39 @@ test("a native 403 is not retried even when five retries are configured", async 
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ model: "gpt-5.6-sol", input: [] }),
     });
-    assert.equal(result.status, 403);
-    assert.equal(attempts, 1);
+    return { attempts, status: result.status };
   } finally {
     await stopChild(router);
     await closeServer(native.server);
     rmSync(stateDir, { recursive: true, force: true });
   }
+}
+
+test("Cloudflare HTML 403 responses can recover on a later native attempt", async () => {
+  const result = await native403Scenario({
+    contentType: "text/html; charset=utf-8",
+    cfRay: "test-ray",
+    failures: 2,
+  });
+  assert.deepEqual(result, { attempts: 3, status: 200 });
+});
+
+test("a JSON 403 is not retried", async () => {
+  const result = await native403Scenario({
+    contentType: "application/json",
+    cfRay: "test-ray",
+    failures: 1,
+  });
+  assert.deepEqual(result, { attempts: 1, status: 403 });
+});
+
+test("an unmarked HTML 403 is not retried", async () => {
+  const result = await native403Scenario({
+    contentType: "text/html",
+    cfRay: undefined,
+    failures: 1,
+  });
+  assert.deepEqual(result, { attempts: 1, status: 403 });
 });
 
 // The constraint that must never break. Once any byte is on the wire the
@@ -379,8 +429,8 @@ test("an upstream failure after headers is never retried", async () => {
   }
 });
 
-// 4xx is deterministic, and 429 is the one 5xx-adjacent status a retry makes
-// actively worse: it is rate limiting, and the caller has to see it.
+// Most 4xx responses are deterministic. 429 is the one 5xx-adjacent status a
+// retry makes actively worse: it is rate limiting, and the caller has to see it.
 test("native 4xx and 429 responses are relayed without a retry", async () => {
   const attempts = [];
   const native = await mockServer(async (request, response) => {

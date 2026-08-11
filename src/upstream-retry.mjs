@@ -71,7 +71,7 @@ export const NATIVE_RETRY_BUDGET_MS = clampedInteger(
 //        worse, and honouring `Retry-After` would mean sleeping for as long as
 //        the upstream asks -- exactly the multi-second hang this bound exists
 //        to avoid. It is relayed so the caller and the user see it.
-//   4xx  deterministic. The same request produces the same answer.
+//   4xx  deterministic, except for a Cloudflare-marked HTML 403 below.
 //   500  the origin ran and failed. Unlike the edge statuses above, a repeat
 //        risks a second execution of work that already happened.
 export const RETRYABLE_STATUSES = new Set([502, 503, 504, 520, 521, 522, 523, 524]);
@@ -95,6 +95,18 @@ const RETRYABLE_ERROR_CODES = new Set([
 
 export function isRetryableStatus(status) {
   return RETRYABLE_STATUSES.has(Number(status));
+}
+
+// Cloudflare can block a request at the edge before the native origin sees it.
+// A 403 is only retryable when its headers identify that narrow HTML response;
+// application errors and unmarked 403s remain terminal.
+export function isRetryableResponse(response) {
+  const status = Number(response?.status);
+  if (isRetryableStatus(status)) return true;
+  if (status !== 403) return false;
+  const contentType = String(response?.headers?.get?.("content-type") || "").trim();
+  const cfRay = String(response?.headers?.get?.("cf-ray") || "").trim();
+  return /^text\/html(?:\s*;|$)/i.test(contentType) && Boolean(cfRay);
 }
 
 export function isRetryableTransportError(error) {
@@ -176,7 +188,7 @@ export async function fetchWithRetry(target, init = {}, options = {}) {
     if (attempt >= retries) return settle(response, failure, attempt);
     const retryable = failure
       ? isRetryableTransportError(failure)
-      : isRetryableStatus(response?.status);
+      : isRetryableResponse(response);
     if (!retryable) return settle(response, failure, attempt);
     // The caller is gone, or has already relayed something. Either way this
     // request is over: a retry would be work for nobody, or a duplicated
