@@ -199,6 +199,7 @@ test("retry sleeps are capped at three seconds and stay inside the remaining bud
   assert.equal(delays.reduce((sum, delay) => sum + delay, 0), 7_000);
   assert.equal(calls, 6);
   assert.equal(result.response.status, 503);
+  assert.equal(await result.response.text(), "edge");
 });
 
 test("native retry configuration accepts twenty retries", () => {
