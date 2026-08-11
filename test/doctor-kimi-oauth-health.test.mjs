@@ -2,10 +2,8 @@ import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
 import {
-  existsSync,
   mkdirSync,
   mkdtempSync,
-  rmdirSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -42,10 +40,6 @@ before(async () => {
 after(() => {
   healthServer?.kill();
 });
-
-function removeDirectoryIfPresent(directory) {
-  if (existsSync(directory)) rmdirSync(directory);
-}
 
 function doctorKimiCheck({ selected, credential }) {
   const testRoot = mkdtempSync(path.join(os.tmpdir(), "doctor-kimi-health-"));
@@ -98,12 +92,7 @@ function doctorKimiCheck({ selected, credential }) {
     assert.ok(check, "doctor must include the Kimi OAuth check");
     return check;
   } finally {
-    rmSync(credentialsPath, { force: true });
-    removeDirectoryIfPresent(credentialsDir);
-    removeDirectoryIfPresent(kimiHome);
-    rmSync(selectionPath, { force: true });
-    removeDirectoryIfPresent(stateDir);
-    removeDirectoryIfPresent(testRoot);
+    rmSync(testRoot, { recursive: true, force: true });
   }
 }
 

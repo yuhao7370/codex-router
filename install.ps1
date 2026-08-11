@@ -322,6 +322,9 @@ try {
   if ($LASTEXITCODE -ne 0) { throw "The router did not become healthy." }
   & node src/install-manifest.mjs record | Out-Null
   if ($LASTEXITCODE -ne 0) { throw "Install-manifest recording failed." }
+  # Match bin/install: skill installation is best effort and preserves any
+  # existing skill that is not verified as codex-router-owned.
+  & node src/skills-install.mjs install
   Write-Host "Installed the selected external model routes. Fully quit and reopen Codex."
 } catch {
   if ($ServiceInstalled) { & node src/service.mjs uninstall 2>$null | Out-Null }

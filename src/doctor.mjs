@@ -657,28 +657,37 @@ add(
 const followsHostApps = serviceFollowsHostApps();
 let serviceLoaded = false;
 let serviceStoppedByDesign = false;
+let serviceStatus;
+let serviceStatusError;
 try {
-  const service = childJson("service.mjs", ["status"]);
-  serviceLoaded = Boolean(service.loaded);
+  serviceStatus = childJson("service.mjs", ["status"]);
+  serviceLoaded = Boolean(serviceStatus.loaded);
   serviceStoppedByDesign = !serviceLoaded && followsHostApps;
-  add(
-    serviceLoaded ? "ok" : serviceStoppedByDesign ? "warn" : "fail",
-    "Background service",
-    serviceStoppedByDesign
-      ? "stopped; following Codex (open Codex or ChatGPT to start it)"
-      : service.state || "stopped",
-    "Run ./bin/enable or ./bin/doctor --fix.",
-  );
 } catch (error) {
-  add(
-    "fail",
-    "Background service",
-    error instanceof Error ? error.message : "not available",
-    "Run ./bin/doctor --fix.",
-  );
+  serviceStatusError = error;
 }
 
 const health = await waitForRouterHealth({ timeoutMs: serviceLoaded ? 30_000 : 2_000 });
+const serviceHealthVerified =
+  !serviceLoaded && !serviceStoppedByDesign && serviceStatus?.installed && health.ok;
+add(
+  serviceLoaded || serviceHealthVerified
+    ? "ok"
+    : serviceStoppedByDesign
+      ? "warn"
+      : "fail",
+  "Background service",
+  serviceStatusError
+    ? serviceStatusError instanceof Error
+      ? serviceStatusError.message
+      : "not available"
+    : serviceStoppedByDesign
+      ? "stopped; following Codex (open Codex or ChatGPT to start it)"
+      : serviceHealthVerified
+        ? `running (health verified; task state ${serviceStatus.state || "ready"})`
+        : serviceStatus?.state || "stopped",
+  "Run ./bin/enable or ./bin/doctor --fix.",
+);
 add(
   health.ok ? "ok" : serviceStoppedByDesign ? "warn" : "fail",
   "Router health",
