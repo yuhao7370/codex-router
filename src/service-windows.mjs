@@ -70,11 +70,11 @@ function wrapper() {
     CODEX_ROUTER_PORT: String(PORTS.router),
     CODEX_ROUTER_API_PORT: String(PORTS.api),
     CODEX_ROUTER_NATIVE_PROXY_URL: nativeProxyUrl(),
-    CODEX_ROUTER_NATIVE_RETRIES: process.env.CODEX_ROUTER_NATIVE_RETRIES || "5",
+    CODEX_ROUTER_NATIVE_RETRIES: process.env.CODEX_ROUTER_NATIVE_RETRIES || "20",
     CODEX_ROUTER_NATIVE_RETRY_BACKOFF_MS:
       process.env.CODEX_ROUTER_NATIVE_RETRY_BACKOFF_MS || "100",
     CODEX_ROUTER_NATIVE_RETRY_BUDGET_MS:
-      process.env.CODEX_ROUTER_NATIVE_RETRY_BUDGET_MS || "10000",
+      process.env.CODEX_ROUTER_NATIVE_RETRY_BUDGET_MS || "60000",
     // The LiteLLM gateway is a Python process. Force UTF-8 output so its
     // startup banner and logs do not crash on Windows systems whose default
     // ANSI/OEM code page is not UTF-8 (e.g. Russian cp1251), where Python

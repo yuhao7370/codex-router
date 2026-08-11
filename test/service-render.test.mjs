@@ -100,9 +100,9 @@ test("background service definitions render for macOS, Linux, and Windows", () =
       windows,
       /set "CODEX_ROUTER_NATIVE_PROXY_URL=http:\/\/127\.0\.0\.1:7897"/,
     );
-    assert.match(windows, /set "CODEX_ROUTER_NATIVE_RETRIES=5"/);
+    assert.match(windows, /set "CODEX_ROUTER_NATIVE_RETRIES=20"/);
     assert.match(windows, /set "CODEX_ROUTER_NATIVE_RETRY_BACKOFF_MS=100"/);
-    assert.match(windows, /set "CODEX_ROUTER_NATIVE_RETRY_BUDGET_MS=10000"/);
+    assert.match(windows, /set "CODEX_ROUTER_NATIVE_RETRY_BUDGET_MS=60000"/);
     assert.match(windows, /litellm|start\.mjs/);
     // The Python gateway must run with UTF-8 output even when the host
     // console code page is not UTF-8 (see service-windows.mjs).
