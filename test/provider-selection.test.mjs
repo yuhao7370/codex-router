@@ -52,13 +52,13 @@ test("provider selection keeps backward compatibility and can hide the final pro
     // credential-aware catalog is what hides providers that cannot authenticate.
     assert.deepEqual(readProviderSelection(), [...PROVIDERS.keys()]);
     process.env.KIMI_API_KEY = "TEST_ENVIRONMENT_ONLY_KEY";
-    // `local` is keyless: it serves from this machine, so there is no
-    // credential to configure and it is always available. Everything else has
-    // to authenticate before it counts.
-    assert.deepEqual(configuredProviderIds(), ["local"]);
+    // Both local providers are keyless: they serve from this machine, so there
+    // is no credential to configure and they are always available. Everything
+    // else has to authenticate before it counts.
+    assert.deepEqual(configuredProviderIds(), ["local", "local-router"]);
     delete process.env.KIMI_API_KEY;
     writeProviderCredential("deepseek", "TEST_DEEPSEEK_SELECTION_KEY");
-    assert.deepEqual(configuredProviderIds(), ["deepseek", "local"]);
+    assert.deepEqual(configuredProviderIds(), ["deepseek", "local", "local-router"]);
 
     writeProviderSelection(["chatgpt-oauth"]);
     assert.deepEqual(readProviderSelection(), ["grok-oauth"]);
