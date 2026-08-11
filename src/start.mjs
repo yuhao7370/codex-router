@@ -16,7 +16,7 @@ import {
 } from "./paths.mjs";
 import { waitForHealth as pollHealth } from "./health-probe.mjs";
 import { writeLiteLlmConfig } from "./litellm-config.mjs";
-import { nativeProxyEnvironmentForChild } from "./native-proxy.mjs";
+import { withoutGenericProxyEnvironment } from "./native-proxy.mjs";
 
 const litellm =
   process.env.MODEL_ROUTER_LITELLM_BIN ||
@@ -96,7 +96,7 @@ let shuttingDown = false;
 function run(command, args) {
   const child = spawn(command, args, {
     cwd: SOURCE_ROOT,
-    env: { ...process.env, ...commonEnv, ...nativeProxyEnvironmentForChild(args[0]) },
+    env: { ...withoutGenericProxyEnvironment(), ...commonEnv },
     stdio: "inherit",
   });
   children.push(child);

@@ -4,14 +4,14 @@
 
 **Goal:** Route only native GPT/OpenAI fetches through Mihomo at `http://127.0.0.1:7897` and persist five bounded native retries in the Windows service.
 
-**Architecture:** The service wrapper persists native-only proxy and retry settings. `src/start.mjs` converts the native proxy URL into Node 24 proxy variables only for the `src/router.mjs` child; LiteLLM and provider-forwarder children keep their original environments. Existing native retry code remains unchanged and consumes the persisted tuning variables.
+**Architecture:** The service wrapper persists native-only proxy and retry settings. `src/router.mjs` uses a pinned `undici` `ProxyAgent` only for native ChatGPT fetches, so supported Node 22.19+ releases do not depend on later environment-proxy support. LiteLLM and provider-forwarder children keep their original fetch paths. Existing native retry code remains unchanged and consumes the persisted tuning variables.
 
-**Tech Stack:** Node.js 24 built-in fetch proxy support, Windows Task Scheduler service wrapper, Node test runner, PowerShell installer/service commands.
+**Tech Stack:** Node.js 22.19+ ESM with pinned `undici`, Windows Task Scheduler service wrapper, Node test runner, PowerShell installer/service commands.
 
 ## Global Constraints
 
 - Proxy only native GPT/OpenAI traffic; do not proxy DeepSeek Official, Kimi, Grok, or the local provider at `127.0.0.1:15721`.
-- Use `http://127.0.0.1:7897` and Node's built-in `NODE_USE_ENV_PROXY`; add no dependency.
+- Use `http://127.0.0.1:7897` through an explicit `undici` `ProxyAgent`; keep the pinned direct dependency needed for Node 22.19+ compatibility.
 - Persist `CODEX_ROUTER_NATIVE_RETRIES=5`, `CODEX_ROUTER_NATIVE_RETRY_BACKOFF_MS=100`, and `CODEX_ROUTER_NATIVE_RETRY_BUDGET_MS=10000`.
 - Never retry 401, 403, 429, 500, partial streams, or client aborts.
 - Never write ChatGPT tokens, provider keys, caller capabilities, proxy credentials, or unredacted protected URLs to source, tests, commands, or logs.

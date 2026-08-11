@@ -75,4 +75,3 @@ remain outside this proxy and retry path.
 5. Service-render tests prove the persisted values are 20, 100, and 60000.
 6. The full repository test suite, syntax check, Router health check, and Codex
    doctor pass without a quota-consuming model request.
-

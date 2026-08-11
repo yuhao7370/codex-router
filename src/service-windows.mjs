@@ -16,6 +16,7 @@ import {
   STATE_DIR,
   TARGET,
 } from "./paths.mjs";
+import { parseNativeProxyUrl } from "./native-proxy.mjs";
 
 const effectivePlatform = process.env.CODEX_ROUTER_SERVICE_PLATFORM || process.platform;
 const command = process.argv[2] || "status";
@@ -36,22 +37,6 @@ function vbsEscape(value) {
   return String(value).replaceAll('"', '""');
 }
 
-function nativeProxyUrl() {
-  const value = process.env.CODEX_ROUTER_NATIVE_PROXY_URL || "http://127.0.0.1:7897";
-  let parsed;
-  try {
-    parsed = new URL(value);
-  } catch {
-    return value;
-  }
-  if (parsed.username || parsed.password) {
-    throw new Error(
-      "CODEX_ROUTER_NATIVE_PROXY_URL must not include username or password credentials.",
-    );
-  }
-  return value;
-}
-
 function wrapper() {
   const start = path.join(SOURCE_ROOT, "src", "start.mjs");
   const variables = {
@@ -69,7 +54,9 @@ function wrapper() {
     CODEX_ROUTER_OAUTH_PORT: String(PORTS.oauth),
     CODEX_ROUTER_PORT: String(PORTS.router),
     CODEX_ROUTER_API_PORT: String(PORTS.api),
-    CODEX_ROUTER_NATIVE_PROXY_URL: nativeProxyUrl(),
+    CODEX_ROUTER_NATIVE_PROXY_URL: parseNativeProxyUrl(
+      process.env.CODEX_ROUTER_NATIVE_PROXY_URL || "http://127.0.0.1:7897",
+    ),
     CODEX_ROUTER_NATIVE_RETRIES: process.env.CODEX_ROUTER_NATIVE_RETRIES || "20",
     CODEX_ROUTER_NATIVE_RETRY_BACKOFF_MS:
       process.env.CODEX_ROUTER_NATIVE_RETRY_BACKOFF_MS || "100",
@@ -135,9 +122,9 @@ function writeAtomic(target, contents) {
   renameSync(temporary, target);
 }
 
-function writeLaunchers() {
+function writeLaunchers(wrapperContents) {
   mkdirSync(STATE_DIR, { recursive: true });
-  writeAtomic(wrapperPath, Buffer.from(wrapper(), "utf8"));
+  writeAtomic(wrapperPath, Buffer.from(wrapperContents, "utf8"));
   // wscript.exe parses a script file with the system ANSI code page unless the
   // file carries a UTF-16 byte order mark, so a state directory holding
   // non-ASCII characters only round-trips when the launcher is UTF-16LE.
@@ -305,11 +292,14 @@ if (command === "render") {
 } else if (command === "render-task") {
   process.stdout.write(`${JSON.stringify(taskAction())}\n`);
 } else if (command === "install") {
+  // Validate and render before the recovery block: invalid configuration must
+  // not be reported as a recovered scheduled-task installation.
+  const wrapperContents = wrapper();
   try {
     // Writing the launchers belongs inside the try: renameSync over the .vbs
     // raises a sharing violation while a running wscript.exe still holds it
     // open, and that used to throw out of install with nothing to catch it.
-    writeLaunchers();
+    writeLaunchers(wrapperContents);
     // An upgrade from the console-visible task may still have that instance
     // running. Register-ScheduledTask -Force replaces the definition under the
     // same task name, so no duplicate is left behind, but it does not stop the

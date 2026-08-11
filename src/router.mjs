@@ -46,6 +46,7 @@ import {
   tokenUsageFromPayload,
 } from "./response-usage.mjs";
 import { fetchWithRetry } from "./upstream-retry.mjs";
+import { nativeProxyFetch } from "./native-proxy.mjs";
 import {
   NamespaceToolCallTransform,
   flattenNamespacedHistory,
@@ -108,6 +109,7 @@ const INTERNAL_KEY =
 const CALLER_KEY = process.env.CODEX_ROUTER_CALLER_KEY;
 const QUIET =
   process.env.CODEX_ROUTER_QUIET === "1" || process.env.KIMI_PROXY_QUIET === "1";
+const fetchNative = nativeProxyFetch();
 // Kill switch for the zero-prompt-token substitution (#95). It is on because a
 // provider that reports no prompt tokens breaks compaction outright, but an
 // operator who would rather see the provider's own numbers can turn it off
@@ -893,7 +895,7 @@ async function relayEncryptedAgentPayload(request, item, encrypted, signal) {
     ],
     tool_choice: { type: "function", name: AGENT_PAYLOAD_RELAY_TOOL },
   };
-  const upstream = await fetch(nativeTarget("/responses", ""), {
+  const upstream = await fetchNative(nativeTarget("/responses", ""), {
     method: "POST",
     headers: { ...nativeHeaders(request), Accept: "text/event-stream" },
     body: JSON.stringify(body),
@@ -1743,6 +1745,7 @@ async function handleResponses(request, response, requestUrl) {
         // error translation and Retry-After handling below; leave it exactly
         // as it was.
         retries: route ? 0 : undefined,
+        fetchImpl: route ? fetch : fetchNative,
         canRetry: () => nothingRelayed(response),
         onRetry: (event) => logUpstreamRetry(event, requestedModel, requestUrl.pathname),
       },
@@ -1869,6 +1872,7 @@ async function handleResponses(request, response, requestUrl) {
           },
           {
             retries: 0,
+            fetchImpl: route ? fetch : fetchNative,
             canRetry: () => nothingRelayed(response),
             onRetry: (event) => logUpstreamRetry(event, requestedModel, requestUrl.pathname),
           },
@@ -2136,6 +2140,7 @@ async function handleNativeRequest(request, response, requestUrl, defaultModel) 
         // turn path keeps the benefit and the billed path keeps the old
         // behaviour until a captured 5xx proves it is safe.
         retries: 0,
+        fetchImpl: fetchNative,
         canRetry: () => nothingRelayed(response),
         onRetry: (event) => logUpstreamRetry(event, requestedModel, requestUrl.pathname),
       },

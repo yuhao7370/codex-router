@@ -33,20 +33,12 @@ CODEX_ROUTER_NATIVE_RETRY_BACKOFF_MS=100
 CODEX_ROUTER_NATIVE_RETRY_BUDGET_MS=10000
 ```
 
-`src/start.mjs` will read `CODEX_ROUTER_NATIVE_PROXY_URL` and pass proxy
-variables only to the `src/router.mjs` child:
-
-```text
-NODE_USE_ENV_PROXY=1
-HTTP_PROXY=http://127.0.0.1:7897
-HTTPS_PROXY=http://127.0.0.1:7897
-NO_PROXY=127.0.0.1,localhost,::1
-```
-
-Node 24's built-in fetch proxy support will handle HTTP CONNECT. The LiteLLM,
-API-forwarder, Kimi, and Grok child processes will not receive these proxy
-variables, so their routing remains unchanged. Loopback health checks and the
-4100/4101/4103/15721 connections explicitly bypass the proxy.
+`src/router.mjs` will create an explicit `undici` `ProxyAgent` from
+`CODEX_ROUTER_NATIVE_PROXY_URL` and pass it only to native ChatGPT fetches.
+This avoids Node's environment-proxy support, which is unavailable in the
+supported Node 22.19 and 22.20 releases. LiteLLM, API-forwarder, Kimi, and
+Grok keep the ordinary fetch path; loopback native targets also bypass the
+proxy.
 
 ### Retry behavior
 
@@ -64,8 +56,10 @@ in the router log and usage events.
 
 The settings belong in the Windows service generator rather than a hand-edited
 generated `.cmd` file. Reinstalling or running `doctor --fix` will regenerate
-the same settings. The implementation adds no dependency and leaves macOS and
-Linux service definitions unchanged.
+the same settings. The implementation adds a pinned direct `undici` dependency.
+Its supported Node floor is below this router's Node 22.19 floor, and its
+explicit `ProxyAgent` API is tested on Node 22.19 and 22.20. macOS and Linux
+service definitions remain unchanged.
 
 If Mihomo moves away from port 7897, the configured native proxy URL must be
 updated and the router service regenerated. A missing or unreachable proxy

@@ -13,7 +13,7 @@ import {
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -140,6 +140,7 @@ test("the Windows service refuses to persist native proxy credentials", () => {
     for (const proxy of [
       "http://proxy-user@proxy.internal:7897",
       "http://:proxy-pass@proxy.internal:7897",
+      "http://%ZZ@proxy.internal:7897",
     ]) {
       const result = spawnSync(
         process.execPath,
@@ -156,15 +157,60 @@ test("the Windows service refuses to persist native proxy credentials", () => {
       assert.notEqual(result.status, 0);
       assert.match(
         result.stderr,
-        /CODEX_ROUTER_NATIVE_PROXY_URL must not include username or password credentials/,
+        /CODEX_ROUTER_NATIVE_PROXY_URL must be a valid credential-free HTTP or HTTPS proxy URL/,
       );
       assert.equal(result.stdout, "");
-      assert.doesNotMatch(result.stderr, /proxy-user|proxy-pass/);
+      assert.doesNotMatch(result.stderr, /proxy-user|proxy-pass|%ZZ/);
     }
   } finally {
     rmSync(testRoot, { recursive: true, force: true });
   }
 });
+
+test(
+  "an invalid native proxy fails Windows install before scheduler recovery",
+  () => {
+    const testRoot = mkdtempSync(path.join(os.tmpdir(), "codex-router-invalid-proxy-install-"));
+    try {
+      const stateDir = windowsStateDir(testRoot);
+      mkdirSync(stateDir, { recursive: true });
+      const wrapperPath = path.join(stateDir, "start-codex-router.cmd");
+      writeFileSync(wrapperPath, "stale wrapper");
+      const stubs = schedulerStubs(path.join(testRoot, "scheduler"));
+      const preloader = path.join(testRoot, "pretend-non-windows.mjs");
+      writeFileSync(
+        preloader,
+        'Object.defineProperty(process, "platform", { value: "linux" });\n',
+      );
+      const result = spawnSync(process.execPath, [
+        "--import",
+        pathToFileURL(preloader).href,
+        path.join(root, "src", "service-windows.mjs"),
+        "install",
+      ], {
+        cwd: root,
+        encoding: "utf8",
+        env: {
+          ...serviceEnv("win32", testRoot),
+          PATH: stubs.path,
+          CODEX_ROUTER_NATIVE_PROXY_URL: "http://%ZZ@proxy.internal:7897",
+        },
+      });
+
+      assert.notEqual(result.status, 0);
+      assert.equal(result.stdout, "");
+      assert.match(
+        result.stderr,
+        /CODEX_ROUTER_NATIVE_PROXY_URL must be a valid credential-free HTTP or HTTPS proxy URL/,
+      );
+      assert.doesNotMatch(result.stderr, /%ZZ/);
+      assert.equal(readFileSync(wrapperPath, "utf8"), "stale wrapper");
+      assert.deepEqual(stubs.calls(), []);
+    } finally {
+      rmSync(testRoot, { recursive: true, force: true });
+    }
+  },
+);
 
 test("packaged services preserve wrapper and PATH values with service-safe quoting", () => {
   const testRoot = mkdtempSync(path.join(os.tmpdir(), "codex-router-packaged-service-"));
