@@ -1532,6 +1532,18 @@ test("a bridged read is recorded rather than spent silently", async () => {
   );
 });
 
+test("a native vision read uses the router's proxy-aware fetch", async () => {
+  const source = await readFile(path.join(repoRoot, "src/router.mjs"), "utf8");
+  const start = source.indexOf("async function readVisionEvidence");
+  assert.notEqual(start, -1, "router.mjs must retain the vision evidence reader");
+  const body = source.slice(start, source.indexOf("// DeepSeek thinking", start));
+  assert.match(
+    body,
+    /describeImage\(\{[\s\S]*fetchImpl:\s*fetchNative/,
+    "the native vision call must use the router's proxy-aware fetch implementation",
+  );
+});
+
 // The list only helps if the read path actually walks it. Asserted against the
 // source because the loop lives inside the request handler, the same way the
 // QUIET and usage-event rules above are asserted.

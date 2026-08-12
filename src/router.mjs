@@ -1042,6 +1042,7 @@ async function readVisionEvidence({ url, engine, nativeCall, effort, question, k
       gatewayBase: GATEWAY_BASE,
       headers: routedHeaders(),
       nativeCall,
+      fetchImpl: fetchNative,
       effort,
       question,
       ...(retryDelaysMs ? { retryDelaysMs } : {}),
