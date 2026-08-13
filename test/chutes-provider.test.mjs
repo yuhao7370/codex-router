@@ -152,6 +152,7 @@ test("Chutes public-catalog fixtures drive discovery, deterministic curation, an
     assert.deepEqual(JSON.parse(discovery.stdout), {
       provider: "chutes",
       discovered: ["moonshotai/Kimi-K3-TEE", "zai-org/GLM-5.2-TEE"],
+      metadataById: {},
       registered: [],
       unregistered: ["moonshotai/Kimi-K3-TEE", "zai-org/GLM-5.2-TEE"],
       unavailable: [],

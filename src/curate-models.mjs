@@ -262,10 +262,13 @@ async function main() {
   const interactive = interactiveSelection && Boolean(process.stdin.isTTY);
 
   const metadataFor = (id) => {
-    const metadata = { ...(flagEfforts || {}) };
-    if (!interactive) return flagEfforts ? metadata : undefined;
+    const discovered = discovery?.metadataById?.[id] || {};
+    const metadata = { ...discovered, ...(flagEfforts || {}) };
+    if (!interactive) return Object.keys(metadata).length > 0 ? metadata : undefined;
+
+    const defaultContext = discovered.contextWindow || 131072;
     process.stdout.write(`\nMetadata for ${id} (Enter keeps the default):\n`);
-    const rawContext = promptLine("  Context window in tokens [131072]").trim();
+    const rawContext = promptLine(`  Context window in tokens [${defaultContext}]`).trim();
     if (rawContext) {
       const context = Number.parseInt(rawContext, 10);
       if (!Number.isInteger(context) || context < 1) {
@@ -274,13 +277,21 @@ async function main() {
       metadata.contextWindow = context;
       metadata.autoCompact = Math.floor(context * 0.85);
     }
-    if (confirm(`  Does ${id} accept image input?`)) {
+
+    const imageDefault =
+      Array.isArray(discovered.inputModalities) && discovered.inputModalities.includes("image");
+    if (confirm(`  Does ${id} accept image input?`, imageDefault)) {
       metadata.inputModalities = ["text", "image"];
     }
+
     if (!flagEfforts) {
+      const discoveredEfforts = (discovered.reasoningLevels || [])
+        .map((level) => level.effort)
+        .filter(Boolean);
+      const effortDefault = discoveredEfforts.length > 0 ? discoveredEfforts.join(",") : "high";
       const rawEfforts = promptLine(
         "  Reasoning efforts, comma-separated from " +
-          `${Object.keys(EFFORT_DESCRIPTIONS).join(",")} [high]`,
+          `${Object.keys(EFFORT_DESCRIPTIONS).join(",")} [${effortDefault}]`,
       ).trim();
       if (rawEfforts) Object.assign(metadata, parseEfforts(rawEfforts) || {});
     }

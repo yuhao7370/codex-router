@@ -14,7 +14,21 @@ function option(name) {
   return index === -1 ? undefined : process.argv[index + 1];
 }
 
-export function modelIds(payload, provider) {
+// The Codex effort ladder, in picker order. A /v1/models response that reports
+// a capabilities.effort block uses this vocabulary; levels absent from that
+// block are never advertised, because an upstream that did not claim a level
+// may reject it or silently remap it.
+const EFFORT_ORDER = ["minimal", "low", "medium", "high", "xhigh", "max"];
+const EFFORT_DESCRIPTIONS = {
+  minimal: "Fastest responses",
+  low: "Quick reasoning",
+  medium: "Balanced reasoning",
+  high: "Deep reasoning",
+  xhigh: "Extended reasoning",
+  max: "Maximum reasoning",
+};
+
+function modelEntries(payload, provider) {
   const data = Array.isArray(payload) ? payload : payload?.data;
   if (!Array.isArray(data)) throw new Error("The provider returned an invalid model list.");
   const candidates = provider?.authProfile === "github-copilot"
@@ -33,7 +47,49 @@ export function modelIds(payload, provider) {
   const visible = provider?.id === "local-router"
     ? candidates.filter((item) => !String(item?.id || "").startsWith("anthropic/"))
     : candidates;
-  return [...new Set(visible.map((item) => String(item?.id || "").trim()).filter(Boolean))].sort();
+  const seen = new Set();
+  const entries = [];
+  for (const item of visible) {
+    const id = String(item?.id || "").trim();
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    entries.push({ id, raw: item });
+  }
+  return entries.sort((a, b) => a.id.localeCompare(b.id));
+}
+
+export function modelIds(payload, provider) {
+  return modelEntries(payload, provider).map((entry) => entry.id);
+}
+
+// Translate a /v1/models entry into the metadata fields userModelEntry accepts.
+// Providers that report sizing and effort capabilities get them honored; any
+// field that is absent or unparseable is left out so curation falls back to
+// the conservative defaults in user-models.mjs.
+export function discoveredMetadata(item) {
+  if (!item || typeof item !== "object") return {};
+  const metadata = {};
+  const contextWindow = Number(item.max_input_tokens);
+  if (Number.isInteger(contextWindow) && contextWindow > 0) {
+    metadata.contextWindow = contextWindow;
+    metadata.autoCompact = Math.floor(contextWindow * 0.85);
+  }
+  if (item?.capabilities?.image_input?.supported === true) {
+    metadata.inputModalities = ["text", "image"];
+  }
+  const effort = item?.capabilities?.effort;
+  const efforts = EFFORT_ORDER.filter((level) => {
+    const entry = effort?.[level];
+    return Boolean(entry) && entry.supported === true;
+  });
+  if (efforts.length > 0) {
+    metadata.reasoningLevels = efforts.map((level) => ({
+      effort: level,
+      description: EFFORT_DESCRIPTIONS[level],
+    }));
+    metadata.defaultEffort = efforts.includes("high") ? "high" : efforts[efforts.length - 1];
+  }
+  return metadata;
 }
 
 async function providerPayload(provider) {
@@ -71,7 +127,13 @@ export async function discoverProviderModels(providerId) {
   if (provider.kind !== "openai-compatible") {
     throw new Error(`${provider.displayName} does not expose a supported model-list endpoint.`);
   }
-  const discovered = modelIds(await providerPayload(provider), provider);
+  const entries = modelEntries(await providerPayload(provider), provider);
+  const discovered = entries.map((entry) => entry.id);
+  const metadataById = {};
+  for (const entry of entries) {
+    const metadata = discoveredMetadata(entry.raw);
+    if (Object.keys(metadata).length > 0) metadataById[entry.id] = metadata;
+  }
   const registered = MODELS
     .filter((model) => model.provider === providerId)
     .map((model) => model.upstreamModel)
@@ -81,6 +143,7 @@ export async function discoverProviderModels(providerId) {
   return {
     provider: providerId,
     discovered,
+    metadataById,
     registered,
     unregistered: discovered.filter((id) => !registeredSet.has(id)),
     unavailable: registered.filter((id) => !discoveredSet.has(id)),

@@ -9,7 +9,9 @@ import { fileURLToPath } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const { PROVIDERS } = await import("../src/model-registry.mjs");
-const { discoverProviderModels, modelIds } = await import("../src/model-discovery.mjs");
+const { discoverProviderModels, discoveredMetadata, modelIds } = await import(
+  "../src/model-discovery.mjs"
+);
 
 async function localServer(handler) {
   const server = http.createServer(handler);
@@ -157,6 +159,72 @@ test("local-router discovery is unauthenticated and drops anthropic aliases", as
     assert.deepEqual(result.discovered, ["deepseek-v4-pro"]);
     assert.equal(headers.authorization, undefined);
     assert.equal(headers["x-api-key"], undefined);
+  } finally {
+    if (previous === undefined) delete process.env.MODEL_ROUTER_LOCAL_OPENAI_BASE_URL;
+    else process.env.MODEL_ROUTER_LOCAL_OPENAI_BASE_URL = previous;
+    await new Promise((resolve) => local.server.close(resolve));
+  }
+});
+
+test("discoveredMetadata honors sizing and effort capabilities from /v1/models", () => {
+  const metadata = discoveredMetadata({
+    id: "deepseek-v4-pro",
+    max_input_tokens: 1000000,
+    capabilities: {
+      image_input: { supported: true },
+      effort: {
+        supported: true,
+        low: { supported: false },
+        medium: { supported: false },
+        high: { supported: true },
+        max: { supported: false },
+        xhigh: { supported: false },
+      },
+    },
+  });
+  assert.deepEqual(metadata, {
+    contextWindow: 1000000,
+    autoCompact: 850000,
+    inputModalities: ["text", "image"],
+    reasoningLevels: [{ effort: "high", description: "Deep reasoning" }],
+    defaultEffort: "high",
+  });
+});
+
+test("discoveredMetadata returns empty metadata for entries without capabilities", () => {
+  assert.deepEqual(discoveredMetadata({ id: "deepseek-v4-pro" }), {});
+  assert.deepEqual(discoveredMetadata(null), {});
+  assert.deepEqual(discoveredMetadata({ id: "x", max_input_tokens: 0 }), {});
+});
+
+test("discoverProviderModels captures real metadata for local-router models", async () => {
+  const local = await localServer((request, response) => {
+    response.writeHead(200, { "Content-Type": "application/json" });
+    response.end(JSON.stringify({
+      object: "list",
+      data: [
+        {
+          id: "deepseek-v4-pro",
+          max_input_tokens: 1000000,
+          capabilities: {
+            image_input: { supported: false },
+            effort: { high: { supported: true }, max: { supported: false } },
+          },
+        },
+        { id: "no-capabilities" },
+      ],
+    }));
+  });
+  const previous = process.env.MODEL_ROUTER_LOCAL_OPENAI_BASE_URL;
+  process.env.MODEL_ROUTER_LOCAL_OPENAI_BASE_URL = `http://127.0.0.1:${local.port}/v1`;
+  try {
+    const result = await discoverProviderModels("local-router");
+    assert.equal(result.metadataById["deepseek-v4-pro"].contextWindow, 1000000);
+    assert.deepEqual(
+      result.metadataById["deepseek-v4-pro"].reasoningLevels.map((level) => level.effort),
+      ["high"],
+    );
+    assert.equal(result.metadataById["no-capabilities"], undefined);
   } finally {
     if (previous === undefined) delete process.env.MODEL_ROUTER_LOCAL_OPENAI_BASE_URL;
     else process.env.MODEL_ROUTER_LOCAL_OPENAI_BASE_URL = previous;
