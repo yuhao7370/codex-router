@@ -52,6 +52,15 @@
     border-radius: 7px; padding: 7px 9px; font-size: 13px; width: 170px;
   }
   input:focus { outline: 1px solid #3b8fd0; }
+  textarea {
+    width: 100%; min-height: 110px; resize: vertical;
+    background: #0e1523; border: 1px solid #2b3a59; color: #e6edf7;
+    border-radius: 7px; padding: 9px 10px; font: 12px/1.5 ui-monospace, Consolas, monospace;
+    box-sizing: border-box;
+  }
+  textarea:focus { outline: 1px solid #3b8fd0; }
+  .hint { color: #7d8aa3; font-size: 12px; margin: 0 0 8px; }
+  .hint a { color: #9fd4ff; }
 </style>
 </head>
 <body>
@@ -83,6 +92,17 @@
       <thead><tr><th>邮箱</th><th>ID</th><th>来源</th><th>状态</th><th>额度</th><th></th></tr></thead>
       <tbody id="accounts-body"></tbody>
     </table>
+  </div>
+
+  <div class="card">
+    <h2>导入账号</h2>
+    <p class="hint">粘贴 auth.json，或直接粘贴 sub2api 导出的 JSON（会自动转换）。<a href="/converter" target="_blank">打开独立转换器</a></p>
+    <textarea id="import-input" placeholder='{"tokens":{"access_token":"..."}}'></textarea>
+    <div class="field">
+      <input type="file" id="import-file" accept=".json,application/json">
+      <button class="ghost" id="import-btn">导入</button>
+    </div>
+    <div class="result" id="import-result" hidden></div>
   </div>
 
   <div class="card">
@@ -136,6 +156,29 @@
     const hours = Math.floor(minutes / 60);
     if (hours < 24) return hours + ' 小时前';
     return Math.floor(hours / 24) + ' 天前';
+  }
+
+  function normalizeImport(raw) {
+    let data;
+    try { data = JSON.parse(raw); } catch (error) { throw new Error('不是有效的 JSON'); }
+    if (data && data.tokens && typeof data.tokens.access_token === 'string') {
+      return data;
+    }
+    if (data && Array.isArray(data.accounts) && data.accounts.length) {
+      const account = data.accounts[0];
+      const credentials = account && account.credentials;
+      if (credentials && typeof credentials.access_token === 'string') {
+        return {
+          tokens: {
+            access_token: credentials.access_token,
+            account_id: credentials.chatgpt_account_id || credentials.account_id || '',
+            id_token: credentials.id_token || '',
+            refresh_token: credentials.refresh_token || '',
+          },
+        };
+      }
+    }
+    throw new Error('无法识别格式（需要 auth.json 或 sub2api 导出）');
   }
 
   async function loadStatus() {
@@ -265,6 +308,30 @@
       el('token-input').value = '';
       await loadStatus();
     } catch (error) { setResult('test-result', false, '清除 Token 失败：' + error.message); }
+  });
+
+  el('import-file').addEventListener('change', async function () {
+    const file = el('import-file').files && el('import-file').files[0];
+    if (!file) return;
+    el('import-input').value = await file.text();
+  });
+
+  el('import-btn').addEventListener('click', async function () {
+    try {
+      const raw = el('import-input').value.trim();
+      if (!raw) { setResult('import-result', false, '请先粘贴或选择 JSON'); return; }
+      const authJson = normalizeImport(raw);
+      const imported = await api('/api/import', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(authJson),
+      });
+      setResult('import-result', true, '已导入：' + (imported.email || imported.account_id || imported.id || ''));
+      el('import-input').value = '';
+      el('import-file').value = '';
+      await Promise.all([loadStatus(), loadAccounts()]);
+    } catch (error) {
+      setResult('import-result', false, '导入失败：' + error.message);
+    }
   });
 
   loadStatus().catch(function (error) { setResult('test-result', false, '加载状态失败：' + error.message); });

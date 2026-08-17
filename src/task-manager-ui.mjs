@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 
 import {
   activeAccount,
+  importTaskManagerAccount,
   injectionStats,
   listTaskManagerAccounts,
   readTaskManagerConfig,
@@ -23,9 +24,17 @@ const PORT = Number(
     4111,
 );
 const PAGE_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), "task-manager-ui.html");
+const CONVERTER_PATH = path.join(
+  path.dirname(fileURLToPath(import.meta.url)),
+  "sub2api-converter.html",
+);
 
 function readPage() {
   return readFileSync(PAGE_PATH, "utf8");
+}
+
+function readConverter() {
+  return readFileSync(CONVERTER_PATH, "utf8");
 }
 
 
@@ -80,6 +89,9 @@ export function startTaskManagerUi() {
       if (request.method === "GET" && (url.pathname === "/" || url.pathname === "/index.html")) {
         return sendHtml(response, readPage());
       }
+      if (request.method === "GET" && url.pathname === "/converter") {
+        return sendHtml(response, readConverter());
+      }
       if (request.method === "GET" && url.pathname === "/api/status") {
         return sendJson(response, 200, statusPayload());
       }
@@ -102,6 +114,11 @@ export function startTaskManagerUi() {
         const body = await readJsonBody(request);
         await selectTaskManagerAccount(body.id);
         return sendJson(response, 200, statusPayload());
+      }
+      if (request.method === "POST" && url.pathname === "/api/import") {
+        const body = await readJsonBody(request);
+        const account = await importTaskManagerAccount(body);
+        return sendJson(response, 200, account);
       }
       if (request.method === "POST" && url.pathname === "/api/port") {
         const body = await readJsonBody(request);

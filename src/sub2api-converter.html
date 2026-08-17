@@ -1,0 +1,227 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>sub2api 转 auth.json</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 24px; min-height: 100vh;
+    background: #0b1120; color: #e6edf7;
+    font: 14px/1.5 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+  }
+  .wrap { max-width: 820px; margin: 0 auto; }
+  h1 { font-size: 22px; margin: 0 0 2px; }
+  .sub { color: #7d8aa3; margin-bottom: 20px; }
+  .card {
+    background: #121a2b; border: 1px solid #24304a;
+    border-radius: 10px; padding: 18px; margin-bottom: 16px;
+  }
+  .card h2 { margin: 0 0 12px; font-size: 15px; color: #9fd4ff; }
+  textarea {
+    width: 100%; min-height: 160px; resize: vertical;
+    background: #0e1523; border: 1px solid #2b3a59; color: #e6edf7;
+    border-radius: 7px; padding: 10px 12px; font: 12px/1.5 ui-monospace, Consolas, monospace;
+  }
+  textarea:focus { outline: 1px solid #3b8fd0; }
+  .field { display: flex; gap: 8px; align-items: center; margin: 10px 0 0; flex-wrap: wrap; }
+  input[type=file] { color: #8a97ad; font-size: 12px; max-width: 260px; }
+  button {
+    background: #1d6fb8; color: #fff; border: 0; border-radius: 7px;
+    padding: 8px 14px; cursor: pointer; font-size: 13px;
+  }
+  button:hover { background: #2584d6; }
+  button.ghost { background: #24304a; }
+  button.ghost:hover { background: #2f3d5c; }
+  .result { margin-top: 10px; padding: 8px 10px; border-radius: 7px; background: #0e1523; font-size: 12px; white-space: pre-wrap; word-break: break-all; }
+  .result.err { color: #ff8290; }
+  .account {
+    display: flex; align-items: center; gap: 12px;
+    padding: 12px 0; border-bottom: 1px solid #1b2740; flex-wrap: wrap;
+  }
+  .account:last-child { border-bottom: 0; }
+  .account .meta { flex: 1; min-width: 220px; }
+  .account .name { font-size: 14px; word-break: break-all; }
+  .account .detail { color: #7d8aa3; font-size: 12px; font-family: ui-monospace, Consolas, monospace; word-break: break-all; }
+  .badge { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 11px; background: #143326; color: #5ce0a3; margin-left: 6px; }
+  .actions { display: flex; gap: 8px; }
+  .toast { position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%); background: #143326; color: #5ce0a3; padding: 8px 16px; border-radius: 7px; font-size: 13px; opacity: 0; transition: opacity .2s; pointer-events: none; }
+  .toast.show { opacity: 1; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>sub2api → auth.json 转换器</h1>
+  <div class="sub">粘贴 sub2api 导出的 JSON，为每个账号生成标准 Codex auth.json。</div>
+
+  <div class="card">
+    <h2>输入</h2>
+    <textarea id="input" placeholder='{"format":"sub2api","accounts":[...]}'></textarea>
+    <div class="field">
+      <input type="file" id="file" accept=".json,application/json">
+      <button id="parse">解析</button>
+      <button class="ghost" id="clear">清空</button>
+    </div>
+    <div class="result err" id="error" hidden></div>
+  </div>
+
+  <div class="card" id="output" hidden>
+    <h2>账号（<span id="count">0</span>）</h2>
+    <div id="list"></div>
+  </div>
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+  function el(id) { return document.getElementById(id); }
+  function showError(text) {
+    const node = el('error');
+    node.hidden = !text;
+    node.textContent = text || '';
+  }
+  function toast(text) {
+    const node = el('toast');
+    node.textContent = text;
+    node.classList.add('show');
+    setTimeout(function () { node.classList.remove('show'); }, 1600);
+  }
+
+  function convertAccount(account) {
+    const c = (account && account.credentials) || {};
+    return {
+      tokens: {
+        access_token: c.access_token || '',
+        account_id: c.chatgpt_account_id || c.account_id || '',
+        id_token: c.id_token || '',
+        refresh_token: c.refresh_token || '',
+      },
+      last_refresh: new Date().toISOString(),
+    };
+  }
+
+  function parseSub2api(raw) {
+    let data;
+    try { data = JSON.parse(raw); } catch (error) { throw new Error('不是有效的 JSON：' + error.message); }
+    const accounts = data && Array.isArray(data.accounts) ? data.accounts : null;
+    if (!accounts || accounts.length === 0) {
+      throw new Error('未找到 accounts 数组，这看起来不是 sub2api 导出格式');
+    }
+    return accounts.map(function (account) {
+      const c = (account && account.credentials) || {};
+      return {
+        name: account.name || (c.email || '未命名账号'),
+        email: c.email || '',
+        plan: (c.plan_type || account.plan_type || '').toUpperCase(),
+        platform: account.platform || 'openai',
+        auth: convertAccount(account),
+      };
+    });
+  }
+
+  function render(accounts) {
+    el('output').hidden = false;
+    el('count').textContent = String(accounts.length);
+    const list = el('list');
+    list.textContent = '';
+    accounts.forEach(function (account, index) {
+      const row = document.createElement('div');
+      row.className = 'account';
+
+      const meta = document.createElement('div');
+      meta.className = 'meta';
+      const name = document.createElement('div');
+      name.className = 'name';
+      name.textContent = account.name;
+      const plan = document.createElement('span');
+      plan.className = 'badge';
+      plan.textContent = account.plan || account.platform;
+      name.appendChild(plan);
+      const detail = document.createElement('div');
+      detail.className = 'detail';
+      detail.textContent = account.email + (account.email ? ' · ' : '') + account.auth.tokens.account_id;
+      meta.appendChild(name);
+      meta.appendChild(detail);
+
+      const actions = document.createElement('div');
+      actions.className = 'actions';
+      const download = document.createElement('button');
+      download.className = 'ghost';
+      download.textContent = '下载';
+      download.addEventListener('click', function () {
+        downloadJson(account.auth, account.email || account.auth.tokens.account_id || ('account-' + (index + 1)));
+      });
+      const copy = document.createElement('button');
+      copy.className = 'ghost';
+      copy.textContent = '复制';
+      copy.addEventListener('click', function () {
+        copyText(JSON.stringify(account.auth, null, 2));
+      });
+      actions.appendChild(download);
+      actions.appendChild(copy);
+
+      row.appendChild(meta);
+      row.appendChild(actions);
+      list.appendChild(row);
+    });
+  }
+
+  function downloadJson(obj, baseName) {
+    const safe = String(baseName).replace(/[\\/:*?"<>|]+/g, '_').slice(0, 80) || 'auth';
+    const blob = new Blob([JSON.stringify(obj, null, 2) + '\n'], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = safe + '.auth.json';
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+    toast('已下载 ' + link.download);
+  }
+
+  function copyText(text) {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(function () { toast('已复制'); }, function () { fallbackCopy(text); });
+    } else {
+      fallbackCopy(text);
+    }
+  }
+
+  function fallbackCopy(text) {
+    const area = document.createElement('textarea');
+    area.value = text;
+    area.style.position = 'fixed';
+    area.style.opacity = '0';
+    document.body.appendChild(area);
+    area.select();
+    try { document.execCommand('copy'); toast('已复制'); } catch (error) { toast('复制失败'); }
+    area.remove();
+  }
+
+  function run() {
+    showError('');
+    try {
+      render(parseSub2api(el('input').value));
+    } catch (error) {
+      el('output').hidden = true;
+      showError(error.message);
+    }
+  }
+
+  el('parse').addEventListener('click', run);
+  el('clear').addEventListener('click', function () {
+    el('input').value = '';
+    el('file').value = '';
+    el('output').hidden = true;
+    showError('');
+  });
+  el('file').addEventListener('change', function () {
+    const file = el('file').files && el('file').files[0];
+    if (!file) return;
+    file.text().then(function (text) { el('input').value = text; });
+  });
+</script>
+</body>
+</html>

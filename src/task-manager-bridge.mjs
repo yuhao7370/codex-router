@@ -120,13 +120,19 @@ function tokenFor(state) {
   return "";
 }
 
-function requestJson(port, token, pathname, method = "GET") {
+function requestJson(port, token, pathname, method = "GET", body) {
   // Use node:http rather than fetch: the WHATWG fetch spec blocks port 6000
   // (X11), which is Codex_Task_Manager's default. The raw HTTP client has no
   // such allow-list restriction.
   return new Promise((resolve, reject) => {
     const headers = {};
     if (token) headers.Authorization = `Bearer ${token}`;
+    let payload = null;
+    if (body !== undefined) {
+      payload = JSON.stringify(body);
+      headers["Content-Type"] = "application/json";
+      headers["Content-Length"] = Buffer.byteLength(payload);
+    }
     const request = http.request(
       {
         host: "127.0.0.1",
@@ -152,6 +158,7 @@ function requestJson(port, token, pathname, method = "GET") {
     );
     request.on("timeout", () => request.destroy(new Error("request timed out")));
     request.on("error", reject);
+    if (payload !== null) request.write(payload);
     request.end();
   });
 }
@@ -213,6 +220,22 @@ export async function selectTaskManagerAccount(id) {
     throw new Error(
       `Select account failed: ${body?.error || `HTTP ${status}`}`,
     );
+  }
+  await refreshActiveAccount();
+  return body;
+}
+
+export async function importTaskManagerAccount(authJson) {
+  const state = readTaskManagerConfig();
+  const { status, body } = await requestJson(
+    state.port,
+    tokenFor(state),
+    "/api/auth/import",
+    "POST",
+    authJson,
+  );
+  if (status !== 200) {
+    throw new Error(body?.error || `Codex_Task_Manager returned HTTP ${status}`);
   }
   await refreshActiveAccount();
   return body;
