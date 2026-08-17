@@ -76,6 +76,7 @@ import { readHiddenModels } from "./model-picker-state.mjs";
 import { readVisionBridgeSettings } from "./vision-bridge-state.mjs";
 import { installedNativeVisionEngines } from "./vision-engines.mjs";
 import { VERSION } from "./version.mjs";
+import { activeAccount, startTaskManagerPoller } from "./task-manager-bridge.mjs";
 
 const LISTEN_HOST =
   process.env.CODEX_ROUTER_HOST || process.env.KIMI_ROUTER_HOST || "127.0.0.1";
@@ -347,6 +348,13 @@ function nativeHeaders(request) {
     const value = request.headers[name];
     if (value !== undefined) {
       headers[name] = Array.isArray(value) ? value.join(", ") : value;
+    }
+  }
+  const account = activeAccount();
+  if (account?.accessToken) {
+    headers.authorization = `Bearer ${account.accessToken}`;
+    if (account.accountId) {
+      headers["chatgpt-account-id"] = account.accountId;
     }
   }
   return headers;
@@ -2297,6 +2305,7 @@ server.on("error", (error) => {
 });
 server.requestTimeout = 0;
 server.headersTimeout = 65_000;
+startTaskManagerPoller();
 server.listen(LISTEN_PORT, LISTEN_HOST, () => {
   console.error("[codex-router] listening");
 });

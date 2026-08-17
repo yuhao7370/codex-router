@@ -1210,6 +1210,57 @@ async function handlePresence(action, value) {
   process.stdout.write(`${JSON.stringify(setPresenceMode(value))}\n`);
 }
 
+async function handleTaskManager(action, value) {
+  const bridge = await import("./task-manager-bridge.mjs");
+  const snapshot = () => {
+    const config = bridge.readTaskManagerConfig();
+    return {
+      enabled: config.enabled,
+      port: config.port,
+      token: config.token ? "set" : "auto",
+    };
+  };
+
+  if (!action || action === "status") {
+    process.stdout.write(`${JSON.stringify(snapshot())}\n`);
+    return;
+  }
+  if (action === "enable" || action === "disable") {
+    bridge.setTaskManagerEnabled(action === "enable");
+    process.stdout.write(`${JSON.stringify(snapshot())}\n`);
+    return;
+  }
+  if (action === "port") {
+    if (!value) throw new Error("Usage: control task-manager port <1-65535>");
+    bridge.setTaskManagerPort(value);
+    process.stdout.write(`${JSON.stringify(snapshot())}\n`);
+    return;
+  }
+  if (action === "token") {
+    if (value === undefined) throw new Error("Usage: control task-manager token <value|clear>");
+    const cleared = value === "clear";
+    bridge.setTaskManagerToken(cleared ? "" : value);
+    process.stdout.write(`${JSON.stringify(snapshot())}\n`);
+    return;
+  }
+  if (action === "test") {
+    process.stdout.write(`${JSON.stringify(await bridge.testTaskManagerConnection())}\n`);
+    return;
+  }
+  if (action === "accounts") {
+    process.stdout.write(`${JSON.stringify(await bridge.listTaskManagerAccounts())}\n`);
+    return;
+  }
+  if (action === "select") {
+    if (!value) throw new Error("Usage: control task-manager select <account-id|native>");
+    process.stdout.write(`${JSON.stringify(await bridge.selectTaskManagerAccount(value))}\n`);
+    return;
+  }
+  throw new Error(
+    "Usage: control task-manager status|enable|disable|port <1-65535>|token <value|clear>|test|accounts|select <id>",
+  );
+}
+
 // --- dispatch ---------------------------------------------------------------
 
 if (args.includes("--probe")) {
@@ -1262,6 +1313,8 @@ if (args.includes("--probe")) {
   handleTray(args[1]);
 } else if (args[0] === "presence") {
   await handlePresence(args[1], args[2]);
+} else if (args[0] === "task-manager") {
+  await handleTaskManager(args[1], args[2]);
 } else if (args[0] === "maintenance") {
   await updateAndVerifyCodex();
 } else if (args[0] === "doctor") {
