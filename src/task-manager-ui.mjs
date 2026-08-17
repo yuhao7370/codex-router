@@ -42,6 +42,7 @@ function statusPayload() {
           hasToken: Boolean(account.accessToken),
           plan: account.plan || "",
           remainingPercent: account.remainingPercent ?? null,
+          fetchedAt: account.fetchedAt ?? null,
         }
       : null,
     injections: injectionStats(),

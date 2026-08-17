@@ -66,6 +66,7 @@
     <div class="row"><span class="k">Token</span><span class="v" id="token">…</span></div>
     <div class="row"><span class="k">当前使用账号</span><span class="v" id="active-account">…</span></div>
     <div class="row"><span class="k">订阅 / 剩余</span><span class="v" id="account-quota">…</span></div>
+    <div class="row"><span class="k">额度更新时间</span><span class="v" id="quota-updated">…</span></div>
     <div style="margin-top:10px">
       <button id="enable-btn">启用代理</button>
       <button class="ghost" id="disable-btn">停用代理</button>
@@ -79,7 +80,7 @@
     <button class="ghost" id="refresh-accounts">刷新账号</button>
     <div class="result" id="accounts-error" hidden></div>
     <table>
-      <thead><tr><th>邮箱</th><th>ID</th><th>来源</th><th>状态</th><th></th></tr></thead>
+      <thead><tr><th>邮箱</th><th>ID</th><th>来源</th><th>状态</th><th>额度</th><th></th></tr></thead>
       <tbody id="accounts-body"></tbody>
     </table>
   </div>
@@ -126,6 +127,17 @@
   }
   function hideResult(id) { el(id).hidden = true; }
 
+  function formatAge(timestamp) {
+    if (!timestamp) return '—';
+    const seconds = Math.max(0, Math.floor(Date.now() / 1000) - timestamp);
+    if (seconds < 60) return '刚刚';
+    const minutes = Math.floor(seconds / 60);
+    if (minutes < 60) return minutes + ' 分钟前';
+    const hours = Math.floor(minutes / 60);
+    if (hours < 24) return hours + ' 小时前';
+    return Math.floor(hours / 24) + ' 天前';
+  }
+
   async function loadStatus() {
     const status = await api('/api/status');
     el('enabled-badge').textContent = status.enabled ? '已启用' : '未启用';
@@ -136,6 +148,9 @@
     const account = status.account;
     el('account-quota').textContent = account && account.remainingPercent != null
       ? (account.plan ? account.plan.toUpperCase() + ' · ' : '') + account.remainingPercent + '% 剩余'
+      : '—';
+    el('quota-updated').textContent = account && account.fetchedAt
+      ? formatAge(account.fetchedAt)
       : '—';
     const injections = status.injections || { count: 0, recent: [] };
     el('injection-count').textContent = String(injections.count);
@@ -162,17 +177,23 @@
         const state = account.valid === false
           ? '<span class="badge off">失效</span>'
           : (account.is_default ? '<span class="badge on">当前</span>' : '<span class="badge">—</span>');
+        const usage = account.usage;
+        const quota = usage && typeof usage.weekly_used_percent === 'number'
+          ? (usage.plan ? String(usage.plan).toUpperCase() + ' ' : '') +
+            Math.max(0, Math.min(100, 100 - usage.weekly_used_percent)) + '%'
+          : '—';
         tr.innerHTML =
           '<td>' + escapeHtml(email || '—') + '</td>' +
           '<td class="mono">' + escapeHtml(id) + '</td>' +
           '<td>' + source + '</td>' +
           '<td>' + state + '</td>' +
+          '<td>' + escapeHtml(quota) + '</td>' +
           '<td><button data-id="' + escapeHtml(id) + '" class="ghost select-btn"' +
             (account.is_default ? ' disabled' : '') + '>选择</button></td>';
         body.appendChild(tr);
       }
       if (accounts.length === 0) {
-        body.innerHTML = '<tr><td colspan="5" class="muted">没有账号</td></tr>';
+        body.innerHTML = '<tr><td colspan="6" class="muted">没有账号</td></tr>';
       }
       for (const btn of document.querySelectorAll('.select-btn')) {
         btn.addEventListener('click', async function () {

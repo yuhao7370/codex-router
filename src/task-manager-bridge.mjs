@@ -11,16 +11,13 @@ import os from "node:os";
 import path from "node:path";
 
 import { protectPrivateFile } from "./file-security.mjs";
-import { nativeProxyFetch } from "./native-proxy.mjs";
 import { STATE_DIR } from "./paths.mjs";
 
 const VERSION = 1;
 const DEFAULT_PORT = 6000;
 const REQUEST_TIMEOUT_MS = 3_000;
-const QUOTA_TIMEOUT_MS = 10_000;
 const POLL_INTERVAL_MS = 15_000;
 const STATE_PATH = path.join(STATE_DIR, "task-manager.json");
-const fetchNative = nativeProxyFetch();
 
 const MAX_INJECTION_EVENTS = 100;
 
@@ -159,38 +156,6 @@ function requestJson(port, token, pathname, method = "GET") {
   });
 }
 
-async function fetchAccountQuota(accessToken, accountId) {
-  try {
-    const headers = {
-      Authorization: `Bearer ${accessToken}`,
-      "User-Agent": "codex-router/task-manager",
-    };
-    if (accountId) headers["ChatGPT-Account-Id"] = accountId;
-    const response = await fetchNative(
-      "https://chatgpt.com/backend-api/wham/usage",
-      { headers, signal: AbortSignal.timeout(QUOTA_TIMEOUT_MS) },
-    );
-    if (!response.ok) return null;
-    const body = await response.json();
-    const windows = [
-      body?.rate_limit?.primary_window,
-      body?.rate_limit?.secondary_window,
-    ].filter((window) => window && typeof window.used_percent === "number");
-    const weekly =
-      windows.find(
-        (window) => Math.abs((window.limit_window_seconds || 0) - 604_800) <= 60_480,
-      ) || windows[0];
-    const used = weekly?.used_percent;
-    return {
-      plan: typeof body?.plan_type === "string" ? body.plan_type : "",
-      remainingPercent:
-        typeof used === "number" ? Math.max(0, Math.min(100, 100 - used)) : null,
-    };
-  } catch {
-    return null;
-  }
-}
-
 export function recordInjection(accountId, pathname) {
   injectionCount += 1;
   injectionEvents.unshift({
@@ -267,12 +232,21 @@ export async function refreshActiveAccount() {
   try {
     const { status, body } = await requestJson(state.port, token, "/api/auth/current");
     if (status === 200 && body && typeof body.access_token === "string" && body.access_token) {
-      const quota = await fetchAccountQuota(body.access_token, body.account_id);
+      // Codex_Task_Manager is the single source of truth for quota. Read the
+      // cached usage it exposes instead of hitting OpenAI again, so this value
+      // can never drift from what the CTM dashboard shows.
+      const usage = body.usage || null;
+      const used =
+        usage && typeof usage.weekly_used_percent === "number"
+          ? usage.weekly_used_percent
+          : null;
       cached = {
         accountId: typeof body.account_id === "string" ? body.account_id : "",
         accessToken: body.access_token,
-        plan: quota?.plan || "",
-        remainingPercent: quota?.remainingPercent ?? null,
+        plan: usage && typeof usage.plan === "string" ? usage.plan : "",
+        remainingPercent:
+          used === null ? null : Math.max(0, Math.min(100, 100 - used)),
+        fetchedAt: usage && typeof usage.fetched_at === "number" ? usage.fetched_at : null,
       };
       return cached;
     }
