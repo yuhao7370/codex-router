@@ -164,7 +164,7 @@ const PAGE = `<!doctype html>
     el('injection-log').textContent = injections.recent && injections.recent.length
       ? injections.recent.map(function (e) {
           return e.at + '  ' + e.accountId + '  ' + (e.path || '');
-        }).join('\n')
+        }).join(String.fromCharCode(10))
       : '暂无注入记录';
     el('port-input').value = String(status.port);
   }
