@@ -6,6 +6,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
+import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 
@@ -111,25 +112,40 @@ function tokenFor(state) {
   return "";
 }
 
-function baseUrl(port) {
-  return `http://127.0.0.1:${port}`;
-}
-
-async function requestJson(port, token, pathname, options = {}) {
-  const headers = { ...(options.headers || {}) };
-  if (token) headers.Authorization = `Bearer ${token}`;
-  const response = await fetch(`${baseUrl(port)}${pathname}`, {
-    method: options.method || "GET",
-    headers,
-    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+function requestJson(port, token, pathname, method = "GET") {
+  // Use node:http rather than fetch: the WHATWG fetch spec blocks port 6000
+  // (X11), which is Codex_Task_Manager's default. The raw HTTP client has no
+  // such allow-list restriction.
+  return new Promise((resolve, reject) => {
+    const headers = {};
+    if (token) headers.Authorization = `Bearer ${token}`;
+    const request = http.request(
+      {
+        host: "127.0.0.1",
+        port,
+        path: pathname,
+        method,
+        headers,
+        timeout: REQUEST_TIMEOUT_MS,
+      },
+      (response) => {
+        const chunks = [];
+        response.on("data", (chunk) => chunks.push(chunk));
+        response.on("end", () => {
+          let body = null;
+          try {
+            body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+          } catch {
+            // Non-JSON or empty body.
+          }
+          resolve({ status: response.statusCode || 0, body });
+        });
+      },
+    );
+    request.on("timeout", () => request.destroy(new Error("request timed out")));
+    request.on("error", reject);
+    request.end();
   });
-  let body = null;
-  try {
-    body = await response.json();
-  } catch {
-    // Non-JSON or empty body.
-  }
-  return { status: response.status, body };
 }
 
 export async function testTaskManagerConnection() {
@@ -167,7 +183,7 @@ export async function selectTaskManagerAccount(id) {
     state.port,
     tokenFor(state),
     `/api/auth/switch?id=${encodeURIComponent(String(id))}`,
-    { method: "POST" },
+    "POST",
   );
   if (status !== 200) {
     throw new Error(
