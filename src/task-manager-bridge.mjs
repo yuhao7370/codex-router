@@ -64,7 +64,11 @@ function writeTaskManagerConfig(next) {
 
 export function setTaskManagerEnabled(enabled) {
   const state = writeTaskManagerConfig({ enabled: Boolean(enabled) });
-  if (!state.enabled) cached = null;
+  if (state.enabled) {
+    refreshActiveAccount().catch(() => {});
+  } else {
+    cached = null;
+  }
   return state;
 }
 
@@ -230,17 +234,14 @@ export function startTaskManagerPoller() {
     const state = readTaskManagerConfig();
     if (!state.enabled) {
       cached = null;
-      return false;
+      return;
     }
     refreshActiveAccount().catch(() => {
       cached = null;
     });
-    return true;
   };
 
-  if (!tick()) return;
-  const timer = setInterval(() => {
-    if (!tick()) clearInterval(timer);
-  }, POLL_INTERVAL_MS);
+  tick();
+  const timer = setInterval(tick, POLL_INTERVAL_MS);
   timer.unref?.();
 }

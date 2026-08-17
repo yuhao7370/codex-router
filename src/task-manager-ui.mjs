@@ -4,6 +4,7 @@ import {
   activeAccount,
   listTaskManagerAccounts,
   readTaskManagerConfig,
+  refreshActiveAccount,
   selectTaskManagerAccount,
   setTaskManagerEnabled,
   setTaskManagerPort,
@@ -303,6 +304,7 @@ export function startTaskManagerUi() {
       }
       if (request.method === "POST" && url.pathname === "/api/enable") {
         setTaskManagerEnabled(true);
+        await refreshActiveAccount();
         return sendJson(response, 200, statusPayload());
       }
       if (request.method === "POST" && url.pathname === "/api/disable") {
@@ -323,11 +325,13 @@ export function startTaskManagerUi() {
       if (request.method === "POST" && url.pathname === "/api/port") {
         const body = await readJsonBody(request);
         setTaskManagerPort(body.port);
+        await refreshActiveAccount();
         return sendJson(response, 200, statusPayload());
       }
       if (request.method === "POST" && url.pathname === "/api/token") {
         const body = await readJsonBody(request);
         setTaskManagerToken(body.token || "");
+        await refreshActiveAccount();
         return sendJson(response, 200, statusPayload());
       }
       sendJson(response, 404, { error: "not found" });
