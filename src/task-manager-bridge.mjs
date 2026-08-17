@@ -17,6 +17,9 @@ const VERSION = 1;
 const DEFAULT_PORT = 6000;
 const REQUEST_TIMEOUT_MS = 3_000;
 const POLL_INTERVAL_MS = 15_000;
+const FAILOVER_COOLDOWN_MS = 30_000;
+const FAILURE_MEMORY_MS = 5 * 60 * 1000;
+const FAILOVER_TRIGGER_STATUSES = new Set([401, 403, 429]);
 const STATE_PATH = path.join(STATE_DIR, "task-manager.json");
 
 const MAX_INJECTION_EVENTS = 100;
@@ -27,9 +30,21 @@ const MAX_INJECTION_EVENTS = 100;
 let cached = null;
 let injectionCount = 0;
 const injectionEvents = [];
+let lastRefreshFailure = null;
+let lastFailoverAt = 0;
+let lastFailover = null;
+let failoverPending = false;
+let failoverScheduled = false;
+const accountFailureMemory = new Map();
 
 function defaults() {
-  return { version: VERSION, enabled: false, port: DEFAULT_PORT, token: "" };
+  return {
+    version: VERSION,
+    enabled: false,
+    failover: false,
+    port: DEFAULT_PORT,
+    token: "",
+  };
 }
 
 export function readTaskManagerConfig() {
@@ -38,6 +53,7 @@ export function readTaskManagerConfig() {
     const parsed = JSON.parse(readFileSync(STATE_PATH, "utf8"));
     const state = { ...defaults(), ...parsed };
     state.enabled = Boolean(state.enabled);
+    state.failover = Boolean(state.failover);
     state.port = Number.isInteger(state.port) ? state.port : DEFAULT_PORT;
     if (state.port < 1 || state.port > 65_535) state.port = DEFAULT_PORT;
     state.token = String(state.token || "").trim();
@@ -89,6 +105,15 @@ export function setTaskManagerToken(token) {
   const value = String(token || "").trim();
   cached = null;
   return writeTaskManagerConfig({ token: value });
+}
+
+export function setTaskManagerFailover(failover) {
+  const state = writeTaskManagerConfig({ failover: Boolean(failover) });
+  if (!state.failover) {
+    failoverPending = false;
+    accountFailureMemory.clear();
+  }
+  return state;
 }
 
 function defaultTokenPath() {
@@ -245,16 +270,19 @@ export async function refreshActiveAccount() {
   const state = readTaskManagerConfig();
   if (!state.enabled) {
     cached = null;
+    lastRefreshFailure = null;
     return null;
   }
   const token = tokenFor(state);
   if (!token) {
     cached = null;
+    lastRefreshFailure = null;
     return null;
   }
   try {
     const { status, body } = await requestJson(state.port, token, "/api/auth/current");
     if (status === 200 && body && typeof body.access_token === "string" && body.access_token) {
+      lastRefreshFailure = null;
       // Codex_Task_Manager is the single source of truth for quota. Read the
       // cached usage it exposes instead of hitting OpenAI again, so this value
       // can never drift from what the CTM dashboard shows.
@@ -273,8 +301,18 @@ export async function refreshActiveAccount() {
       };
       return cached;
     }
-  } catch {
-    // Fall through: a failed request must fall back to native auth.
+    // CTM answered but the account is unavailable (e.g. its refresh token was
+    // revoked), which the auth API reports as a 409 Conflict.
+    lastRefreshFailure = {
+      kind: status === 409 ? "account" : "network",
+      status,
+      error: body?.error || null,
+    };
+  } catch (error) {
+    lastRefreshFailure = {
+      kind: "network",
+      error: error instanceof Error ? error.message : String(error),
+    };
   }
   cached = null;
   return null;
@@ -284,6 +322,109 @@ export function activeAccount() {
   return cached;
 }
 
+async function chooseFallbackAccount() {
+  const { accounts = [], default_account_id: defaultId } =
+    await listTaskManagerAccounts();
+  const now = Date.now();
+  const recentlyFailed = (id) => {
+    if (!id) return false;
+    const timestamp = accountFailureMemory.get(id);
+    return timestamp !== undefined && now - timestamp < FAILURE_MEMORY_MS;
+  };
+  const candidates = accounts.filter((account) => {
+    if (account.source === "native") return false;
+    if (account.valid === false) return false;
+    if (account.id === defaultId) return false;
+    if (recentlyFailed(account.id) || recentlyFailed(account.account_id)) {
+      return false;
+    }
+    return true;
+  });
+  const withQuota = candidates.filter((account) => {
+    const used = account.usage?.weekly_used_percent;
+    return typeof used === "number" && used < 100;
+  });
+  const pool = withQuota.length ? withQuota : candidates;
+  if (!pool.length) return null;
+  return [...pool].sort((left, right) => {
+    const l = left.usage?.weekly_used_percent;
+    const r = right.usage?.weekly_used_percent;
+    return (typeof l === "number" ? l : 101) - (typeof r === "number" ? r : 101);
+  })[0];
+}
+
+export async function failoverIfNeeded(reason = "poll") {
+  const state = readTaskManagerConfig();
+  if (!state.enabled || !state.failover) return false;
+  if (Date.now() - lastFailoverAt < FAILOVER_COOLDOWN_MS) return false;
+
+  const current = cached;
+  const exhausted =
+    current &&
+    current.remainingPercent !== null &&
+    current.remainingPercent <= 0;
+  const unavailable = !current && lastRefreshFailure?.kind === "account";
+  if (!exhausted && !unavailable && !failoverPending) return false;
+
+  failoverPending = false;
+  let fallback = null;
+  try {
+    fallback = await chooseFallbackAccount();
+  } catch {
+    return false;
+  }
+  if (!fallback) return false;
+
+  if (current?.accountId) {
+    accountFailureMemory.set(current.accountId, Date.now());
+  }
+  try {
+    await selectTaskManagerAccount(fallback.id);
+  } catch {
+    return false;
+  }
+
+  lastFailoverAt = Date.now();
+  lastFailover = {
+    at: new Date().toISOString(),
+    from: current?.accountId || null,
+    to: fallback.account_id || fallback.id,
+    reason,
+  };
+  return true;
+}
+
+export function notifyAccountFailure(status) {
+  if (!FAILOVER_TRIGGER_STATUSES.has(status)) return;
+  const state = readTaskManagerConfig();
+  if (!state.enabled || !state.failover) return;
+  const account = cached;
+  if (account?.accountId) {
+    accountFailureMemory.set(account.accountId, Date.now());
+  }
+  failoverPending = true;
+  scheduleImmediateFailover();
+}
+
+function scheduleImmediateFailover() {
+  if (failoverScheduled) return;
+  failoverScheduled = true;
+  setTimeout(async () => {
+    failoverScheduled = false;
+    await refreshActiveAccount();
+    await failoverIfNeeded("failure");
+  }, 500);
+}
+
+export function failoverStatus() {
+  const state = readTaskManagerConfig();
+  return {
+    enabled: state.failover,
+    lastFailoverAt: lastFailoverAt || null,
+    lastFailover,
+  };
+}
+
 export function startTaskManagerPoller() {
   const tick = () => {
     const state = readTaskManagerConfig();
@@ -291,9 +432,11 @@ export function startTaskManagerPoller() {
       cached = null;
       return;
     }
-    refreshActiveAccount().catch(() => {
-      cached = null;
-    });
+    refreshActiveAccount()
+      .then(() => failoverIfNeeded("poll"))
+      .catch(() => {
+        cached = null;
+      });
   };
 
   tick();

@@ -5,12 +5,14 @@ import { fileURLToPath } from "node:url";
 
 import {
   activeAccount,
+  failoverStatus,
   importTaskManagerAccount,
   injectionStats,
   listTaskManagerAccounts,
   readTaskManagerConfig,
   refreshActiveAccount,
   selectTaskManagerAccount,
+  setTaskManagerFailover,
   setTaskManagerEnabled,
   setTaskManagerPort,
   setTaskManagerToken,
@@ -43,6 +45,7 @@ function statusPayload() {
   const account = activeAccount();
   return {
     enabled: config.enabled,
+    failover: failoverStatus(),
     port: config.port,
     token: config.token ? "set" : "auto",
     account: account
@@ -102,6 +105,11 @@ export function startTaskManagerUi() {
       }
       if (request.method === "POST" && url.pathname === "/api/disable") {
         setTaskManagerEnabled(false);
+        return sendJson(response, 200, statusPayload());
+      }
+      if (request.method === "POST" && url.pathname === "/api/failover") {
+        const body = await readJsonBody(request);
+        setTaskManagerFailover(Boolean(body.enabled));
         return sendJson(response, 200, statusPayload());
       }
       if (request.method === "POST" && url.pathname === "/api/test") {

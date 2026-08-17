@@ -31,3 +31,21 @@ test("task manager enable persists", () => {
   bridge.setTaskManagerEnabled(false);
   assert.equal(bridge.readTaskManagerConfig().enabled, false);
 });
+
+test("task manager failover toggle persists and defaults off", () => {
+  assert.equal(bridge.readTaskManagerConfig().failover, false);
+  assert.equal(bridge.failoverStatus().enabled, false);
+  bridge.setTaskManagerFailover(true);
+  assert.equal(bridge.readTaskManagerConfig().failover, true);
+  assert.equal(bridge.failoverStatus().enabled, true);
+  bridge.setTaskManagerFailover(false);
+  assert.equal(bridge.readTaskManagerConfig().failover, false);
+});
+
+test("notifyAccountFailure ignores non-trigger statuses", () => {
+  bridge.setTaskManagerFailover(true);
+  // A 200/500 must not queue a failover; it just returns without throwing.
+  bridge.notifyAccountFailure(200);
+  bridge.notifyAccountFailure(500);
+  bridge.setTaskManagerFailover(false);
+});

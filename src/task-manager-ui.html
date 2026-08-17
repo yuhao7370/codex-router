@@ -76,6 +76,8 @@
     <div class="row"><span class="k">当前使用账号</span><span class="v" id="active-account">…</span></div>
     <div class="row"><span class="k">订阅 / 剩余</span><span class="v" id="account-quota">…</span></div>
     <div class="row"><span class="k">额度更新时间</span><span class="v" id="quota-updated">…</span></div>
+    <div class="row"><span class="k">自动切换</span><span class="v" id="failover-badge">…</span></div>
+    <div class="row"><span class="k">上次切换</span><span class="v" id="failover-last">…</span></div>
     <div style="margin-top:10px">
       <button id="enable-btn">启用代理</button>
       <button class="ghost" id="disable-btn">停用代理</button>
@@ -113,6 +115,9 @@
 
   <div class="card">
     <h2>设置</h2>
+    <div class="field">
+      <label><input type="checkbox" id="failover-toggle"> 账号额度用光/不可用时自动切换</label>
+    </div>
     <div class="field">
       <label>端口</label>
       <input id="port-input" type="number" min="1" max="65535" placeholder="6000">
@@ -158,6 +163,11 @@
     return Math.floor(hours / 24) + ' 天前';
   }
 
+  function shortId(id) {
+    const value = String(id || '');
+    return value.length > 12 ? value.slice(0, 8) + '…' : value;
+  }
+
   function normalizeImport(raw) {
     let data;
     try { data = JSON.parse(raw); } catch (error) { throw new Error('不是有效的 JSON'); }
@@ -195,6 +205,15 @@
     el('quota-updated').textContent = account && account.fetchedAt
       ? formatAge(account.fetchedAt)
       : '—';
+    const failover = status.failover || {};
+    el('failover-badge').textContent = failover.enabled ? '已开启' : '已关闭';
+    el('failover-badge').className = 'badge ' + (failover.enabled ? 'on' : 'off');
+    el('failover-last').textContent = failover.lastFailover
+      ? (failover.lastFailover.from ? shortId(failover.lastFailover.from) + ' → ' : '') +
+        shortId(failover.lastFailover.to) + '（' +
+        formatAge(Math.floor(new Date(failover.lastFailover.at).getTime() / 1000)) + '）'
+      : '—';
+    el('failover-toggle').checked = Boolean(failover.enabled);
     const injections = status.injections || { count: 0, recent: [] };
     el('injection-count').textContent = String(injections.count);
     el('injection-log').textContent = injections.recent && injections.recent.length
@@ -331,6 +350,18 @@
       await Promise.all([loadStatus(), loadAccounts()]);
     } catch (error) {
       setResult('import-result', false, '导入失败：' + error.message);
+    }
+  });
+
+  el('failover-toggle').addEventListener('change', async function () {
+    try {
+      await api('/api/failover', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled: el('failover-toggle').checked }),
+      });
+      await loadStatus();
+    } catch (error) {
+      setResult('test-result', false, '切换自动切换失败：' + error.message);
     }
   });
 

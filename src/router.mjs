@@ -78,6 +78,7 @@ import { installedNativeVisionEngines } from "./vision-engines.mjs";
 import { VERSION } from "./version.mjs";
 import {
   activeAccount,
+  notifyAccountFailure,
   recordInjection,
   startTaskManagerPoller,
 } from "./task-manager-bridge.mjs";
@@ -1772,6 +1773,10 @@ async function handleResponses(request, response, requestUrl) {
     // routed turn that means the full router -> litellm -> api-forwarder ->
     // provider path, so a stall here is the provider's, not the router's.
     upstreamLatencyMs = Date.now() - startedAt;
+    // A native 401/403/429 means the injected account stopped working. Let the
+    // bridge mark it failed so the poller can switch to a healthy account when
+    // failover is enabled; the current turn still relays the upstream error.
+    if (!route) notifyAccountFailure(upstream.status);
     // Gateway error bodies leak LiteLLM's internal exception chain, which
     // reads like a router bug. Rewrite them to name the provider that failed.
     // Native traffic passes through untouched: OpenAI errors are already clear.
@@ -2160,6 +2165,7 @@ async function handleNativeRequest(request, response, requestUrl, defaultModel) 
         onRetry: (event) => logUpstreamRetry(event, requestedModel, requestUrl.pathname),
       },
     );
+    notifyAccountFailure(upstream.status);
     await pipeResponse(upstream, response, HOP_BY_HOP_HEADERS);
     recordUsageEvent({
       model: requestedModel,
