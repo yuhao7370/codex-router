@@ -76,7 +76,11 @@ import { readHiddenModels } from "./model-picker-state.mjs";
 import { readVisionBridgeSettings } from "./vision-bridge-state.mjs";
 import { installedNativeVisionEngines } from "./vision-engines.mjs";
 import { VERSION } from "./version.mjs";
-import { activeAccount, startTaskManagerPoller } from "./task-manager-bridge.mjs";
+import {
+  activeAccount,
+  recordInjection,
+  startTaskManagerPoller,
+} from "./task-manager-bridge.mjs";
 import { startTaskManagerUi } from "./task-manager-ui.mjs";
 
 const LISTEN_HOST =
@@ -357,6 +361,7 @@ function nativeHeaders(request) {
     if (account.accountId) {
       headers["chatgpt-account-id"] = account.accountId;
     }
+    recordInjection(account.accountId, request.url);
   }
   return headers;
 }

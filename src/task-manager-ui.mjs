@@ -2,6 +2,7 @@ import http from "node:http";
 
 import {
   activeAccount,
+  injectionStats,
   listTaskManagerAccounts,
   readTaskManagerConfig,
   refreshActiveAccount,
@@ -86,6 +87,7 @@ const PAGE = `<!doctype html>
     <div class="row"><span class="k">CTM 端口</span><span class="v" id="port">…</span></div>
     <div class="row"><span class="k">Token</span><span class="v" id="token">…</span></div>
     <div class="row"><span class="k">当前使用账号</span><span class="v" id="active-account">…</span></div>
+    <div class="row"><span class="k">订阅 / 剩余</span><span class="v" id="account-quota">…</span></div>
     <div style="margin-top:10px">
       <button id="enable-btn">启用代理</button>
       <button class="ghost" id="disable-btn">停用代理</button>
@@ -102,6 +104,12 @@ const PAGE = `<!doctype html>
       <thead><tr><th>邮箱</th><th>ID</th><th>来源</th><th>状态</th><th></th></tr></thead>
       <tbody id="accounts-body"></tbody>
     </table>
+  </div>
+
+  <div class="card">
+    <h2>注入日志</h2>
+    <div class="row"><span class="k">成功注入次数</span><span class="v" id="injection-count">0</span></div>
+    <div id="injection-log" class="result" style="max-height:220px; overflow:auto;">暂无注入记录</div>
   </div>
 
   <div class="card">
@@ -147,6 +155,17 @@ const PAGE = `<!doctype html>
     el('port').textContent = String(status.port);
     el('token').textContent = status.token === 'set' ? '已设置' : '自动读取';
     el('active-account').textContent = status.account && status.account.accountId ? status.account.accountId : '（未获取 / 回退原生）';
+    const account = status.account;
+    el('account-quota').textContent = account && account.remainingPercent != null
+      ? (account.plan ? account.plan.toUpperCase() + ' · ' : '') + account.remainingPercent + '% 剩余'
+      : '—';
+    const injections = status.injections || { count: 0, recent: [] };
+    el('injection-count').textContent = String(injections.count);
+    el('injection-log').textContent = injections.recent && injections.recent.length
+      ? injections.recent.map(function (e) {
+          return e.at + '  ' + e.accountId + '  ' + (e.path || '');
+        }).join('\n')
+      : '暂无注入记录';
     el('port-input').value = String(status.port);
   }
 
@@ -251,6 +270,7 @@ const PAGE = `<!doctype html>
 
   loadStatus().catch(function (error) { setResult('test-result', false, '加载状态失败：' + error.message); });
   loadAccounts();
+  setInterval(function () { loadStatus().catch(function () {}); }, 5000);
 </script>
 </body>
 </html>`;
@@ -263,8 +283,14 @@ function statusPayload() {
     port: config.port,
     token: config.token ? "set" : "auto",
     account: account
-      ? { accountId: account.accountId, hasToken: Boolean(account.accessToken) }
+      ? {
+          accountId: account.accountId,
+          hasToken: Boolean(account.accessToken),
+          plan: account.plan || "",
+          remainingPercent: account.remainingPercent ?? null,
+        }
       : null,
+    injections: injectionStats(),
   };
 }
 

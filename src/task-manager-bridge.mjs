@@ -11,18 +11,25 @@ import os from "node:os";
 import path from "node:path";
 
 import { protectPrivateFile } from "./file-security.mjs";
+import { nativeProxyFetch } from "./native-proxy.mjs";
 import { STATE_DIR } from "./paths.mjs";
 
 const VERSION = 1;
 const DEFAULT_PORT = 6000;
 const REQUEST_TIMEOUT_MS = 3_000;
+const QUOTA_TIMEOUT_MS = 10_000;
 const POLL_INTERVAL_MS = 15_000;
 const STATE_PATH = path.join(STATE_DIR, "task-manager.json");
+const fetchNative = nativeProxyFetch();
+
+const MAX_INJECTION_EVENTS = 100;
 
 // The active account fetched from Codex_Task_Manager. `null` means the bridge
 // has no usable account right now, which makes the native path fall back to
 // the app's own authorization.
 let cached = null;
+let injectionCount = 0;
+const injectionEvents = [];
 
 function defaults() {
   return { version: VERSION, enabled: false, port: DEFAULT_PORT, token: "" };
@@ -152,6 +159,54 @@ function requestJson(port, token, pathname, method = "GET") {
   });
 }
 
+async function fetchAccountQuota(accessToken, accountId) {
+  try {
+    const headers = {
+      Authorization: `Bearer ${accessToken}`,
+      "User-Agent": "codex-router/task-manager",
+    };
+    if (accountId) headers["ChatGPT-Account-Id"] = accountId;
+    const response = await fetchNative(
+      "https://chatgpt.com/backend-api/wham/usage",
+      { headers, signal: AbortSignal.timeout(QUOTA_TIMEOUT_MS) },
+    );
+    if (!response.ok) return null;
+    const body = await response.json();
+    const windows = [
+      body?.rate_limit?.primary_window,
+      body?.rate_limit?.secondary_window,
+    ].filter((window) => window && typeof window.used_percent === "number");
+    const weekly =
+      windows.find(
+        (window) => Math.abs((window.limit_window_seconds || 0) - 604_800) <= 60_480,
+      ) || windows[0];
+    const used = weekly?.used_percent;
+    return {
+      plan: typeof body?.plan_type === "string" ? body.plan_type : "",
+      remainingPercent:
+        typeof used === "number" ? Math.max(0, Math.min(100, 100 - used)) : null,
+    };
+  } catch {
+    return null;
+  }
+}
+
+export function recordInjection(accountId, pathname) {
+  injectionCount += 1;
+  injectionEvents.unshift({
+    at: new Date().toISOString(),
+    accountId,
+    path: pathname || "",
+  });
+  if (injectionEvents.length > MAX_INJECTION_EVENTS) {
+    injectionEvents.length = MAX_INJECTION_EVENTS;
+  }
+}
+
+export function injectionStats() {
+  return { count: injectionCount, recent: injectionEvents.slice(0, 20) };
+}
+
 export async function testTaskManagerConnection() {
   const state = readTaskManagerConfig();
   try {
@@ -212,9 +267,12 @@ export async function refreshActiveAccount() {
   try {
     const { status, body } = await requestJson(state.port, token, "/api/auth/current");
     if (status === 200 && body && typeof body.access_token === "string" && body.access_token) {
+      const quota = await fetchAccountQuota(body.access_token, body.account_id);
       cached = {
         accountId: typeof body.account_id === "string" ? body.account_id : "",
         accessToken: body.access_token,
+        plan: quota?.plan || "",
+        remainingPercent: quota?.remainingPercent ?? null,
       };
       return cached;
     }
