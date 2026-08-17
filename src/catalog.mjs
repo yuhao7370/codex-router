@@ -42,6 +42,24 @@ import {
 
 const refresh = process.argv.includes("--refresh-native");
 const bundled = process.argv.includes("--bundled-native");
+const GPT_5_6_NATIVE_SLUGS = new Set([
+  "gpt-5.6-sol",
+  "gpt-5.6-terra",
+  "gpt-5.6-luna",
+]);
+
+export function normalizeNativeContextWindows(models) {
+  return models.map((model) =>
+    GPT_5_6_NATIVE_SLUGS.has(String(model.slug))
+      ? {
+          ...model,
+          context_window: 1_050_000,
+          max_context_window: 1_050_000,
+          auto_compact_token_limit: 900_000,
+        }
+      : model,
+  );
+}
 
 function atomicContents(target, contents) {
   mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
@@ -100,12 +118,13 @@ function captureNative() {
       "Refusing to capture an already-merged catalog. Disable the router before refreshing native models.",
     );
   }
+  const models = normalizeNativeContextWindows(parsed.models);
   const capturedWith = codexVersion();
   atomicJson(NATIVE_CATALOG_PATH, {
     ...(capturedWith ? { captured_with: capturedWith } : {}),
-    models: parsed.models,
+    models,
   });
-  return parsed;
+  return { ...parsed, models };
 }
 
 // A native capture is only trustworthy for the Codex build that produced it:
@@ -115,6 +134,17 @@ function captureNative() {
 // have.
 export function nativeCatalogIsReusable(parsed, currentVersion) {
   if (!parsed || !Array.isArray(parsed.models) || parsed.models.length === 0) {
+    return false;
+  }
+  if (
+    parsed.models.some(
+      (model) =>
+        GPT_5_6_NATIVE_SLUGS.has(String(model.slug)) &&
+        (model.context_window !== 1_050_000 ||
+          model.max_context_window !== 1_050_000 ||
+          model.auto_compact_token_limit !== 900_000),
+    )
+  ) {
     return false;
   }
   return !currentVersion || parsed.captured_with === currentVersion;
@@ -129,7 +159,10 @@ function nativeCatalog() {
         `Configured native model catalog is unavailable or invalid: ${source.path}`,
       );
     }
-    return catalog;
+    return {
+      ...catalog,
+      models: normalizeNativeContextWindows(catalog.models),
+    };
   }
   if (!existsSync(NATIVE_CATALOG_PATH) || refresh) return captureNative();
   const parsed = JSON.parse(readFileSync(NATIVE_CATALOG_PATH, "utf8"));

@@ -18,6 +18,7 @@ import {
   clampModelEfforts,
   codexEffortVocabulary,
   nativeCatalogIsReusable,
+  normalizeNativeContextWindows,
   promoteNativeMultiAgent,
   routedCatalogConfigured,
   routedModel,
@@ -565,6 +566,23 @@ test("native catalog cache is reusable only for the codex build that captured it
   // Invalid or empty caches are never reusable.
   assert.equal(nativeCatalogIsReusable(undefined, undefined), false);
   assert.equal(nativeCatalogIsReusable({ models: [] }, "codex-cli 0.146.1"), false);
+});
+
+test("native GPT-5.6 context windows use the official 1.05M limit", () => {
+  const unrelated = { slug: "gpt-5.5", context_window: 272000 };
+  const models = normalizeNativeContextWindows([
+    { slug: "gpt-5.6-sol", context_window: 272000, max_context_window: 272000 },
+    { slug: "gpt-5.6-terra", context_window: 272000, max_context_window: 272000 },
+    { slug: "gpt-5.6-luna", context_window: 272000, max_context_window: 272000 },
+    unrelated,
+  ]);
+
+  for (const model of models.slice(0, 3)) {
+    assert.equal(model.context_window, 1050000);
+    assert.equal(model.max_context_window, 1050000);
+    assert.equal(model.auto_compact_token_limit, 900000);
+  }
+  assert.equal(models[3], unrelated);
 });
 
 test("native listed models follow the local subagent opt-in", () => {
