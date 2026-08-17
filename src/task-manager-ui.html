@@ -1,0 +1,254 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Codex Router · CTM</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 24px; min-height: 100vh;
+    background: #0b1120; color: #e6edf7;
+    font: 14px/1.5 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+  }
+  .wrap { max-width: 760px; margin: 0 auto; }
+  h1 { font-size: 22px; margin: 0 0 2px; }
+  .sub { color: #7d8aa3; margin-bottom: 20px; }
+  .card {
+    background: #121a2b; border: 1px solid #24304a;
+    border-radius: 10px; padding: 18px; margin-bottom: 16px;
+  }
+  .card h2 { margin: 0 0 12px; font-size: 15px; color: #9fd4ff; }
+  .row { display: flex; justify-content: space-between; padding: 6px 0; border-bottom: 1px solid #1b2740; }
+  .row:last-child { border-bottom: 0; }
+  .k { color: #8a97ad; }
+  .v { font-family: ui-monospace, Consolas, monospace; word-break: break-all; text-align: right; }
+  .badge { display: inline-block; padding: 1px 9px; border-radius: 999px; font-size: 12px; }
+  .on { background: #143326; color: #5ce0a3; }
+  .off { background: #33171c; color: #ff8290; }
+  .muted { color: #7d8aa3; }
+  button {
+    background: #1d6fb8; color: #fff; border: 0; border-radius: 7px;
+    padding: 8px 14px; cursor: pointer; font-size: 13px; margin: 4px 6px 0 0;
+  }
+  button:hover { background: #2584d6; }
+  button.ghost { background: #24304a; }
+  button.ghost:hover { background: #2f3d5c; }
+  button.danger { background: #a9323f; }
+  button.danger:hover { background: #c03a49; }
+  button:disabled { opacity: 0.45; cursor: default; }
+  .result { margin-top: 10px; padding: 8px 10px; border-radius: 7px; background: #0e1523; font-size: 12px; white-space: pre-wrap; word-break: break-all; }
+  .result.ok { color: #5ce0a3; }
+  .result.err { color: #ff8290; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 8px 8px; border-bottom: 1px solid #1b2740; font-size: 13px; }
+  th { color: #8a97ad; font-weight: 500; }
+  td.mono { font-family: ui-monospace, Consolas, monospace; font-size: 12px; }
+  .field { display: flex; gap: 8px; align-items: center; margin: 8px 0; flex-wrap: wrap; }
+  label { color: #8a97ad; }
+  input {
+    background: #0e1523; border: 1px solid #2b3a59; color: #e6edf7;
+    border-radius: 7px; padding: 7px 9px; font-size: 13px; width: 170px;
+  }
+  input:focus { outline: 1px solid #3b8fd0; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Codex Router</h1>
+  <div class="sub">Codex_Task_Manager 账号代理控制台</div>
+
+  <div class="card">
+    <h2>状态</h2>
+    <div class="row"><span class="k">代理状态</span><span class="v"><span id="enabled-badge" class="badge off">…</span></span></div>
+    <div class="row"><span class="k">CTM 端口</span><span class="v" id="port">…</span></div>
+    <div class="row"><span class="k">Token</span><span class="v" id="token">…</span></div>
+    <div class="row"><span class="k">当前使用账号</span><span class="v" id="active-account">…</span></div>
+    <div class="row"><span class="k">订阅 / 剩余</span><span class="v" id="account-quota">…</span></div>
+    <div style="margin-top:10px">
+      <button id="enable-btn">启用代理</button>
+      <button class="ghost" id="disable-btn">停用代理</button>
+      <button class="ghost" id="test-btn">测试连接</button>
+    </div>
+    <div id="test-result" class="result" hidden></div>
+  </div>
+
+  <div class="card">
+    <h2>CTM 账号</h2>
+    <button class="ghost" id="refresh-accounts">刷新账号</button>
+    <div class="result" id="accounts-error" hidden></div>
+    <table>
+      <thead><tr><th>邮箱</th><th>ID</th><th>来源</th><th>状态</th><th></th></tr></thead>
+      <tbody id="accounts-body"></tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h2>注入日志</h2>
+    <div class="row"><span class="k">成功注入次数</span><span class="v" id="injection-count">0</span></div>
+    <div id="injection-log" class="result" style="max-height:220px; overflow:auto;">暂无注入记录</div>
+  </div>
+
+  <div class="card">
+    <h2>设置</h2>
+    <div class="field">
+      <label>端口</label>
+      <input id="port-input" type="number" min="1" max="65535" placeholder="6000">
+      <button class="ghost" id="save-port">保存端口</button>
+    </div>
+    <div class="field">
+      <label>Token</label>
+      <input id="token-input" type="password" placeholder="留空 = 自动读取">
+      <button class="ghost" id="save-token">保存 Token</button>
+      <button class="ghost" id="clear-token">清除 Token</button>
+    </div>
+  </div>
+</div>
+
+<script>
+  async function api(path, options) {
+    const response = await fetch(path, options);
+    let body = null;
+    try { body = await response.json(); } catch (e) {}
+    if (!response.ok) {
+      throw new Error(body && body.error ? body.error : ('HTTP ' + response.status));
+    }
+    return body;
+  }
+
+  function el(id) { return document.getElementById(id); }
+  function setResult(id, ok, text) {
+    const node = el(id);
+    node.hidden = false;
+    node.className = 'result ' + (ok ? 'ok' : 'err');
+    node.textContent = text;
+  }
+  function hideResult(id) { el(id).hidden = true; }
+
+  async function loadStatus() {
+    const status = await api('/api/status');
+    el('enabled-badge').textContent = status.enabled ? '已启用' : '未启用';
+    el('enabled-badge').className = 'badge ' + (status.enabled ? 'on' : 'off');
+    el('port').textContent = String(status.port);
+    el('token').textContent = status.token === 'set' ? '已设置' : '自动读取';
+    el('active-account').textContent = status.account && status.account.accountId ? status.account.accountId : '（未获取 / 回退原生）';
+    const account = status.account;
+    el('account-quota').textContent = account && account.remainingPercent != null
+      ? (account.plan ? account.plan.toUpperCase() + ' · ' : '') + account.remainingPercent + '% 剩余'
+      : '—';
+    const injections = status.injections || { count: 0, recent: [] };
+    el('injection-count').textContent = String(injections.count);
+    el('injection-log').textContent = injections.recent && injections.recent.length
+      ? injections.recent.map(function (e) {
+          return e.at + '  ' + e.accountId + '  ' + (e.path || '');
+        }).join(String.fromCharCode(10))
+      : '暂无注入记录';
+    el('port-input').value = String(status.port);
+  }
+
+  async function loadAccounts() {
+    hideResult('accounts-error');
+    try {
+      const payload = await api('/api/accounts');
+      const body = el('accounts-body');
+      body.textContent = '';
+      const accounts = Array.isArray(payload.accounts) ? payload.accounts : [];
+      for (const account of accounts) {
+        const tr = document.createElement('tr');
+        const email = account.email || '';
+        const id = account.id || account.account_id || '';
+        const source = account.source === 'native' ? '原生' : '托管';
+        const state = account.valid === false
+          ? '<span class="badge off">失效</span>'
+          : (account.is_default ? '<span class="badge on">当前</span>' : '<span class="badge">—</span>');
+        tr.innerHTML =
+          '<td>' + escapeHtml(email || '—') + '</td>' +
+          '<td class="mono">' + escapeHtml(id) + '</td>' +
+          '<td>' + source + '</td>' +
+          '<td>' + state + '</td>' +
+          '<td><button data-id="' + escapeHtml(id) + '" class="ghost select-btn"' +
+            (account.is_default ? ' disabled' : '') + '>选择</button></td>';
+        body.appendChild(tr);
+      }
+      if (accounts.length === 0) {
+        body.innerHTML = '<tr><td colspan="5" class="muted">没有账号</td></tr>';
+      }
+      for (const btn of document.querySelectorAll('.select-btn')) {
+        btn.addEventListener('click', async function () {
+          try {
+            await api('/api/select', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ id: btn.getAttribute('data-id') }),
+            });
+            await Promise.all([loadStatus(), loadAccounts()]);
+          } catch (error) {
+            setResult('accounts-error', false, '选择失败：' + error.message);
+          }
+        });
+      }
+    } catch (error) {
+      setResult('accounts-error', false, '获取账号失败：' + error.message);
+    }
+  }
+
+  function escapeHtml(value) {
+    return String(value).replace(/[&<>"']/g, function (ch) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch];
+    });
+  }
+
+  el('enable-btn').addEventListener('click', async function () {
+    try { await api('/api/enable', { method: 'POST' }); await loadStatus(); }
+    catch (error) { setResult('test-result', false, '启用失败：' + error.message); }
+  });
+  el('disable-btn').addEventListener('click', async function () {
+    try { await api('/api/disable', { method: 'POST' }); await loadStatus(); }
+    catch (error) { setResult('test-result', false, '停用失败：' + error.message); }
+  });
+  el('test-btn').addEventListener('click', async function () {
+    try {
+      const result = await api('/api/test', { method: 'POST' });
+      setResult('test-result', result.ok, result.ok ? '连接正常' : JSON.stringify(result));
+    } catch (error) {
+      setResult('test-result', false, '测试失败：' + error.message);
+    }
+  });
+  el('refresh-accounts').addEventListener('click', loadAccounts);
+  el('save-port').addEventListener('click', async function () {
+    try {
+      await api('/api/port', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ port: Number(el('port-input').value) }),
+      });
+      await loadStatus();
+    } catch (error) { setResult('test-result', false, '保存端口失败：' + error.message); }
+  });
+  el('save-token').addEventListener('click', async function () {
+    try {
+      await api('/api/token', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: el('token-input').value }),
+      });
+      el('token-input').value = '';
+      await loadStatus();
+    } catch (error) { setResult('test-result', false, '保存 Token 失败：' + error.message); }
+  });
+  el('clear-token').addEventListener('click', async function () {
+    try {
+      await api('/api/token', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: '' }),
+      });
+      el('token-input').value = '';
+      await loadStatus();
+    } catch (error) { setResult('test-result', false, '清除 Token 失败：' + error.message); }
+  });
+
+  loadStatus().catch(function (error) { setResult('test-result', false, '加载状态失败：' + error.message); });
+  loadAccounts();
+  setInterval(function () { loadStatus().catch(function () {}); }, 5000);
+</script>
+</body>
+</html>
