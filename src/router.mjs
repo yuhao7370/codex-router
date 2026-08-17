@@ -77,6 +77,7 @@ import { readVisionBridgeSettings } from "./vision-bridge-state.mjs";
 import { installedNativeVisionEngines } from "./vision-engines.mjs";
 import { VERSION } from "./version.mjs";
 import { activeAccount, startTaskManagerPoller } from "./task-manager-bridge.mjs";
+import { startTaskManagerUi } from "./task-manager-ui.mjs";
 
 const LISTEN_HOST =
   process.env.CODEX_ROUTER_HOST || process.env.KIMI_ROUTER_HOST || "127.0.0.1";
@@ -2306,6 +2307,7 @@ server.on("error", (error) => {
 server.requestTimeout = 0;
 server.headersTimeout = 65_000;
 startTaskManagerPoller();
+startTaskManagerUi();
 server.listen(LISTEN_PORT, LISTEN_HOST, () => {
   console.error("[codex-router] listening");
 });
