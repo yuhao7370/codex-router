@@ -332,7 +332,6 @@ async function chooseFallbackAccount() {
     return timestamp !== undefined && now - timestamp < FAILURE_MEMORY_MS;
   };
   const candidates = accounts.filter((account) => {
-    if (account.source === "native") return false;
     if (account.valid === false) return false;
     if (account.id === defaultId) return false;
     if (recentlyFailed(account.id) || recentlyFailed(account.account_id)) {
@@ -340,15 +339,21 @@ async function chooseFallbackAccount() {
     }
     return true;
   });
+  const usedOf = (account) => account.usage?.weekly_used_percent;
   const withQuota = candidates.filter((account) => {
-    const used = account.usage?.weekly_used_percent;
+    const used = usedOf(account);
     return typeof used === "number" && used < 100;
   });
-  const pool = withQuota.length ? withQuota : candidates;
+  // Prefer accounts that still have quota. Only fall back to accounts with no
+  // usage data yet; never bounce onto an account already known to be spent.
+  const unknownQuota = candidates.filter(
+    (account) => typeof usedOf(account) !== "number",
+  );
+  const pool = withQuota.length ? withQuota : unknownQuota;
   if (!pool.length) return null;
   return [...pool].sort((left, right) => {
-    const l = left.usage?.weekly_used_percent;
-    const r = right.usage?.weekly_used_percent;
+    const l = usedOf(left);
+    const r = usedOf(right);
     return (typeof l === "number" ? l : 101) - (typeof r === "number" ? r : 101);
   })[0];
 }
