@@ -105,8 +105,7 @@
       "    <h2>用量统计</h2>" +
       '    <div class="up-actions">' +
       '      <label class="up-toggle"><input type="checkbox" data-role="detail-toggle" checked> 显示明细</label>' +
-      '      <span class="up-foot"><span class="up-mono" data-role="source">…</span></span>' +
-      '      <button type="button" class="up-btn" data-role="sync">同步价格</button>' +
+      '      <button type="button" class="up-btn" data-role="sync">同步在线价格</button>' +
       '      <button type="button" class="up-btn" data-role="refresh">刷新</button>' +
       "    </div>" +
       "  </div>" +
@@ -166,9 +165,6 @@
 
     function render(data) {
       const accounts = Array.isArray(data.accounts) ? data.accounts : [];
-      const pricing = data.pricing || {};
-      const source = pricing.source === "models.dev" ? "models.dev 在线价" : "官方内置价";
-      q('[data-role="source"]').textContent = source;
 
       let requests = 0;
       let tokens = 0;
