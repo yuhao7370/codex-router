@@ -528,7 +528,7 @@
       ? errors.map(function (e) {
           const label = e.type === 'blocked'
             ? '踢出'
-            : (e.type === 'capacity' ? '容量上限' : '限流');
+            : (e.type === 'capacity' ? '容量上限' : (e.type === 'quota' ? '额度用完' : '限流'));
           const email = e.email || shortId(e.accountId);
           return formatTime(e.at) + '  [' + label + '] ' + email +
             (e.status ? ' (HTTP ' + e.status + ')' : '');

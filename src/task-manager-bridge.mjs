@@ -511,6 +511,31 @@ export async function failoverIfNeeded(reason = "poll") {
   return true;
 }
 
+function kickPoolAccount(
+  poolId,
+  { status = null, reason = "blocked", email = "", accountId = "" } = {},
+) {
+  const state = readTaskManagerConfig();
+  if (!Array.isArray(state.pool) || !state.pool.includes(poolId)) return false;
+  const remaining = state.pool.filter((id) => id !== poolId);
+  writeTaskManagerConfig({
+    pool: remaining,
+    blocked: {
+      ...state.blocked,
+      [poolId]: { at: Date.now(), status, reason },
+    },
+  });
+  poolCredentials = poolCredentials.filter((account) => account.id !== poolId);
+  recordErrorLog({
+    type: reason === "quota" ? "quota" : "blocked",
+    status,
+    accountId: accountId || "",
+    email,
+    message: reason === "quota" ? "额度用完" : "账号鉴权失败",
+  });
+  return true;
+}
+
 export function notifyAccountFailure(status, capacity = false) {
   if (!FAILOVER_TRIGGER_STATUSES.has(status)) return;
   const state = readTaskManagerConfig();
@@ -525,6 +550,19 @@ export function notifyAccountFailure(status, capacity = false) {
   }
 
   const isBlock = BLOCK_STATUSES.has(status);
+  const poolActive = Array.isArray(state.pool) && state.pool.length > 0;
+
+  if (isBlock && poolActive) {
+    // A hard failure removes the account from the pool so it can never be
+    // handed a request again.
+    kickPoolAccount(poolEntry ? poolEntry.id : accountId, {
+      status,
+      email,
+      accountId,
+    });
+    return;
+  }
+
   recordErrorLog({
     type: isBlock ? "blocked" : capacity ? "capacity" : "rate_limit",
     status,
@@ -537,27 +575,7 @@ export function notifyAccountFailure(status, capacity = false) {
         : "限流/额度",
   });
 
-  if (Array.isArray(state.pool) && state.pool.length > 0) {
-    // Pool mode: a hard failure removes the account from the pool so it can
-    // never be handed a request again, and records it as blocked for the UI.
-    if (isBlock) {
-      const poolId = poolEntry ? poolEntry.id : accountId;
-      const remaining = state.pool.filter((id) => id !== poolId);
-      if (remaining.length !== state.pool.length) {
-        writeTaskManagerConfig({
-          pool: remaining,
-          blocked: {
-            ...state.blocked,
-            [poolId]: { at: Date.now(), status },
-          },
-        });
-        poolCredentials = poolCredentials.filter(
-          (account) => account.id !== poolId,
-        );
-      }
-    }
-    return;
-  }
+  if (poolActive) return;
   if (!state.failover) return;
   failoverPending = true;
   scheduleImmediateFailover();
@@ -618,6 +636,23 @@ export async function refreshPool() {
     })
     .filter((account) => account.accessToken);
   poolCursor = 0;
+  // Accounts that already spent their weekly quota are as unusable as a dead
+  // credential: kick them so a healthy fallback is left standing.
+  const exhaustedIds = poolCredentials
+    .filter(
+      (account) =>
+        account.remainingPercent !== null && account.remainingPercent <= 0,
+    )
+    .map((account) => account.id);
+  for (const id of exhaustedIds) {
+    const account = poolCredentials.find((entry) => entry.id === id);
+    kickPoolAccount(id, {
+      status: 429,
+      reason: "quota",
+      email: account?.email || "",
+      accountId: account?.accountId || "",
+    });
+  }
   return poolCredentials;
 }
 
