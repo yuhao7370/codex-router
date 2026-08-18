@@ -22,6 +22,7 @@ import {
   setTaskManagerPort,
   setTaskManagerPool,
   setTaskManagerToken,
+  setUsagePanelVisible,
   testTaskManagerConnection,
 } from "./task-manager-bridge.mjs";
 import { panelUsageSnapshot } from "./provider-usage.mjs";
@@ -38,6 +39,11 @@ const CONVERTER_PATH = path.join(
   path.dirname(fileURLToPath(import.meta.url)),
   "sub2api-converter.html",
 );
+const USAGE_PAGE_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), "usage.html");
+const USAGE_PANEL_JS_PATH = path.join(
+  path.dirname(fileURLToPath(import.meta.url)),
+  "usage-panel.js",
+);
 
 function readPage() {
   return readFileSync(PAGE_PATH, "utf8");
@@ -45,6 +51,14 @@ function readPage() {
 
 function readConverter() {
   return readFileSync(CONVERTER_PATH, "utf8");
+}
+
+function readUsagePage() {
+  return readFileSync(USAGE_PAGE_PATH, "utf8");
+}
+
+function readUsagePanelJs() {
+  return readFileSync(USAGE_PANEL_JS_PATH, "utf8");
 }
 
 
@@ -57,6 +71,8 @@ function statusPayload() {
     failover: failoverStatus(),
     logIntervalMs: config.logIntervalMs,
     accountsIntervalMs: config.accountsIntervalMs,
+    usageIntervalMs: config.usageIntervalMs,
+    showUsagePanel: config.showUsagePanel,
     pool: poolStatus(),
     port: config.port,
     token: config.token ? "set" : "auto",
@@ -90,6 +106,14 @@ function sendHtml(response, body) {
   response.end(body);
 }
 
+function sendJs(response, body) {
+  response.writeHead(200, {
+    "Content-Type": "application/javascript; charset=utf-8",
+    "Content-Length": Buffer.byteLength(body),
+  });
+  response.end(body);
+}
+
 async function readJsonBody(request) {
   const chunks = [];
   for await (const chunk of request) chunks.push(chunk);
@@ -106,6 +130,12 @@ export function startTaskManagerUi() {
       }
       if (request.method === "GET" && url.pathname === "/converter") {
         return sendHtml(response, readConverter());
+      }
+      if (request.method === "GET" && url.pathname === "/usage") {
+        return sendHtml(response, readUsagePage());
+      }
+      if (request.method === "GET" && url.pathname === "/usage-panel.js") {
+        return sendJs(response, readUsagePanelJs());
       }
       if (request.method === "GET" && url.pathname === "/api/status") {
         return sendJson(response, 200, statusPayload());
@@ -153,6 +183,11 @@ export function startTaskManagerUi() {
       if (request.method === "POST" && url.pathname === "/api/usage/sync") {
         const result = await syncModelsDevPricing();
         return sendJson(response, 200, { ...result, pricing: pricingSyncState() });
+      }
+      if (request.method === "POST" && url.pathname === "/api/usage-panel") {
+        const body = await readJsonBody(request);
+        const config = setUsagePanelVisible(body.visible);
+        return sendJson(response, 200, { showUsagePanel: config.showUsagePanel });
       }
       if (request.method === "POST" && url.pathname === "/api/enable") {
         setTaskManagerEnabled(true);
