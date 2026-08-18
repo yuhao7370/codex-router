@@ -2,6 +2,12 @@ import { PROVIDERS } from "./model-registry.mjs";
 import { providerAccountUsageSnapshot } from "./provider-account-usage.mjs";
 import { readProviderSelection } from "./provider-selection.mjs";
 import { recentUsageEvents } from "./usage-events.mjs";
+import {
+  computeUsageCost,
+  findModelPricing,
+  loadPricingIndex,
+  pricingSyncState,
+} from "./model-pricing.mjs";
 
 function dateKey(value) {
   const date = new Date(value);
@@ -50,6 +56,7 @@ export function aggregateProviderUsage(events, { days = 90, now = Date.now() } =
         meteredRequests: 0,
         inputTokens: 0,
         outputTokens: 0,
+        cachedInputTokens: 0,
         totalTokens: 0,
         daily: new Map(),
         models: new Map(),
@@ -85,6 +92,7 @@ export function aggregateProviderUsage(events, { days = 90, now = Date.now() } =
     }
     provider.inputTokens += inputTokens;
     provider.outputTokens += outputTokens;
+    provider.cachedInputTokens += nonnegative(event.cachedInputTokens);
     provider.totalTokens += totalTokens;
     const day = dateKey(at);
     const bucket = provider.daily.get(day) || { startDate: day, tokens: 0, requests: 0 };
@@ -101,6 +109,7 @@ export function aggregateProviderUsage(events, { days = 90, now = Date.now() } =
       meteredRequests: 0,
       inputTokens: 0,
       outputTokens: 0,
+      cachedInputTokens: 0,
       totalTokens: 0,
       lastUsedAt: new Date(at).toISOString(),
     };
@@ -115,6 +124,7 @@ export function aggregateProviderUsage(events, { days = 90, now = Date.now() } =
     }
     model.inputTokens += inputTokens;
     model.outputTokens += outputTokens;
+    model.cachedInputTokens += nonnegative(event.cachedInputTokens);
     model.totalTokens += totalTokens;
     if (at >= Date.parse(model.lastUsedAt)) model.lastUsedAt = new Date(at).toISOString();
     provider.models.set(slug, model);
@@ -132,6 +142,208 @@ export function aggregateProviderUsage(events, { days = 90, now = Date.now() } =
         (left, right) => right.totalTokens - left.totalTokens || right.requests - left.requests,
       ),
     })),
+  };
+}
+
+// Attach USD cost estimates to a token-aggregated snapshot. Pricing is looked
+// up per model, so a provider's cost is the sum of its priced models; models
+// without a known price keep their token counts and report `priced: false`.
+export function attachUsageCosts(snapshot, index = loadPricingIndex()) {
+  const providers = snapshot.providers.map((provider) => {
+    let totalCost = 0;
+    let pricedModels = 0;
+    const models = provider.models.map((model) => {
+      const pricing = findModelPricing(model.slug, index);
+      if (!pricing) {
+        return {
+          ...model,
+          inputCost: 0,
+          outputCost: 0,
+          cacheReadCost: 0,
+          totalCost: 0,
+          priced: false,
+        };
+      }
+      const cost = computeUsageCost(pricing, model);
+      totalCost += cost.totalCost;
+      pricedModels += 1;
+      return {
+        ...model,
+        inputCost: cost.inputCost,
+        outputCost: cost.outputCost,
+        cacheReadCost: cost.cacheReadCost,
+        totalCost: cost.totalCost,
+        priced: true,
+      };
+    });
+    return {
+      ...provider,
+      models,
+      totalCost: Math.round(totalCost * 1e6) / 1e6,
+      pricedModels,
+    };
+  });
+  return {
+    ...snapshot,
+    providers,
+    pricing: pricingSyncState(),
+  };
+}
+
+// Aggregate native traffic by the Codex Task Manager account that injected
+// it. Rows without an `accountId` (recorded before account attribution
+// existed, or relayed under the caller's own auth) are intentionally dropped:
+// they cannot be assigned to a subscription after the fact.
+export function aggregateAccountUsage(events, { days = 90, now = Date.now() } = {}) {
+  const cutoff = now - days * 24 * 60 * 60 * 1_000;
+  const byAccount = new Map();
+  for (const event of events) {
+    const accountId =
+      typeof event?.accountId === "string" && event.accountId
+        ? event.accountId
+        : undefined;
+    if (!accountId) continue;
+    const at = Date.parse(event?.at);
+    if (!Number.isFinite(at) || at < cutoff || at > now) continue;
+    if (
+      event.meteringVersion !== 1 &&
+      event.totalTokens === undefined &&
+      event.inputTokens === undefined &&
+      event.outputTokens === undefined
+    ) continue;
+
+    let account = byAccount.get(accountId);
+    if (!account) {
+      account = {
+        accountId,
+        requests: 0,
+        successfulRequests: 0,
+        meteredRequests: 0,
+        inputTokens: 0,
+        outputTokens: 0,
+        cachedInputTokens: 0,
+        totalTokens: 0,
+        models: new Map(),
+      };
+      byAccount.set(accountId, account);
+    }
+    account.requests += 1;
+    if (event.status >= 200 && event.status < 400) account.successfulRequests += 1;
+    const inputTokens = nonnegative(event.inputTokens);
+    const outputTokens = nonnegative(event.outputTokens);
+    const totalTokens = nonnegative(
+      event.totalTokens ??
+        (event.inputTokens !== undefined || event.outputTokens !== undefined
+          ? inputTokens + outputTokens
+          : 0),
+    );
+    if (
+      event.totalTokens !== undefined ||
+      event.inputTokens !== undefined ||
+      event.outputTokens !== undefined
+    ) {
+      account.meteredRequests += 1;
+    }
+    account.inputTokens += inputTokens;
+    account.outputTokens += outputTokens;
+    account.cachedInputTokens += nonnegative(event.cachedInputTokens);
+    account.totalTokens += totalTokens;
+
+    const slug = typeof event.model === "string" && event.model ? event.model : "unknown";
+    const model = account.models.get(slug) || {
+      slug,
+      displayName: modelDisplayName(slug),
+      requests: 0,
+      successfulRequests: 0,
+      meteredRequests: 0,
+      inputTokens: 0,
+      outputTokens: 0,
+      cachedInputTokens: 0,
+      totalTokens: 0,
+      lastUsedAt: new Date(at).toISOString(),
+    };
+    model.requests += 1;
+    if (event.status >= 200 && event.status < 400) model.successfulRequests += 1;
+    if (
+      event.totalTokens !== undefined ||
+      event.inputTokens !== undefined ||
+      event.outputTokens !== undefined
+    ) {
+      model.meteredRequests += 1;
+    }
+    model.inputTokens += inputTokens;
+    model.outputTokens += outputTokens;
+    model.cachedInputTokens += nonnegative(event.cachedInputTokens);
+    model.totalTokens += totalTokens;
+    if (at >= Date.parse(model.lastUsedAt)) model.lastUsedAt = new Date(at).toISOString();
+    account.models.set(slug, model);
+  }
+
+  return [...byAccount.values()]
+    .map(({ models, ...account }) => ({
+      ...account,
+      models: [...models.values()].sort(
+        (left, right) =>
+          right.totalTokens - left.totalTokens || right.requests - left.requests,
+      ),
+    }))
+    .sort(
+      (left, right) =>
+        right.totalTokens - left.totalTokens || right.requests - left.requests,
+    );
+}
+
+export function attachAccountCosts(accounts, index = loadPricingIndex()) {
+  return accounts.map((account) => {
+    let totalCost = 0;
+    let pricedModels = 0;
+    const models = account.models.map((model) => {
+      const pricing = findModelPricing(model.slug, index);
+      if (!pricing) {
+        return {
+          ...model,
+          inputCost: 0,
+          outputCost: 0,
+          cacheReadCost: 0,
+          totalCost: 0,
+          priced: false,
+        };
+      }
+      const cost = computeUsageCost(pricing, model);
+      totalCost += cost.totalCost;
+      pricedModels += 1;
+      return {
+        ...model,
+        inputCost: cost.inputCost,
+        outputCost: cost.outputCost,
+        cacheReadCost: cost.cacheReadCost,
+        totalCost: cost.totalCost,
+        priced: true,
+      };
+    });
+    return {
+      ...account,
+      models,
+      totalCost: Math.round(totalCost * 1e6) / 1e6,
+      pricedModels,
+    };
+  });
+}
+
+// The panel path reads only local usage events and pricing; unlike
+// `providerUsageSnapshot` it never calls provider account APIs, so a dashboard
+// refresh stays fast and failure-tolerant.
+export function panelUsageSnapshot({ days = 90, now = Date.now() } = {}) {
+  const events = recentUsageEvents({
+    sinceMs: days * 24 * 60 * 60 * 1_000,
+    limit: 100_000,
+  });
+  const snapshot = aggregateProviderUsage(events, { days, now });
+  const withProviderCosts = attachUsageCosts(snapshot);
+  const accounts = attachAccountCosts(aggregateAccountUsage(events, { days, now }));
+  return {
+    ...withProviderCosts,
+    accounts,
   };
 }
 

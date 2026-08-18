@@ -49,6 +49,7 @@ import {
   fetchWithRetry,
   isAtCapacityResponse,
   isQuotaExhaustedResponse,
+  sleep,
 } from "./upstream-retry.mjs";
 import { nativeProxyFetch } from "./native-proxy.mjs";
 import {
@@ -369,6 +370,14 @@ function nativeHeaders(request) {
     recordInjection(account.accountId, request.url);
   }
   return headers;
+}
+
+// The native path stamps the injected CTM account on the upstream request as
+// `chatgpt-account-id`; read it back so usage can be attributed per account
+// rather than collapsing every subscription into one "native" bucket.
+function injectedAccountId(headers) {
+  const value = headers["chatgpt-account-id"];
+  return typeof value === "string" && value ? value : undefined;
 }
 
 function routedHeaders() {
@@ -1560,6 +1569,7 @@ async function handleResponses(request, response, requestUrl) {
   let retryUsage;
   let usage;
   let estimatedInputTokens;
+  let nativeAccountId;
   let emptyCompletion = false;
   let emptyCompletionRetried = false;
   let guardReleasedForBudget = false;
@@ -1659,6 +1669,7 @@ async function handleResponses(request, response, requestUrl) {
     let target;
     let headers;
     let routedBody;
+    let nativeContentEncoding;
     let namespacesFlattened = false;
     let flattenedNamespaces = new Map();
     if (route) {
@@ -1739,11 +1750,17 @@ async function handleResponses(request, response, requestUrl) {
       }
       if (!compactV1) delete native.previous_response_id;
       target = nativeTarget(requestUrl.pathname);
-      headers = nativeHeaders(request);
+      // Compress the body once: the bytes are account-independent, so a
+      // capacity retry can reuse them under a different account's headers.
+      const compressionProbe = {};
       routedBody = await compressedNativeBody(
         Buffer.from(JSON.stringify(native), "utf8"),
-        headers,
+        compressionProbe,
       );
+      nativeContentEncoding = compressionProbe["Content-Encoding"];
+      headers = nativeHeaders(request);
+      nativeAccountId = injectedAccountId(headers);
+      if (nativeContentEncoding) headers["Content-Encoding"] = nativeContentEncoding;
     }
 
     // `routedBody` is a fully materialized Buffer -- plain JSON, or the zstd
@@ -1752,24 +1769,66 @@ async function handleResponses(request, response, requestUrl) {
     // attempt replays the identical bytes under the identical encoding. Nothing
     // here consumes a stream, which is what makes the request replayable at
     // all.
-    const { response: upstream, retries } = await fetchWithRetry(
-      target,
-      {
-        method: "POST",
-        headers,
-        body: routedBody,
-        signal: controller.signal,
-      },
-      {
-        // Routed traffic terminates at the local gateway, which has its own
-        // error translation and Retry-After handling below; leave it exactly
-        // as it was.
-        retries: route ? 0 : undefined,
-        fetchImpl: route ? fetch : fetchNative,
-        canRetry: () => nothingRelayed(response),
-        onRetry: (event) => logUpstreamRetry(event, requestedModel, requestUrl.pathname),
-      },
-    );
+    let upstream;
+    let retries = 0;
+    if (route) {
+      const result = await fetchWithRetry(
+        target,
+        {
+          method: "POST",
+          headers,
+          body: routedBody,
+          signal: controller.signal,
+        },
+        {
+          // Routed traffic terminates at the local gateway, which has its own
+          // error translation and Retry-After handling below; leave it exactly
+          // as it was.
+          retries: 0,
+          fetchImpl: fetch,
+          canRetry: () => nothingRelayed(response),
+          onRetry: (event) => logUpstreamRetry(event, requestedModel, requestUrl.pathname),
+        },
+      );
+      upstream = result.response;
+      retries += result.retries;
+    } else {
+      // A native turn that hits "model at capacity" retries on the next pooled
+      // account instead of relaying the error, so one saturated account never
+      // blocks the whole request.
+      const maxAccountAttempts = 5;
+      let result;
+      let capacityBackoffMs = 500;
+      for (let attempt = 0; attempt < maxAccountAttempts; attempt += 1) {
+        result = await fetchWithRetry(
+          target,
+          {
+            method: "POST",
+            headers,
+            body: routedBody,
+            signal: controller.signal,
+          },
+          {
+            fetchImpl: fetchNative,
+            canRetry: () => nothingRelayed(response),
+            onRetry: (event) => logUpstreamRetry(event, requestedModel, requestUrl.pathname),
+          },
+        );
+        upstream = result.response;
+        retries += result.retries;
+        const capacity = !upstream.ok && (await isAtCapacityResponse(upstream));
+        if (!capacity || attempt === maxAccountAttempts - 1) break;
+        notifyAccountFailure(upstream.status, true, false);
+        await upstream.body?.cancel().catch(() => {});
+        // Let the model shed load before the next account tries again.
+        await sleep(capacityBackoffMs, controller.signal);
+        capacityBackoffMs = Math.min(capacityBackoffMs * 2, 8_000);
+        controller.signal.throwIfAborted();
+        headers = nativeHeaders(request);
+        nativeAccountId = injectedAccountId(headers);
+        if (nativeContentEncoding) headers["Content-Encoding"] = nativeContentEncoding;
+      }
+    }
     upstreamRetries = retries;
     // Time until the upstream chain answered the request. Everything before
     // this is router-side work (body read, normalization, flattening, vision
@@ -2016,6 +2075,7 @@ async function handleResponses(request, response, requestUrl) {
     recordUsageEvent({
       model: route?.slug || requestedModel,
       provider: route ? canonicalProviderId(route.provider) : "openai",
+      accountId: nativeAccountId,
       status: finalStatus,
       durationMs: Date.now() - startedAt,
       retries: upstreamRetries,
@@ -2073,6 +2133,7 @@ async function handleResponses(request, response, requestUrl) {
         recordUsageEvent({
           model: route?.slug || requestedModel,
           provider: route ? canonicalProviderId(route.provider) : "openai",
+          accountId: nativeAccountId,
           status: 0,
           durationMs: Date.now() - startedAt,
           retries: upstreamRetries,
@@ -2095,6 +2156,7 @@ async function handleResponses(request, response, requestUrl) {
       recordUsageEvent({
         model: route?.slug || requestedModel,
         provider: route ? canonicalProviderId(route.provider) : "openai",
+        accountId: nativeAccountId,
         status: finalStatus,
         durationMs: Date.now() - startedAt,
         retries: upstreamRetries,
@@ -2153,6 +2215,7 @@ async function handleNativeRequest(request, response, requestUrl, defaultModel) 
     });
 
     const headers = nativeHeaders(request);
+    const nativeAccountId = injectedAccountId(headers);
     // Same replayable-Buffer rule as the turn path: encode once, outside the
     // retry, so every attempt carries identical bytes under identical headers.
     const imageBody = await compressedNativeBody(body, headers);
@@ -2184,6 +2247,7 @@ async function handleNativeRequest(request, response, requestUrl, defaultModel) 
     recordUsageEvent({
       model: requestedModel,
       provider: "openai",
+      accountId: nativeAccountId,
       status: upstream.status,
       durationMs: Date.now() - startedAt,
       retries: upstreamRetries,

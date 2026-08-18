@@ -24,6 +24,8 @@ import {
   setTaskManagerToken,
   testTaskManagerConnection,
 } from "./task-manager-bridge.mjs";
+import { panelUsageSnapshot } from "./provider-usage.mjs";
+import { pricingSyncState, syncModelsDevPricing } from "./model-pricing.mjs";
 
 const HOST = "127.0.0.1";
 const PORT = Number(
@@ -108,6 +110,41 @@ export function startTaskManagerUi() {
       if (request.method === "GET" && url.pathname === "/api/status") {
         return sendJson(response, 200, statusPayload());
       }
+      if (request.method === "GET" && url.pathname === "/api/usage") {
+        const snapshot = panelUsageSnapshot();
+        const accountMeta = new Map();
+        try {
+          const accounts = await listTaskManagerAccounts();
+          for (const account of Array.isArray(accounts?.accounts) ? accounts.accounts : []) {
+            const id = account.account_id || account.id;
+            if (id) {
+              accountMeta.set(String(id), {
+                email: typeof account.email === "string" ? account.email : "",
+                plan:
+                  account.usage && typeof account.usage.plan === "string"
+                    ? account.usage.plan
+                    : "",
+              });
+            }
+          }
+        } catch {
+          // CTM may be stopped or unauthenticated; the account list stays
+          // usable keyed by its raw id without names.
+        }
+        const accounts = (snapshot.accounts || []).map((account) => {
+          const meta = accountMeta.get(account.accountId);
+          return {
+            ...account,
+            email: meta?.email || "",
+            plan: meta?.plan || "",
+          };
+        });
+        return sendJson(response, 200, { ...snapshot, accounts });
+      }
+      if (request.method === "POST" && url.pathname === "/api/usage/sync") {
+        const result = await syncModelsDevPricing();
+        return sendJson(response, 200, { ...result, pricing: pricingSyncState() });
+      }
       if (request.method === "POST" && url.pathname === "/api/enable") {
         setTaskManagerEnabled(true);
         await refreshActiveAccount();
@@ -180,5 +217,20 @@ export function startTaskManagerUi() {
   server.listen(PORT, HOST, () => {
     console.error(`[codex-router] task-manager UI at http://127.0.0.1:${PORT}`);
   });
+
+  // Refresh the models.dev price snapshot in the background without delaying
+  // startup. The panel keeps working on seed prices while this is in flight.
+  setTimeout(() => {
+    syncModelsDevPricing()
+      .then((result) => {
+        if (result.ok) {
+          console.error(`[codex-router] models.dev pricing synced (${result.modelCount} models)`);
+        } else {
+          console.error(`[codex-router] models.dev pricing sync failed: ${result.error}`);
+        }
+      })
+      .catch(() => {});
+  }, 5_000);
+
   return server;
 }

@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { aggregateProviderUsage } from "../src/provider-usage.mjs";
+import {
+  aggregateAccountUsage,
+  aggregateProviderUsage,
+  attachAccountCosts,
+  attachUsageCosts,
+} from "../src/provider-usage.mjs";
 
 test("protocol variants never appear as separate usage providers", () => {
   const snapshot = aggregateProviderUsage([], { now: Date.parse("2026-07-21T18:00:00Z") });
@@ -141,4 +146,147 @@ test("keeps unlabeled model traffic visible instead of dropping it", () => {
 
   assert.deepEqual(grok.models.map((model) => model.slug), ["unknown"]);
   assert.equal(grok.models[0].totalTokens, 25);
+});
+
+test("attaches per-model and provider cost from a pricing index", () => {
+  const now = Date.parse("2026-07-21T18:00:00Z");
+  const snapshot = aggregateProviderUsage(
+    [
+      {
+        meteringVersion: 1,
+        at: "2026-07-20T12:00:00Z",
+        provider: "deepseek",
+        model: "deepseek/deepseek-v4-flash",
+        status: 200,
+        inputTokens: 1000,
+        outputTokens: 500,
+        cachedInputTokens: 200,
+        totalTokens: 1500,
+      },
+      {
+        meteringVersion: 1,
+        at: "2026-07-20T12:00:00Z",
+        provider: "meta",
+        model: "meta/muse-spark-1.1",
+        status: 200,
+        inputTokens: 100,
+        outputTokens: 50,
+        totalTokens: 150,
+      },
+    ],
+    { days: 7, now },
+  );
+  const index = new Map([
+    [
+      "deepseek-v4-flash",
+      { modelId: "deepseek-v4-flash", displayName: "DeepSeek V4 Flash", input: 1, output: 2, cacheRead: 0.1, cacheWrite: 0 },
+    ],
+  ]);
+  const enriched = attachUsageCosts(snapshot, index);
+
+  const deepseek = enriched.providers.find((provider) => provider.id === "deepseek");
+  assert.equal(deepseek.totalCost, 0.00182);
+  const flash = deepseek.models.find((model) => model.slug === "deepseek/deepseek-v4-flash");
+  assert.equal(flash.priced, true);
+  assert.equal(flash.inputCost, 0.0008);
+
+  const meta = enriched.providers.find((provider) => provider.id === "meta");
+  assert.equal(meta.totalCost, 0);
+  assert.equal(meta.models[0].priced, false);
+});
+
+test("groups native traffic by CTM account and drops unattributed rows", () => {
+  const now = Date.parse("2026-07-21T18:00:00Z");
+  const accounts = aggregateAccountUsage(
+    [
+      {
+        meteringVersion: 1,
+        at: "2026-07-20T12:00:00Z",
+        provider: "openai",
+        accountId: "acct-a",
+        model: "gpt-5.6-sol",
+        status: 200,
+        inputTokens: 100,
+        outputTokens: 40,
+        cachedInputTokens: 10,
+        totalTokens: 140,
+      },
+      {
+        meteringVersion: 1,
+        at: "2026-07-20T13:00:00Z",
+        provider: "openai",
+        accountId: "acct-a",
+        model: "gpt-5.6-luna",
+        status: 200,
+        inputTokens: 300,
+        outputTokens: 50,
+        totalTokens: 350,
+      },
+      {
+        meteringVersion: 1,
+        at: "2026-07-20T14:00:00Z",
+        provider: "openai",
+        accountId: "acct-b",
+        model: "gpt-5.6-sol",
+        status: 200,
+        inputTokens: 20,
+        outputTokens: 10,
+        totalTokens: 30,
+      },
+      {
+        meteringVersion: 1,
+        at: "2026-07-20T15:00:00Z",
+        provider: "openai",
+        model: "gpt-5.6-sol",
+        status: 200,
+        inputTokens: 999,
+        outputTokens: 999,
+        totalTokens: 1998,
+      },
+    ],
+    { days: 7, now },
+  );
+
+  const byId = Object.fromEntries(accounts.map((account) => [account.accountId, account]));
+  assert.equal(accounts.length, 2);
+  assert.equal(byId["acct-a"].totalTokens, 490);
+  assert.equal(byId["acct-a"].cachedInputTokens, 10);
+  assert.equal(byId["acct-a"].models.length, 2);
+  assert.equal(byId["acct-b"].totalTokens, 30);
+  assert.equal(byId["unattributed"], undefined);
+});
+
+test("attaches account cost from a pricing index", () => {
+  const accounts = [
+    {
+      accountId: "acct-a",
+      requests: 1,
+      successfulRequests: 1,
+      meteredRequests: 1,
+      inputTokens: 1000,
+      outputTokens: 500,
+      cachedInputTokens: 200,
+      totalTokens: 1500,
+      models: [
+        {
+          slug: "gpt-5.6-sol",
+          displayName: "gpt-5.6-sol",
+          inputTokens: 1000,
+          outputTokens: 500,
+          cachedInputTokens: 200,
+          totalTokens: 1500,
+        },
+      ],
+    },
+  ];
+  const index = new Map([
+    [
+      "gpt-5.6-sol",
+      { modelId: "gpt-5.6-sol", displayName: "GPT-5.6 Sol", input: 5, output: 30, cacheRead: 0.5, cacheWrite: 6.25 },
+    ],
+  ]);
+  const enriched = attachAccountCosts(accounts, index);
+  // billable input 800 * 5/M = 0.004; output 500 * 30/M = 0.015; cache 200 * 0.5/M = 0.0001.
+  assert.equal(enriched[0].totalCost, 0.0191);
+  assert.equal(enriched[0].models[0].priced, true);
 });

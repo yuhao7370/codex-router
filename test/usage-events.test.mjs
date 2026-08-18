@@ -103,6 +103,44 @@ test("an aborted stream persists its marker and reads back", async () => {
   }
 });
 
+test("an attributed native turn persists its CTM account id", async () => {
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), "model-router-usage-"));
+  const previousStateDir = process.env.MODEL_ROUTER_STATE_DIR;
+  process.env.MODEL_ROUTER_STATE_DIR = stateDir;
+  try {
+    const usage = await import(`../src/usage-events.mjs?account=1&ts=${Date.now()}`);
+    usage.recordUsageEvent({
+      model: "gpt-5.6-sol",
+      provider: "openai",
+      accountId: "acct-123",
+      status: 200,
+      durationMs: 50,
+      inputTokens: 10,
+      outputTokens: 5,
+    });
+    const [event] = usage
+      .recentUsageEvents()
+      .filter((candidate) => candidate.accountId === "acct-123");
+    assert.equal(event.accountId, "acct-123");
+
+    // Routed turns and unattributed native turns omit the field entirely.
+    usage.recordUsageEvent({
+      model: "deepseek/deepseek-v4-flash",
+      provider: "deepseek",
+      status: 200,
+      durationMs: 40,
+    });
+    const unattributed = usage
+      .recentUsageEvents()
+      .find((candidate) => candidate.provider === "deepseek");
+    assert.equal("accountId" in unattributed, false);
+  } finally {
+    if (previousStateDir === undefined) delete process.env.MODEL_ROUTER_STATE_DIR;
+    else process.env.MODEL_ROUTER_STATE_DIR = previousStateDir;
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
 test("a guard budget release persists its marker and reads back", async () => {
   const stateDir = mkdtempSync(path.join(os.tmpdir(), "model-router-usage-"));
   const previousStateDir = process.env.MODEL_ROUTER_STATE_DIR;

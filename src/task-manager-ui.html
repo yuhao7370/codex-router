@@ -248,13 +248,35 @@
   .hint a:hover { text-decoration: underline; }
   #pool-hint { margin: 6px 0 10px; }
 
+  /* ===== 用量统计 ===== */
+  .usage-hero { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 16px; margin-bottom: 18px; }
+  .usage-number { display: flex; flex-direction: column; }
+  .usage-number .label {
+    font-size: 11.5px; font-weight: 700; letter-spacing: 0.08em;
+    text-transform: uppercase; color: var(--muted);
+  }
+  .usage-number .value { margin-top: 8px; font-size: 20px; font-weight: 700; letter-spacing: -0.01em; }
+  .usage-number .value.accent { color: var(--accent); }
+  .usage-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.45fr); gap: 18px; align-items: start; }
+  .usage-grid h3 {
+    margin: 0 0 10px; font-size: 13px; font-weight: 700; color: #2b3550;
+    display: flex; align-items: center; gap: 8px;
+  }
+  .usage-grid h3::before {
+    content: ""; width: 3px; height: 12px; border-radius: 2px; flex: none;
+    background: linear-gradient(180deg, var(--accent), var(--accent2));
+  }
+
   @media (max-width: 1200px) {
     .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .main { grid-template-columns: 1fr; }
+    .usage-hero { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .usage-grid { grid-template-columns: 1fr; }
   }
   @media (max-width: 640px) {
     body { padding: 16px 14px 32px; }
     .stats { grid-template-columns: 1fr; }
+    .usage-hero { grid-template-columns: 1fr; }
     .card { padding: 16px; }
   }
 </style>
@@ -299,6 +321,58 @@
       <div class="stat-label">故障自动切换</div>
       <div class="stat-value"><span id="failover-badge" class="badge">…</span></div>
       <div class="stat-foot">上次切换：<span id="failover-last">…</span></div>
+    </div>
+  </section>
+
+  <section class="usage-panel">
+    <div class="card">
+      <div class="card-head">
+        <h2>用量统计</h2>
+        <div class="head-actions">
+          <span class="stat-foot" style="margin:0"><span id="usage-price-source" class="mono">…</span> · <span class="mono" id="usage-countdown">…</span> 后刷新</span>
+          <button class="ghost" id="sync-pricing">同步价格</button>
+          <button class="ghost" id="refresh-usage">刷新</button>
+        </div>
+      </div>
+      <div class="result" id="usage-sync-result" hidden></div>
+      <div class="usage-hero">
+        <div class="usage-number">
+          <div class="label">请求数</div>
+          <div class="value" id="usage-requests">—</div>
+        </div>
+        <div class="usage-number">
+          <div class="label">总 Token（90 天）</div>
+          <div class="value" id="usage-tokens">—</div>
+        </div>
+        <div class="usage-number">
+          <div class="label">缓存命中 Token</div>
+          <div class="value" id="usage-cache">—</div>
+        </div>
+        <div class="usage-number">
+          <div class="label">等效成本（90 天）</div>
+          <div class="value accent" id="usage-cost">—</div>
+        </div>
+      </div>
+      <div class="usage-grid">
+        <div>
+          <h3>账号用量</h3>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>账号</th><th>输入</th><th>输出</th><th>缓存</th><th>总 Token</th><th>等效成本</th></tr></thead>
+              <tbody id="usage-providers-body"></tbody>
+            </table>
+          </div>
+        </div>
+        <div>
+          <h3>模型明细</h3>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>账号</th><th>模型</th><th>总 Token</th><th>等效成本</th></tr></thead>
+              <tbody id="usage-models-body"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
     </div>
   </section>
 
@@ -421,6 +495,19 @@
   function shortId(id) {
     const value = String(id || '');
     return value.length > 12 ? value.slice(0, 8) + '…' : value;
+  }
+
+  function fmtTokens(value) {
+    const n = Math.round(Number(value) || 0);
+    if (n >= 1e8) return (n / 1e8).toFixed(2) + ' 亿';
+    if (n >= 1e4) return (n / 1e4).toFixed(2) + ' 万';
+    return n.toLocaleString('en-US');
+  }
+
+  function fmtUsd(value) {
+    const n = Number(value) || 0;
+    const text = n.toFixed(4).replace(/0+$/, '').replace(/\.$/, '');
+    return '$' + text;
   }
 
   let accountIndex = new Map();
@@ -628,6 +715,89 @@
     });
   }
 
+  function renderUsage(data) {
+    const accounts = Array.isArray(data.accounts) ? data.accounts : [];
+    const pricing = data.pricing || {};
+    const source = pricing.source === 'models.dev' ? 'models.dev 在线价' : '官方内置价';
+    const updated = pricing.updatedAt
+      ? ' · 更新于 ' + formatAge(Math.floor(new Date(pricing.updatedAt).getTime() / 1000))
+      : '';
+    el('usage-price-source').textContent = source + updated;
+
+    let requests = 0;
+    let tokens = 0;
+    let cache = 0;
+    let cost = 0;
+    for (const account of accounts) {
+      requests += Number(account.requests) || 0;
+      tokens += Number(account.totalTokens) || 0;
+      cache += Number(account.cachedInputTokens) || 0;
+      cost += Number(account.totalCost) || 0;
+    }
+    el('usage-requests').textContent = fmtTokens(requests);
+    el('usage-tokens').textContent = fmtTokens(tokens);
+    el('usage-cache').textContent = fmtTokens(cache);
+    el('usage-cost').textContent = fmtUsd(cost);
+
+    const accountRows = accounts
+      .filter((account) => account.requests > 0 || account.totalTokens > 0)
+      .sort((left, right) =>
+        (right.totalTokens || 0) - (left.totalTokens || 0) ||
+        (right.requests || 0) - (left.requests || 0));
+    const providerBody = el('usage-providers-body');
+    providerBody.textContent = '';
+    for (const account of accountRows) {
+      const label = account.email || shortId(account.accountId) || '—';
+      const tr = document.createElement('tr');
+      tr.innerHTML =
+        '<td>' + escapeHtml(label) + '</td>' +
+        '<td class="mono">' + fmtTokens(account.inputTokens) + '</td>' +
+        '<td class="mono">' + fmtTokens(account.outputTokens) + '</td>' +
+        '<td class="mono">' + fmtTokens(account.cachedInputTokens) + '</td>' +
+        '<td class="mono">' + fmtTokens(account.totalTokens) + '</td>' +
+        '<td class="mono">' + fmtUsd(account.totalCost) + '</td>';
+      providerBody.appendChild(tr);
+    }
+    if (accountRows.length === 0) {
+      providerBody.innerHTML = '<tr><td colspan="6" class="muted">暂无用量记录</td></tr>';
+    }
+
+    const modelRows = [];
+    for (const account of accounts) {
+      for (const model of Array.isArray(account.models) ? account.models : []) {
+        if (model.requests > 0 || model.totalTokens > 0) {
+          modelRows.push({
+            ...model,
+            accountLabel: account.email || shortId(account.accountId) || '—',
+          });
+        }
+      }
+    }
+    modelRows.sort((left, right) =>
+      (right.totalTokens || 0) - (left.totalTokens || 0) ||
+      (right.requests || 0) - (left.requests || 0));
+    const modelBody = el('usage-models-body');
+    modelBody.textContent = '';
+    for (const model of modelRows.slice(0, 300)) {
+      const tr = document.createElement('tr');
+      tr.innerHTML =
+        '<td>' + escapeHtml(model.accountLabel) + '</td>' +
+        '<td class="mono">' + escapeHtml(model.displayName || model.slug) + '</td>' +
+        '<td class="mono">' + fmtTokens(model.totalTokens) + '</td>' +
+        '<td class="mono">' + (model.priced ? fmtUsd(model.totalCost) : '—') + '</td>';
+      modelBody.appendChild(tr);
+    }
+    if (modelRows.length === 0) {
+      modelBody.innerHTML = '<tr><td colspan="4" class="muted">暂无用量记录</td></tr>';
+    }
+  }
+
+  async function loadUsage() {
+    try {
+      renderUsage(await api('/api/usage'));
+    } catch (error) {}
+  }
+
   el('enable-btn').addEventListener('click', async function () {
     try { await api('/api/enable', { method: 'POST' }); await loadStatus(); }
     catch (error) { setResult('test-result', false, '启用失败：' + error.message); }
@@ -757,12 +927,33 @@
     }
   });
 
+  el('refresh-usage').addEventListener('click', loadUsage);
+  el('sync-pricing').addEventListener('click', async function () {
+    hideResult('usage-sync-result');
+    try {
+      const result = await api('/api/usage/sync', { method: 'POST' });
+      setResult(
+        'usage-sync-result',
+        Boolean(result.ok),
+        result.ok
+          ? '已同步 ' + result.modelCount + ' 个模型价格'
+          : '同步失败：' + (result.error || '未知错误'),
+      );
+      await loadUsage();
+    } catch (error) {
+      setResult('usage-sync-result', false, '同步失败：' + error.message);
+    }
+  });
+
   let logIntervalMs = 2000;
   let accountsIntervalMs = 15000;
+  let usageIntervalMs = 5000;
   let logNextAt = 0;
   let accountsNextAt = 0;
+  let usageNextAt = 0;
   let logTimer = null;
   let accountsTimer = null;
+  let usageTimer = null;
 
   async function pollLog() {
     try { await loadStatus(); } catch (error) {}
@@ -776,10 +967,17 @@
     accountsTimer = setTimeout(pollAccounts, accountsIntervalMs);
   }
 
+  async function pollUsage() {
+    try { await loadUsage(); } catch (error) {}
+    usageNextAt = Date.now() + usageIntervalMs;
+    usageTimer = setTimeout(pollUsage, usageIntervalMs);
+  }
+
   function tickCountdown() {
     const now = Date.now();
     el('log-countdown').textContent = Math.max(0, Math.ceil((logNextAt - now) / 1000)) + 's';
     el('accounts-countdown').textContent = Math.max(0, Math.ceil((accountsNextAt - now) / 1000)) + 's';
+    el('usage-countdown').textContent = Math.max(0, Math.ceil((usageNextAt - now) / 1000)) + 's';
   }
 
   el('save-intervals').addEventListener('click', async function () {
@@ -817,8 +1015,10 @@
     } catch (error) {}
     await loadAccounts();
     await loadStatus();
+    await loadUsage();
     pollLog();
     pollAccounts();
+    pollUsage();
   }
   boot().catch(function (error) { setResult('test-result', false, '加载失败：' + error.message); });
   setInterval(tickCountdown, 1000);

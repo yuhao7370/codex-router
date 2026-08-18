@@ -28,6 +28,10 @@ function safeRetryCount(value) {
 export function recordUsageEvent({
   model,
   provider,
+  // The Codex Task Manager account that authenticated this turn. Only
+  // present on native turns where an account was injected; routed turns have
+  // no CTM account and omit it.
+  accountId,
   status,
   durationMs,
   inputTokens,
@@ -68,6 +72,7 @@ export function recordUsageEvent({
     at: new Date(at).toISOString(),
     model: safeText(model, "unknown"),
     provider: safeText(provider, "unknown"),
+    ...(safeText(accountId, "") ? { accountId: safeText(accountId, "") } : {}),
     status: Number.isInteger(status) ? status : 0,
     durationMs: Number.isFinite(durationMs) ? Math.max(0, Math.round(durationMs)) : 0,
     ...(streamAborted === true ? { streamAborted: true } : {}),
@@ -143,6 +148,7 @@ export function recentUsageEvents({ sinceMs = 24 * 60 * 60 * 1000, limit = 1_000
           // the whole family into its canonical provider so usage stays one
           // series per subscription.
           provider: canonicalProviderId(safeText(event.provider, "unknown")),
+          ...(safeText(event.accountId, "") ? { accountId: safeText(event.accountId, "") } : {}),
           status: Number.isInteger(event.status) ? event.status : 0,
           durationMs: Number.isFinite(event.durationMs)
             ? Math.max(0, Math.round(event.durationMs))
