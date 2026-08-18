@@ -530,9 +530,17 @@
     el('port-input').value = String(status.port);
   }
 
-  async function loadAccounts() {
+  async function loadAccounts(preserveChecks = false) {
     hideResult('accounts-error');
     try {
+      // During a periodic refresh, keep any unsaved checkbox selections so the
+      // poll never wipes a pool the user is still building.
+      const pendingChecks = new Set();
+      if (preserveChecks) {
+        for (const input of document.querySelectorAll('.pool-check')) {
+          if (input.checked) pendingChecks.add(input.getAttribute('data-id'));
+        }
+      }
       const payload = await api('/api/accounts');
       const body = el('accounts-body');
       body.textContent = '';
@@ -554,9 +562,12 @@
           ? (usage.plan ? String(usage.plan).toUpperCase() + ' ' : '') +
             Math.max(0, Math.min(100, 100 - usage.weekly_used_percent)) + '%'
           : '—';
+        const checked = preserveChecks
+          ? (pendingChecks.has(id) || currentPool.has(id))
+          : currentPool.has(id);
         tr.innerHTML =
           '<td><input type="checkbox" class="pool-check" data-id="' + escapeHtml(id) + '"' +
-            (currentPool.has(id) ? ' checked' : '') + (blocked ? ' disabled' : '') + '></td>' +
+            (checked ? ' checked' : '') + (blocked ? ' disabled' : '') + '></td>' +
           '<td>' + escapeHtml(email || '—') + '</td>' +
           '<td class="mono">' + escapeHtml(id) + '</td>' +
           '<td>' + source + '</td>' +
@@ -751,6 +762,7 @@
   }
   boot().catch(function (error) { setResult('test-result', false, '加载失败：' + error.message); });
   setInterval(function () { loadStatus().catch(function () {}); }, 2000);
+  setInterval(function () { loadAccounts(true).catch(function () {}); }, 15000);
 </script>
 </body>
 </html>
