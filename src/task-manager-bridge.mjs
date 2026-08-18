@@ -36,12 +36,16 @@ let lastFailover = null;
 let failoverPending = false;
 let failoverScheduled = false;
 const accountFailureMemory = new Map();
+let poolCredentials = [];
+let poolCursor = 0;
+let lastInjectedId = null;
 
 function defaults() {
   return {
     version: VERSION,
     enabled: false,
     failover: false,
+    pool: [],
     port: DEFAULT_PORT,
     token: "",
   };
@@ -54,6 +58,9 @@ export function readTaskManagerConfig() {
     const state = { ...defaults(), ...parsed };
     state.enabled = Boolean(state.enabled);
     state.failover = Boolean(state.failover);
+    state.pool = Array.isArray(state.pool)
+      ? state.pool.map((id) => String(id)).filter(Boolean)
+      : [];
     state.port = Number.isInteger(state.port) ? state.port : DEFAULT_PORT;
     if (state.port < 1 || state.port > 65_535) state.port = DEFAULT_PORT;
     state.token = String(state.token || "").trim();
@@ -112,6 +119,19 @@ export function setTaskManagerFailover(failover) {
   if (!state.failover) {
     failoverPending = false;
     accountFailureMemory.clear();
+  }
+  return state;
+}
+
+export function setTaskManagerPool(ids) {
+  const value = (Array.isArray(ids) ? ids : [])
+    .map((id) => String(id))
+    .filter(Boolean);
+  poolCredentials = [];
+  poolCursor = 0;
+  const state = writeTaskManagerConfig({ pool: value });
+  if (state.enabled && value.length) {
+    refreshPool().catch(() => {});
   }
   return state;
 }
@@ -402,11 +422,14 @@ export async function failoverIfNeeded(reason = "poll") {
 export function notifyAccountFailure(status) {
   if (!FAILOVER_TRIGGER_STATUSES.has(status)) return;
   const state = readTaskManagerConfig();
-  if (!state.enabled || !state.failover) return;
-  const account = cached;
-  if (account?.accountId) {
-    accountFailureMemory.set(account.accountId, Date.now());
+  if (!state.enabled) return;
+  const accountId = lastInjectedId || (cached && cached.accountId);
+  if (accountId) {
+    accountFailureMemory.set(accountId, Date.now());
   }
+  // Pool mode handles the failed account by skipping it on the next rotation.
+  if (Array.isArray(state.pool) && state.pool.length > 0) return;
+  if (!state.failover) return;
   failoverPending = true;
   scheduleImmediateFailover();
 }
@@ -419,6 +442,98 @@ function scheduleImmediateFailover() {
     await refreshActiveAccount();
     await failoverIfNeeded("failure");
   }, 500);
+}
+
+export async function refreshPool() {
+  const state = readTaskManagerConfig();
+  if (!state.enabled || !Array.isArray(state.pool) || state.pool.length === 0) {
+    poolCredentials = [];
+    return poolCredentials;
+  }
+  const token = tokenFor(state);
+  if (!token) {
+    poolCredentials = [];
+    return poolCredentials;
+  }
+  const { status, body } = await requestJson(
+    state.port,
+    token,
+    "/api/auth/credentials",
+    "POST",
+    { ids: state.pool },
+  );
+  if (status !== 200) {
+    throw new Error(body?.error || `Codex_Task_Manager returned HTTP ${status}`);
+  }
+  poolCredentials = (body.accounts || [])
+    .map((account) => {
+      const used = account.usage?.weekly_used_percent;
+      return {
+        accountId:
+          typeof account.account_id === "string"
+            ? account.account_id
+            : account.id || "",
+        accessToken:
+          typeof account.access_token === "string" ? account.access_token : "",
+        email: account.email || "",
+        plan:
+          account.usage && typeof account.usage.plan === "string"
+            ? account.usage.plan
+            : "",
+        remainingPercent:
+          typeof used === "number"
+            ? Math.max(0, Math.min(100, 100 - used))
+            : null,
+      };
+    })
+    .filter((account) => account.accessToken);
+  poolCursor = 0;
+  return poolCredentials;
+}
+
+export function nextInjectionAccount() {
+  const state = readTaskManagerConfig();
+  if (
+    state.enabled &&
+    Array.isArray(state.pool) &&
+    state.pool.length > 0 &&
+    poolCredentials.length > 0
+  ) {
+    const now = Date.now();
+    let candidate = null;
+    for (let step = 0; step < poolCredentials.length; step += 1) {
+      const account =
+        poolCredentials[(poolCursor + step) % poolCredentials.length];
+      const failedAt = accountFailureMemory.get(account.accountId);
+      if (failedAt === undefined || now - failedAt >= FAILURE_MEMORY_MS) {
+        candidate = account;
+        poolCursor = (poolCursor + step + 1) % poolCredentials.length;
+        break;
+      }
+    }
+    if (!candidate) {
+      candidate = poolCredentials[poolCursor % poolCredentials.length];
+      poolCursor = (poolCursor + 1) % poolCredentials.length;
+    }
+    lastInjectedId = candidate.accountId;
+    return candidate;
+  }
+  const account = cached;
+  lastInjectedId = account ? account.accountId : null;
+  return account;
+}
+
+export function poolStatus() {
+  const state = readTaskManagerConfig();
+  return {
+    ids: Array.isArray(state.pool) ? state.pool : [],
+    accounts: poolCredentials.map((account) => ({
+      accountId: account.accountId,
+      email: account.email,
+      plan: account.plan,
+      remainingPercent: account.remainingPercent,
+    })),
+  };
 }
 
 export function failoverStatus() {
@@ -435,6 +550,7 @@ export function startTaskManagerPoller() {
     const state = readTaskManagerConfig();
     if (!state.enabled) {
       cached = null;
+      poolCredentials = [];
       return;
     }
     refreshActiveAccount()
@@ -442,6 +558,7 @@ export function startTaskManagerPoller() {
       .catch(() => {
         cached = null;
       });
+    refreshPool().catch(() => {});
   };
 
   tick();

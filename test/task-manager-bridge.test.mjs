@@ -49,3 +49,13 @@ test("notifyAccountFailure ignores non-trigger statuses", () => {
   bridge.notifyAccountFailure(500);
   bridge.setTaskManagerFailover(false);
 });
+
+test("task manager pool persists and defaults empty", () => {
+  assert.deepEqual(bridge.readTaskManagerConfig().pool, []);
+  assert.deepEqual(bridge.poolStatus().ids, []);
+  bridge.setTaskManagerPool(["a", "b"]);
+  assert.deepEqual(bridge.readTaskManagerConfig().pool, ["a", "b"]);
+  assert.deepEqual(bridge.poolStatus().ids, ["a", "b"]);
+  bridge.setTaskManagerPool([]);
+  assert.deepEqual(bridge.readTaskManagerConfig().pool, []);
+});

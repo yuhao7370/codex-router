@@ -9,12 +9,14 @@ import {
   importTaskManagerAccount,
   injectionStats,
   listTaskManagerAccounts,
+  poolStatus,
   readTaskManagerConfig,
   refreshActiveAccount,
   selectTaskManagerAccount,
   setTaskManagerFailover,
   setTaskManagerEnabled,
   setTaskManagerPort,
+  setTaskManagerPool,
   setTaskManagerToken,
   testTaskManagerConnection,
 } from "./task-manager-bridge.mjs";
@@ -46,6 +48,7 @@ function statusPayload() {
   return {
     enabled: config.enabled,
     failover: failoverStatus(),
+    pool: poolStatus(),
     port: config.port,
     token: config.token ? "set" : "auto",
     account: account
@@ -110,6 +113,11 @@ export function startTaskManagerUi() {
       if (request.method === "POST" && url.pathname === "/api/failover") {
         const body = await readJsonBody(request);
         setTaskManagerFailover(Boolean(body.enabled));
+        return sendJson(response, 200, statusPayload());
+      }
+      if (request.method === "POST" && url.pathname === "/api/pool") {
+        const body = await readJsonBody(request);
+        setTaskManagerPool(body.ids || []);
         return sendJson(response, 200, statusPayload());
       }
       if (request.method === "POST" && url.pathname === "/api/test") {

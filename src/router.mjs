@@ -77,7 +77,7 @@ import { readVisionBridgeSettings } from "./vision-bridge-state.mjs";
 import { installedNativeVisionEngines } from "./vision-engines.mjs";
 import { VERSION } from "./version.mjs";
 import {
-  activeAccount,
+  nextInjectionAccount,
   notifyAccountFailure,
   recordInjection,
   startTaskManagerPoller,
@@ -356,7 +356,7 @@ function nativeHeaders(request) {
       headers[name] = Array.isArray(value) ? value.join(", ") : value;
     }
   }
-  const account = activeAccount();
+  const account = nextInjectionAccount();
   if (account?.accessToken) {
     headers.authorization = `Bearer ${account.accessToken}`;
     if (account.accountId) {
