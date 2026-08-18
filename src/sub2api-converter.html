@@ -5,71 +5,214 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>sub2api 转 auth.json</title>
 <style>
-  :root { color-scheme: dark; }
+  :root {
+    color-scheme: light;
+    --bg: #eef1f6;
+    --card: #ffffff;
+    --border: #e3e8f0;
+    --text: #161d2b;
+    --muted: #68738a;
+    --accent: #4f46e5;
+    --accent2: #7c3aed;
+    --mint: #0d9488;
+    --ok: #0a9d6c;
+    --err: #d9385e;
+    --err-bg: #fdeef2;
+    --radius: 14px;
+  }
   * { box-sizing: border-box; }
+  ::selection { background: rgba(99, 102, 241, 0.2); }
   body {
-    margin: 0; padding: 24px; min-height: 100vh;
-    background: #0b1120; color: #e6edf7;
-    font: 14px/1.5 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+    margin: 0; padding: 24px 28px 40px; min-height: 100vh;
+    color: var(--text);
+    font: 14px/1.6 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+    background:
+      radial-gradient(1000px 420px at 12% -10%, rgba(99, 102, 241, 0.10), transparent 60%),
+      radial-gradient(900px 400px at 88% -8%, rgba(13, 148, 136, 0.08), transparent 55%),
+      var(--bg);
+    background-attachment: fixed;
   }
-  .wrap { max-width: 820px; margin: 0 auto; }
-  h1 { font-size: 22px; margin: 0 0 2px; }
-  .sub { color: #7d8aa3; margin-bottom: 20px; }
+  .wrap { width: 100%; display: flex; flex-direction: column; gap: 18px; }
+
+  /* ===== 页头 ===== */
+  .header {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 16px; flex-wrap: wrap; padding: 2px 2px 0;
+  }
+  h1 { font-size: 20px; font-weight: 700; margin: 0; letter-spacing: 0.01em; }
+  .sub { color: var(--muted); font-size: 12.5px; margin-top: 3px; }
+  .header-actions { display: flex; align-items: center; gap: 10px; }
+
+  .pill {
+    display: inline-flex; align-items: center; gap: 8px;
+    padding: 7px 14px; border-radius: 999px;
+    font-size: 12.5px; font-weight: 600;
+    background: #fff; border: 1px solid var(--border);
+    box-shadow: 0 1px 2px rgba(16, 24, 40, 0.04);
+  }
+  a.pill { text-decoration: none; color: var(--accent); transition: border-color 0.12s ease; }
+  a.pill:hover { border-color: var(--accent); }
+
+  /* ===== 双栏 ===== */
+  .panels {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    gap: 18px; align-items: start;
+  }
+
+  /* ===== 卡片 ===== */
   .card {
-    background: #121a2b; border: 1px solid #24304a;
-    border-radius: 10px; padding: 18px; margin-bottom: 16px;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 20px;
+    box-shadow: 0 1px 2px rgba(16, 24, 40, 0.04), 0 10px 26px rgba(16, 24, 40, 0.05);
   }
-  .card h2 { margin: 0 0 12px; font-size: 15px; color: #9fd4ff; }
+  .card h2 {
+    display: flex; align-items: center; gap: 10px;
+    margin: 0 0 14px; font-size: 14px; font-weight: 700;
+    letter-spacing: 0.04em; color: #2b3550;
+  }
+  .step {
+    display: inline-grid; place-items: center; flex: none;
+    width: 22px; height: 22px; border-radius: 7px;
+    font-size: 12px; font-weight: 700; color: #fff;
+    background: linear-gradient(135deg, #6366f1, #7c3aed);
+    box-shadow: 0 3px 8px rgba(99, 102, 241, 0.3);
+  }
+  .count-num { color: var(--accent); }
+
+  /* ===== 表单 ===== */
   textarea {
-    width: 100%; min-height: 160px; resize: vertical;
-    background: #0e1523; border: 1px solid #2b3a59; color: #e6edf7;
-    border-radius: 7px; padding: 10px 12px; font: 12px/1.5 ui-monospace, Consolas, monospace;
+    width: 100%; min-height: 380px; resize: vertical;
+    background: #fff; border: 1px solid #d6dde8; color: var(--text);
+    border-radius: 9px; padding: 12px 14px;
+    font: 12px/1.6 ui-monospace, Consolas, monospace;
+    transition: border-color 0.12s ease, box-shadow 0.12s ease;
   }
-  textarea:focus { outline: 1px solid #3b8fd0; }
-  .field { display: flex; gap: 8px; align-items: center; margin: 10px 0 0; flex-wrap: wrap; }
-  input[type=file] { color: #8a97ad; font-size: 12px; max-width: 260px; }
+  textarea:focus {
+    outline: none; border-color: var(--accent);
+    box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.15);
+  }
+  .field { display: flex; gap: 10px; align-items: center; margin: 12px 0 0; flex-wrap: wrap; }
+  input[type=file] { color: var(--muted); font-size: 12px; max-width: 280px; }
+  input[type=file]::file-selector-button {
+    appearance: none; cursor: pointer; font-size: 12px; font-weight: 600;
+    color: #3c4763; padding: 7px 12px; margin-right: 10px;
+    border-radius: 8px; border: 1px solid #d6dde8; background: #f1f4f9;
+    transition: background 0.12s ease;
+  }
+  input[type=file]::file-selector-button:hover { background: #e6ebf3; }
+
+  /* ===== 按钮 ===== */
   button {
-    background: #1d6fb8; color: #fff; border: 0; border-radius: 7px;
-    padding: 8px 14px; cursor: pointer; font-size: 13px;
+    appearance: none; border: 0; cursor: pointer;
+    font: 600 13px/1 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+    color: #fff; padding: 10px 16px; border-radius: 9px;
+    background: linear-gradient(135deg, #6366f1, #7c3aed);
+    box-shadow: 0 4px 12px rgba(99, 102, 241, 0.28);
+    transition: transform 0.12s ease, filter 0.12s ease, box-shadow 0.12s ease;
   }
-  button:hover { background: #2584d6; }
-  button.ghost { background: #24304a; }
-  button.ghost:hover { background: #2f3d5c; }
-  .result { margin-top: 10px; padding: 8px 10px; border-radius: 7px; background: #0e1523; font-size: 12px; white-space: pre-wrap; word-break: break-all; }
-  .result.err { color: #ff8290; }
+  button:hover { filter: brightness(1.08); transform: translateY(-1px); }
+  button:active { transform: translateY(0); }
+  button.ghost {
+    background: #fff; border: 1px solid #d6dde8; color: #3c4763;
+    box-shadow: none;
+  }
+  button.ghost:hover { background: #f4f6fa; }
+  .actions button { padding: 7px 13px; font-size: 12px; }
+
+  /* ===== 错误框 ===== */
+  .result {
+    margin-top: 12px; padding: 10px 12px; border-radius: 9px;
+    font: 12px/1.6 ui-monospace, Consolas, monospace;
+    white-space: pre-wrap; word-break: break-all;
+  }
+  .result.err { background: var(--err-bg); border: 1px solid #f6cdd8; color: var(--err); }
+
+  /* ===== 空状态 ===== */
+  .empty {
+    padding: 48px 20px; text-align: center;
+    color: var(--muted); font-size: 13px;
+    border: 1px dashed #d6dde8; border-radius: 11px;
+    background: #fafbfd;
+  }
+
+  /* ===== 账号行 ===== */
   .account {
-    display: flex; align-items: center; gap: 12px;
-    padding: 12px 0; border-bottom: 1px solid #1b2740; flex-wrap: wrap;
+    display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+    padding: 14px 16px; margin-bottom: 10px;
+    border: 1px solid var(--border); border-radius: 11px;
+    background: #fafbfd;
+    transition: border-color 0.12s ease, box-shadow 0.12s ease;
   }
-  .account:last-child { border-bottom: 0; }
+  .account:hover { border-color: #cfd8e6; box-shadow: 0 4px 14px rgba(16, 24, 40, 0.06); }
+  .account:last-child { margin-bottom: 0; }
   .account .meta { flex: 1; min-width: 220px; }
-  .account .name { font-size: 14px; word-break: break-all; }
-  .account .detail { color: #7d8aa3; font-size: 12px; font-family: ui-monospace, Consolas, monospace; word-break: break-all; }
-  .badge { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 11px; background: #143326; color: #5ce0a3; margin-left: 6px; }
+  .account .name { font-size: 14px; font-weight: 600; word-break: break-all; }
+  .account .detail {
+    color: var(--muted); font-size: 12px; margin-top: 3px;
+    font-family: ui-monospace, Consolas, monospace; word-break: break-all;
+  }
+  .badge {
+    display: inline-block; padding: 2px 9px; margin-left: 8px;
+    border-radius: 999px; font-size: 11px; font-weight: 600;
+    background: #e6f4f1; color: var(--mint);
+  }
   .actions { display: flex; gap: 8px; }
-  .toast { position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%); background: #143326; color: #5ce0a3; padding: 8px 16px; border-radius: 7px; font-size: 13px; opacity: 0; transition: opacity .2s; pointer-events: none; }
-  .toast.show { opacity: 1; }
+
+  /* ===== Toast ===== */
+  .toast {
+    position: fixed; left: 50%; bottom: 28px;
+    transform: translate(-50%, 8px);
+    background: #fff; border: 1px solid #bfe8d8; color: var(--ok);
+    font-size: 13px; font-weight: 600;
+    padding: 10px 18px; border-radius: 999px;
+    box-shadow: 0 10px 30px rgba(16, 24, 40, 0.12);
+    opacity: 0; transition: opacity 0.25s ease, transform 0.25s ease;
+    pointer-events: none;
+  }
+  .toast.show { opacity: 1; transform: translate(-50%, 0); }
+
+  @media (max-width: 960px) {
+    .panels { grid-template-columns: 1fr; }
+    textarea { min-height: 220px; }
+  }
+  @media (max-width: 640px) {
+    body { padding: 16px 14px 32px; }
+    .card { padding: 16px; }
+  }
 </style>
 </head>
 <body>
 <div class="wrap">
-  <h1>sub2api → auth.json 转换器</h1>
-  <div class="sub">粘贴 sub2api 导出的 JSON，为每个账号生成标准 Codex auth.json。</div>
-
-  <div class="card">
-    <h2>输入</h2>
-    <textarea id="input" placeholder='{"format":"sub2api","accounts":[...]}'></textarea>
-    <div class="field">
-      <input type="file" id="file" accept=".json,application/json">
-      <button id="parse">解析</button>
-      <button class="ghost" id="clear">清空</button>
+  <header class="header">
+    <div>
+      <h1>sub2api → auth.json 转换器</h1>
+      <div class="sub">粘贴 sub2api 导出的 JSON，为每个账号生成标准 Codex auth.json</div>
     </div>
-    <div class="result err" id="error" hidden></div>
-  </div>
+    <div class="header-actions">
+      <a class="pill" href="/">返回主面板</a>
+    </div>
+  </header>
 
-  <div class="card" id="output" hidden>
-    <h2>账号（<span id="count">0</span>）</h2>
-    <div id="list"></div>
+  <div class="panels">
+    <div class="card">
+      <h2><span class="step">1</span> 输入 sub2api JSON</h2>
+      <textarea id="input" placeholder='{"format":"sub2api","accounts":[...]}'></textarea>
+      <div class="field">
+        <input type="file" id="file" accept=".json,application/json">
+        <button id="parse">解析</button>
+        <button class="ghost" id="clear">清空</button>
+      </div>
+      <div class="result err" id="error" hidden></div>
+    </div>
+
+    <div class="card" id="output">
+      <h2><span class="step">2</span> 转换结果（<span class="count-num" id="count">0</span>）</h2>
+      <div class="empty" id="empty-state">解析后，账号列表会显示在这里</div>
+      <div id="list"></div>
+    </div>
   </div>
 </div>
 <div class="toast" id="toast"></div>
@@ -120,8 +263,14 @@
     });
   }
 
+  function resetOutput() {
+    el('list').textContent = '';
+    el('count').textContent = '0';
+    el('empty-state').hidden = false;
+  }
+
   function render(accounts) {
-    el('output').hidden = false;
+    el('empty-state').hidden = true;
     el('count').textContent = String(accounts.length);
     const list = el('list');
     list.textContent = '';
@@ -205,7 +354,7 @@
     try {
       render(parseSub2api(el('input').value));
     } catch (error) {
-      el('output').hidden = true;
+      resetOutput();
       showError(error.message);
     }
   }
@@ -214,7 +363,7 @@
   el('clear').addEventListener('click', function () {
     el('input').value = '';
     el('file').value = '';
-    el('output').hidden = true;
+    resetOutput();
     showError('');
   });
   el('file').addEventListener('change', function () {
