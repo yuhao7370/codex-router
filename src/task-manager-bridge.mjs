@@ -668,34 +668,41 @@ export async function refreshPool() {
 
 export function nextInjectionAccount() {
   const state = readTaskManagerConfig();
-  if (
-    state.enabled &&
-    Array.isArray(state.pool) &&
-    state.pool.length > 0 &&
-    poolCredentials.length > 0
-  ) {
-    const now = Date.now();
-    let candidate = null;
+  const now = Date.now();
+  const recentlyFailed = (accountId) => {
+    if (!accountId) return false;
+    const failedAt = accountFailureMemory.get(accountId);
+    return failedAt !== undefined && now - failedAt < FAILURE_MEMORY_MS;
+  };
+  const blocked = state.blocked || {};
+
+  if (state.enabled && state.pool.length > 0 && poolCredentials.length > 0) {
     for (let step = 0; step < poolCredentials.length; step += 1) {
       const account =
         poolCredentials[(poolCursor + step) % poolCredentials.length];
-      const failedAt = accountFailureMemory.get(account.accountId);
-      if (failedAt === undefined || now - failedAt >= FAILURE_MEMORY_MS) {
-        candidate = account;
+      if (!recentlyFailed(account.accountId)) {
         poolCursor = (poolCursor + step + 1) % poolCredentials.length;
-        break;
+        lastInjectedId = account.accountId;
+        return account;
       }
     }
-    if (!candidate) {
-      candidate = poolCredentials[poolCursor % poolCredentials.length];
-      poolCursor = (poolCursor + 1) % poolCredentials.length;
-    }
-    lastInjectedId = candidate.accountId;
-    return candidate;
+    // Every pool account just failed; fall through to the single/native path.
   }
+
   const account = cached;
-  lastInjectedId = account ? account.accountId : null;
-  return account;
+  if (
+    account?.accessToken &&
+    !recentlyFailed(account.accountId) &&
+    !blocked[account.accountId]
+  ) {
+    lastInjectedId = account.accountId;
+    return account;
+  }
+
+  // Last resort: no injected account, so the caller relays its own
+  // authorization (the locally signed-in native account).
+  lastInjectedId = null;
+  return null;
 }
 
 export function poolStatus() {
