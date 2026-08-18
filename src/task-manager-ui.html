@@ -244,6 +244,7 @@
   .hint { color: var(--muted); font-size: 12.5px; margin: 0 0 10px; }
   .hint a { color: var(--accent); text-decoration: none; }
   .hint a:hover { text-decoration: underline; }
+  #pool-hint { margin: 6px 0 10px; }
 
   @media (max-width: 1200px) {
     .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -310,7 +311,7 @@
         </div>
       </div>
       <div class="result" id="accounts-error" hidden></div>
-      <p class="hint" id="pool-hint" style="margin:6px 0 10px">轮询池：未启用（勾选账号并保存后启用均匀派发）</p>
+      <p class="hint" id="pool-hint">轮询池：未启用（勾选账号并保存后启用均匀派发）</p>
       <div class="table-wrap">
       <table>
         <thead><tr><th>池</th><th>邮箱</th><th>ID</th><th>来源</th><th>状态</th><th>额度</th><th></th></tr></thead>
@@ -406,12 +407,6 @@
   let accountIndex = new Map();
   let currentPool = new Set();
 
-  function syncPoolCheckboxes() {
-    for (const input of document.querySelectorAll('.pool-check')) {
-      input.checked = currentPool.has(input.getAttribute('data-id'));
-    }
-  }
-
   function buildAccountIndex(accounts) {
     accountIndex = new Map();
     for (const account of accounts || []) {
@@ -487,7 +482,6 @@
     el('failover-toggle').checked = Boolean(failover.enabled);
     const pool = status.pool || {};
     currentPool = new Set(Array.isArray(pool.ids) ? pool.ids : []);
-    syncPoolCheckboxes();
     const poolIds = Array.isArray(pool.ids) ? pool.ids : [];
     const poolAccounts = Array.isArray(pool.accounts) ? pool.accounts : [];
     const poolHint = el('pool-hint');
@@ -665,11 +659,14 @@
 
   el('save-pool').addEventListener('click', async function () {
     try {
+      const ids = checkedPoolIds();
       await api('/api/pool', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ids: checkedPoolIds() }),
+        body: JSON.stringify({ ids: ids }),
       });
-      await Promise.all([loadStatus(), loadAccounts()]);
+      currentPool = new Set(ids);
+      await loadAccounts();
+      await loadStatus();
     } catch (error) {
       setResult('accounts-error', false, '保存轮询池失败：' + error.message);
     }
@@ -681,13 +678,21 @@
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ids: [] }),
       });
-      await Promise.all([loadStatus(), loadAccounts()]);
+      currentPool = new Set();
+      await loadAccounts();
+      await loadStatus();
     } catch (error) {
       setResult('accounts-error', false, '清空轮询池失败：' + error.message);
     }
   });
 
   async function boot() {
+    try {
+      const status = await api('/api/status');
+      currentPool = new Set(
+        status.pool && Array.isArray(status.pool.ids) ? status.pool.ids : [],
+      );
+    } catch (error) {}
     await loadAccounts();
     await loadStatus();
   }
