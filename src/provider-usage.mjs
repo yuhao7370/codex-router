@@ -334,8 +334,8 @@ export function attachAccountCosts(accounts, index = loadPricingIndex()) {
 // The panel path reads only local usage events and pricing; unlike
 // `providerUsageSnapshot` it never calls provider account APIs, so a dashboard
 // refresh stays fast and failure-tolerant.
-export function panelUsageSnapshot({ days = 90, now = Date.now() } = {}) {
-  const snapshot = usageSummarySnapshot({ days, now });
+export function panelUsageSnapshot({ range = "90d", now = Date.now() } = {}) {
+  const snapshot = usageSummarySnapshot({ range, now });
   const withProviderCosts = attachUsageCosts({ providers: snapshot.providers });
   return {
     fetchedAt: snapshot.fetchedAt,

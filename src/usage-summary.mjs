@@ -29,6 +29,24 @@ function dateKey(value) {
   return `${year}-${month}-${day}`;
 }
 
+function daysAgoKey(days, now) {
+  const date = new Date(now);
+  date.setDate(date.getDate() - days);
+  return dateKey(date);
+}
+
+function resolveRangeDays(range, now) {
+  const toDay = dateKey(now);
+  if (range === "today") return { fromDay: toDay, toDay };
+  if (range === "yesterday") {
+    const yesterday = daysAgoKey(1, now);
+    return { fromDay: yesterday, toDay: yesterday };
+  }
+  const days = { "7d": 7, "30d": 30, "90d": 90 }[range];
+  if (days) return { fromDay: dateKey(now - days * 86_400_000), toDay };
+  return { fromDay: dateKey(now - 90 * 86_400_000), toDay };
+}
+
 function nonnegative(value) {
   const number = Number(value);
   return Number.isFinite(number) && number >= 0 ? Math.round(number) : 0;
@@ -155,7 +173,7 @@ function mergeEntry(entry, event, at) {
   }
 }
 
-function rollUp(entry, cutoffDay, nowDay) {
+function rollUp(entry, fromDay, toDay) {
   const out = {
     requests: 0,
     successfulRequests: 0,
@@ -183,7 +201,7 @@ function rollUp(entry, cutoffDay, nowDay) {
     };
     let visible = false;
     for (const [day, bucket] of days) {
-      if (day < cutoffDay || day > nowDay) continue;
+      if (day < fromDay || day > toDay) continue;
       visible = true;
       model.requests += bucket.requests;
       model.successfulRequests += bucket.successfulRequests;
@@ -220,11 +238,9 @@ export function recordUsageSummaryEvent(event) {
   mergeEvent(ensureSummary(), event);
 }
 
-export function usageSummarySnapshot({ days = 90, now = Date.now() } = {}) {
+export function usageSummarySnapshot({ range = "90d", now = Date.now() } = {}) {
   const target = ensureSummary();
-  const cutoff = now - days * 24 * 60 * 60 * 1_000;
-  const cutoffDay = dateKey(cutoff);
-  const nowDay = dateKey(now);
+  const { fromDay, toDay } = resolveRangeDays(range, now);
 
   const seed = new Map(
     [NATIVE_OPENAI, ...[...PROVIDERS.values()].filter((provider) => !provider.variantOf)].map(
@@ -232,7 +248,7 @@ export function usageSummarySnapshot({ days = 90, now = Date.now() } = {}) {
     ),
   );
   const providers = [...seed.values()].map((provider) => {
-    const rollup = rollUp(target.providers.get(provider.id), cutoffDay, nowDay);
+    const rollup = rollUp(target.providers.get(provider.id), fromDay, toDay);
     return {
       id: provider.id,
       displayName: provider.displayName,
@@ -256,7 +272,7 @@ export function usageSummarySnapshot({ days = 90, now = Date.now() } = {}) {
 
   const accounts = [...target.accounts.entries()]
     .map(([accountId, entry]) => {
-      const rollup = rollUp(entry, cutoffDay, nowDay);
+      const rollup = rollUp(entry, fromDay, toDay);
       return {
         accountId,
         requests: rollup.requests,

@@ -111,7 +111,8 @@ export function startTaskManagerUi() {
         return sendJson(response, 200, statusPayload());
       }
       if (request.method === "GET" && url.pathname === "/api/usage") {
-        const snapshot = panelUsageSnapshot();
+        const range = url.searchParams.get("range") || "90d";
+        const snapshot = panelUsageSnapshot({ range });
         const accountMeta = new Map();
         const validIds = new Set();
         let ctmReachable = false;

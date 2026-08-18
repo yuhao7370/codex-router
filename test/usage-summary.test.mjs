@@ -94,7 +94,7 @@ test("incremental summary matches the event-level aggregators", async () => {
   const { aggregateAccountUsage, aggregateProviderUsage, summary } =
     await loadModules();
   for (const event of events) summary.recordUsageSummaryEvent(event);
-  const snapshot = summary.usageSummarySnapshot({ days: 7, now });
+  const snapshot = summary.usageSummarySnapshot({ range: "7d", now });
 
   assert.deepEqual(
     snapshot.accounts,
@@ -112,7 +112,7 @@ test("summary rebuilds from the raw event log", async () => {
     appendFileSync(eventsPath, `${JSON.stringify(event)}\n`, "utf8");
   }
   const { aggregateAccountUsage, summary } = await loadModules();
-  const snapshot = summary.usageSummarySnapshot({ days: 7, now });
+  const snapshot = summary.usageSummarySnapshot({ range: "7d", now });
 
   assert.deepEqual(
     snapshot.accounts,
@@ -149,10 +149,51 @@ test("summary drops days outside the requested window", async () => {
     outputTokens: 100,
     totalTokens: 200,
   });
-  const snapshot = summary.usageSummarySnapshot({ days: 7, now });
+  const snapshot = summary.usageSummarySnapshot({ range: "7d", now });
   const account = snapshot.accounts.find((entry) => entry.accountId === "acct-a");
 
   assert.equal(account.totalTokens, 200);
   assert.equal(account.models.length, 1);
   assert.equal(account.models[0].totalTokens, 200);
+});
+
+test("today and yesterday use local calendar days", async () => {
+  resetRawLog();
+  const { summary } = await loadModules();
+  const todayNoon = new Date();
+  todayNoon.setHours(12, 0, 0, 0);
+  const yesterdayNoon = new Date(todayNoon);
+  yesterdayNoon.setDate(yesterdayNoon.getDate() - 1);
+  const dayBefore = new Date(todayNoon);
+  dayBefore.setDate(dayBefore.getDate() - 2);
+
+  const record = (at, tokens) =>
+    summary.recordUsageSummaryEvent({
+      meteringVersion: 1,
+      at: at.toISOString(),
+      provider: "openai",
+      accountId: "acct-a",
+      model: "gpt-5.6-sol",
+      status: 200,
+      inputTokens: tokens,
+      outputTokens: 0,
+      totalTokens: tokens,
+    });
+
+  record(todayNoon, 100);
+  record(yesterdayNoon, 10);
+  record(dayBefore, 1);
+
+  const now = todayNoon.getTime();
+  const account = (snapshot) =>
+    snapshot.accounts.find((entry) => entry.accountId === "acct-a");
+
+  assert.equal(
+    account(summary.usageSummarySnapshot({ range: "today", now })).totalTokens,
+    100,
+  );
+  assert.equal(
+    account(summary.usageSummarySnapshot({ range: "yesterday", now })).totalTokens,
+    10,
+  );
 });

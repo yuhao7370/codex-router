@@ -266,6 +266,17 @@
     content: ""; width: 3px; height: 12px; border-radius: 2px; flex: none;
     background: linear-gradient(180deg, var(--accent), var(--accent2));
   }
+  .usage-range {
+    display: inline-flex; border: 1px solid var(--border); border-radius: 8px;
+    overflow: hidden; background: #fff; margin: 2px 0 16px;
+  }
+  .usage-range .seg {
+    border: none; background: transparent; padding: 6px 12px;
+    font: inherit; font-size: 12px; font-weight: 600; color: var(--muted);
+    cursor: pointer;
+  }
+  .usage-range .seg + .seg { border-left: 1px solid var(--border); }
+  .usage-range .seg.active { background: var(--accent); color: #fff; }
 
   @media (max-width: 1200px) {
     .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -335,13 +346,20 @@
         </div>
       </div>
       <div class="result" id="usage-sync-result" hidden></div>
+      <div class="usage-range" role="group" aria-label="时间范围">
+        <button class="seg" type="button" data-range="today">今日</button>
+        <button class="seg" type="button" data-range="yesterday">昨日</button>
+        <button class="seg" type="button" data-range="7d">7 天</button>
+        <button class="seg" type="button" data-range="30d">30 天</button>
+        <button class="seg active" type="button" data-range="90d">90 天</button>
+      </div>
       <div class="usage-hero">
         <div class="usage-number">
           <div class="label">请求数</div>
           <div class="value" id="usage-requests">—</div>
         </div>
         <div class="usage-number">
-          <div class="label">总 Token（90 天）</div>
+          <div class="label" id="usage-tokens-label">总 Token（90 天）</div>
           <div class="value" id="usage-tokens">—</div>
         </div>
         <div class="usage-number">
@@ -349,7 +367,7 @@
           <div class="value" id="usage-cache">—</div>
         </div>
         <div class="usage-number">
-          <div class="label">等效成本（90 天）</div>
+          <div class="label" id="usage-cost-label">等效成本（90 天）</div>
           <div class="value accent" id="usage-cost">—</div>
         </div>
       </div>
@@ -792,10 +810,37 @@
     }
   }
 
+  const usageRangeNames = {
+    today: '今日',
+    yesterday: '昨日',
+    '7d': '7 天',
+    '30d': '30 天',
+    '90d': '90 天',
+  };
+  let usageRange = '90d';
+
   async function loadUsage() {
     try {
-      renderUsage(await api('/api/usage'));
+      renderUsage(await api('/api/usage?range=' + encodeURIComponent(usageRange)));
     } catch (error) {}
+  }
+
+  function setUsageRange(range) {
+    if (!usageRangeNames[range]) return;
+    usageRange = range;
+    for (const seg of document.querySelectorAll('.usage-range .seg')) {
+      seg.classList.toggle('active', seg.getAttribute('data-range') === range);
+    }
+    const label = usageRangeNames[range];
+    el('usage-tokens-label').textContent = '总 Token（' + label + '）';
+    el('usage-cost-label').textContent = '等效成本（' + label + '）';
+    loadUsage();
+  }
+
+  for (const seg of document.querySelectorAll('.usage-range .seg')) {
+    seg.addEventListener('click', function () {
+      setUsageRange(seg.getAttribute('data-range'));
+    });
   }
 
   el('enable-btn').addEventListener('click', async function () {
