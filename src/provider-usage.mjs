@@ -1,11 +1,9 @@
-import { statSync } from "node:fs";
-
 import { PROVIDERS } from "./model-registry.mjs";
 import { providerAccountUsageSnapshot } from "./provider-account-usage.mjs";
 import { readProviderSelection } from "./provider-selection.mjs";
-import { USAGE_EVENTS_PATH, recentUsageEvents } from "./usage-events.mjs";
+import { recentUsageEvents } from "./usage-events.mjs";
+import { usageSummarySnapshot } from "./usage-summary.mjs";
 import {
-  MODEL_PRICING_PATH,
   computeUsageCost,
   findModelPricing,
   loadPricingIndex,
@@ -336,42 +334,15 @@ export function attachAccountCosts(accounts, index = loadPricingIndex()) {
 // The panel path reads only local usage events and pricing; unlike
 // `providerUsageSnapshot` it never calls provider account APIs, so a dashboard
 // refresh stays fast and failure-tolerant.
-let panelSnapshotCache = null;
-
-function fileStamp(pathname) {
-  try {
-    const stat = statSync(pathname);
-    return `${stat.size}:${Math.floor(stat.mtimeMs)}`;
-  } catch {
-    return "";
-  }
-}
-
 export function panelUsageSnapshot({ days = 90, now = Date.now() } = {}) {
-  const stamp = `${days}:${fileStamp(USAGE_EVENTS_PATH)}:${fileStamp(MODEL_PRICING_PATH)}`;
-  if (panelSnapshotCache && panelSnapshotCache.stamp === stamp) {
-    return panelSnapshotCache.snapshot;
-  }
-  // Rebuilding reads the whole events file synchronously, which blocks the
-  // router's event loop. Bound it to once every five seconds so a burst of
-  // concurrent panel polls (or multiple open tabs) cannot stall other routes
-  // such as /api/accounts past its 3s Codex_Task_Manager timeout.
-  if (panelSnapshotCache && now - panelSnapshotCache.builtAt < 5_000) {
-    return panelSnapshotCache.snapshot;
-  }
-  const events = recentUsageEvents({
-    sinceMs: days * 24 * 60 * 60 * 1_000,
-    limit: 100_000,
-  });
-  const snapshot = aggregateProviderUsage(events, { days, now });
-  const withProviderCosts = attachUsageCosts(snapshot);
-  const accounts = attachAccountCosts(aggregateAccountUsage(events, { days, now }));
-  const result = {
+  const snapshot = usageSummarySnapshot({ days, now });
+  const withProviderCosts = attachUsageCosts({ providers: snapshot.providers });
+  return {
+    fetchedAt: snapshot.fetchedAt,
+    scope: snapshot.scope,
     ...withProviderCosts,
-    accounts,
+    accounts: attachAccountCosts(snapshot.accounts),
   };
-  panelSnapshotCache = { stamp, builtAt: now, snapshot: result };
-  return result;
 }
 
 export async function providerUsageSnapshot(options = {}) {

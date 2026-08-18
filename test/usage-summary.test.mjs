@@ -1,0 +1,158 @@
+import assert from "node:assert/strict";
+import { appendFileSync, mkdtempSync, rmSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import test from "node:test";
+
+const now = Date.parse("2026-07-21T18:00:00Z");
+const events = [
+  {
+    meteringVersion: 1,
+    at: "2026-07-20T12:00:00Z",
+    provider: "openai",
+    accountId: "acct-a",
+    model: "gpt-5.6-sol",
+    status: 200,
+    inputTokens: 100,
+    outputTokens: 40,
+    cachedInputTokens: 10,
+    totalTokens: 140,
+  },
+  {
+    meteringVersion: 1,
+    at: "2026-07-20T13:00:00Z",
+    provider: "openai",
+    accountId: "acct-a",
+    model: "gpt-5.6-luna",
+    status: 200,
+    inputTokens: 300,
+    outputTokens: 50,
+    totalTokens: 350,
+  },
+  {
+    meteringVersion: 1,
+    at: "2026-07-20T14:00:00Z",
+    provider: "openai",
+    accountId: "acct-b",
+    model: "gpt-5.6-sol",
+    status: 500,
+    inputTokens: 20,
+    outputTokens: 10,
+    totalTokens: 30,
+  },
+  {
+    meteringVersion: 1,
+    at: "2026-07-20T15:00:00Z",
+    provider: "openai",
+    model: "gpt-5.6-sol",
+    status: 200,
+    inputTokens: 999,
+    outputTokens: 999,
+    totalTokens: 1998,
+  },
+  {
+    meteringVersion: 1,
+    at: "2026-07-19T12:00:00Z",
+    provider: "deepseek",
+    model: "deepseek/deepseek-v4-flash",
+    status: 200,
+    inputTokens: 80,
+    outputTokens: 20,
+    totalTokens: 100,
+  },
+];
+
+// `paths.mjs` computes STATE_DIR once and caches it for the whole process, so
+// a single temp dir is shared by every test here. Each test gets a fresh
+// summary module via a query-busted dynamic import and clears the raw log so
+// it starts from a known-empty store.
+const stateDir = mkdtempSync(path.join(os.tmpdir(), "model-router-summary-"));
+process.env.MODEL_ROUTER_STATE_DIR = stateDir;
+const eventsPath = path.join(stateDir, "usage-events.jsonl");
+
+test.after(() => rmSync(stateDir, { recursive: true, force: true }));
+
+let tagCounter = 0;
+
+function resetRawLog() {
+  rmSync(eventsPath, { force: true });
+}
+
+async function loadModules() {
+  const tag = `${Date.now()}-${tagCounter++}`;
+  const usage = await import(`../src/provider-usage.mjs?agg=${tag}`);
+  const summary = await import(`../src/usage-summary.mjs?sum=${tag}`);
+  return {
+    aggregateAccountUsage: usage.aggregateAccountUsage,
+    aggregateProviderUsage: usage.aggregateProviderUsage,
+    summary,
+  };
+}
+
+test("incremental summary matches the event-level aggregators", async () => {
+  resetRawLog();
+  const { aggregateAccountUsage, aggregateProviderUsage, summary } =
+    await loadModules();
+  for (const event of events) summary.recordUsageSummaryEvent(event);
+  const snapshot = summary.usageSummarySnapshot({ days: 7, now });
+
+  assert.deepEqual(
+    snapshot.accounts,
+    aggregateAccountUsage(events, { days: 7, now }),
+  );
+  assert.deepEqual(
+    snapshot.providers,
+    aggregateProviderUsage(events, { days: 7, now }).providers,
+  );
+});
+
+test("summary rebuilds from the raw event log", async () => {
+  resetRawLog();
+  for (const event of events) {
+    appendFileSync(eventsPath, `${JSON.stringify(event)}\n`, "utf8");
+  }
+  const { aggregateAccountUsage, summary } = await loadModules();
+  const snapshot = summary.usageSummarySnapshot({ days: 7, now });
+
+  assert.deepEqual(
+    snapshot.accounts,
+    aggregateAccountUsage(events, { days: 7, now }),
+  );
+  assert.equal(
+    snapshot.providers.find((provider) => provider.id === "openai").totalTokens,
+    2518,
+  );
+});
+
+test("summary drops days outside the requested window", async () => {
+  resetRawLog();
+  const { summary } = await loadModules();
+  summary.recordUsageSummaryEvent({
+    meteringVersion: 1,
+    at: "2026-06-01T12:00:00Z",
+    provider: "openai",
+    accountId: "acct-a",
+    model: "gpt-5.6-sol",
+    status: 200,
+    inputTokens: 10_000,
+    outputTokens: 10_000,
+    totalTokens: 20_000,
+  });
+  summary.recordUsageSummaryEvent({
+    meteringVersion: 1,
+    at: "2026-07-21T12:00:00Z",
+    provider: "openai",
+    accountId: "acct-a",
+    model: "gpt-5.6-sol",
+    status: 200,
+    inputTokens: 100,
+    outputTokens: 100,
+    totalTokens: 200,
+  });
+  const snapshot = summary.usageSummarySnapshot({ days: 7, now });
+  const account = snapshot.accounts.find((entry) => entry.accountId === "acct-a");
+
+  assert.equal(account.totalTokens, 200);
+  assert.equal(account.models.length, 1);
+  assert.equal(account.models[0].totalTokens, 200);
+});

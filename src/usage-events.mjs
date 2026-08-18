@@ -1,10 +1,10 @@
 import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync } from "node:fs";
-import path from "node:path";
 
-import { STATE_DIR } from "./paths.mjs";
+import { STATE_DIR, USAGE_EVENTS_PATH } from "./paths.mjs";
 import { canonicalProviderId } from "./provider-selection.mjs";
+import { recordUsageSummaryEvent } from "./usage-summary.mjs";
 
-export const USAGE_EVENTS_PATH = path.join(STATE_DIR, "usage-events.jsonl");
+export { USAGE_EVENTS_PATH };
 
 function safeText(value, fallback) {
   const text = typeof value === "string" ? value.trim() : "";
@@ -98,6 +98,11 @@ export function recordUsageEvent({
       ? { estimatedInputTokens: safeTokenCount(estimatedInputTokens) }
       : {}),
   };
+  try {
+    recordUsageSummaryEvent(event);
+  } catch {
+    // Summary maintenance is best-effort and must never fail a request.
+  }
   try {
     mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
     appendFileSync(USAGE_EVENTS_PATH, `${JSON.stringify(event)}\n`, {
