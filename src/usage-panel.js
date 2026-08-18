@@ -57,6 +57,8 @@
 .usage-app .up-mono { font-family: ui-monospace, Consolas, monospace; }
 .usage-app .up-btn { border: 1px solid #e3e8f0; background: #fff; color: #68738a; padding: 6px 12px; border-radius: 8px; font: inherit; font-size: 12px; font-weight: 600; cursor: pointer; }
 .usage-app .up-btn:hover { background: #f4f6fa; }
+.usage-app .up-toggle { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: #68738a; cursor: pointer; user-select: none; }
+.usage-app .up-toggle input { margin: 0; cursor: pointer; }
 .usage-app .up-range { display: inline-flex; border: 1px solid #e3e8f0; border-radius: 8px; overflow: hidden; background: #fff; margin: 2px 0 16px; }
 .usage-app .up-seg { border: none; background: transparent; padding: 6px 12px; font: inherit; font-size: 12px; font-weight: 600; color: #68738a; cursor: pointer; }
 .usage-app .up-seg + .up-seg { border-left: 1px solid #e3e8f0; }
@@ -67,6 +69,7 @@
 .usage-app .up-value { margin-top: 8px; font-size: 20px; font-weight: 700; letter-spacing: -0.01em; }
 .usage-app .up-value.up-accent { color: #4f46e5; }
 .usage-app .up-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.45fr); gap: 18px; align-items: start; }
+.usage-app .up-grid.detail-hidden { grid-template-columns: 1fr; }
 .usage-app .up-grid h3 { margin: 0 0 10px; font-size: 13px; font-weight: 700; color: #2b3550; display: flex; align-items: center; gap: 8px; }
 .usage-app .up-grid h3::before { content: ""; width: 3px; height: 12px; border-radius: 2px; background: linear-gradient(180deg, #4f46e5, #7c3aed); }
 .usage-app .up-table-wrap { overflow-x: auto; margin: 0 -4px; padding: 0 4px; }
@@ -101,6 +104,7 @@
       '  <div class="up-card-head">' +
       "    <h2>用量统计</h2>" +
       '    <div class="up-actions">' +
+      '      <label class="up-toggle"><input type="checkbox" data-role="detail-toggle" checked> 显示明细</label>' +
       '      <span class="up-foot"><span class="up-mono" data-role="source">…</span></span>' +
       '      <button type="button" class="up-btn" data-role="sync">同步价格</button>' +
       '      <button type="button" class="up-btn" data-role="refresh">刷新</button>' +
@@ -125,7 +129,7 @@
       "      <h3>账号用量</h3>" +
       '      <div class="up-table-wrap"><table><thead><tr><th>账号</th><th>输入</th><th>输出</th><th>缓存</th><th>总 Token</th><th>等效成本</th></tr></thead><tbody data-role="account-body"></tbody></table></div>' +
       "    </div>" +
-      "    <div>" +
+      '    <div data-role="detail">' +
       "      <h3>模型明细</h3>" +
       '      <div class="up-table-wrap"><table><thead><tr><th>账号</th><th>模型</th><th>总 Token</th><th>等效成本</th></tr></thead><tbody data-role="model-body"></tbody></table></div>' +
       "    </div>" +
@@ -289,6 +293,39 @@
     });
 
     setRange(defaultRange);
+
+    const detailToggle = q('[data-role="detail-toggle"]');
+    const detailColumn = q('[data-role="detail"]');
+    const grid = root.querySelector(".up-grid");
+
+    function applyDetail(show) {
+      detailToggle.checked = show;
+      detailColumn.style.display = show ? "" : "none";
+      grid.classList.toggle("detail-hidden", !show);
+    }
+
+    let showDetail = true;
+    try {
+      showDetail = localStorage.getItem("usage-show-detail") !== "0";
+    } catch (error) {
+      showDetail = true;
+    }
+    applyDetail(showDetail);
+
+    detailToggle.addEventListener("change", function () {
+      applyDetail(detailToggle.checked);
+      try {
+        localStorage.setItem("usage-show-detail", detailToggle.checked ? "1" : "0");
+      } catch (error) {}
+    });
+
+    try {
+      window.addEventListener("storage", function (event) {
+        if (event.key === "usage-show-detail") {
+          applyDetail(event.newValue !== "0");
+        }
+      });
+    } catch (error) {}
 
     let timer = null;
     function scheduleNext() {
