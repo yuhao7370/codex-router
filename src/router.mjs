@@ -45,7 +45,7 @@ import {
   ResponseUsageTransform,
   tokenUsageFromPayload,
 } from "./response-usage.mjs";
-import { fetchWithRetry } from "./upstream-retry.mjs";
+import { fetchWithRetry, isAtCapacityResponse } from "./upstream-retry.mjs";
 import { nativeProxyFetch } from "./native-proxy.mjs";
 import {
   NamespaceToolCallTransform,
@@ -1773,10 +1773,16 @@ async function handleResponses(request, response, requestUrl) {
     // routed turn that means the full router -> litellm -> api-forwarder ->
     // provider path, so a stall here is the provider's, not the router's.
     upstreamLatencyMs = Date.now() - startedAt;
-    // A native 401/403/429 means the injected account stopped working. Let the
-    // bridge mark it failed so the poller can switch to a healthy account when
-    // failover is enabled; the current turn still relays the upstream error.
-    if (!route) notifyAccountFailure(upstream.status);
+    // A native 401/402/403/429 means the injected account stopped working. Let
+    // the bridge mark it failed so the poller can switch to a healthy account
+    // when failover is enabled; the current turn still relays the error.
+    if (!route) {
+      const capacity =
+        !upstream.ok &&
+        upstream.status === 429 &&
+        (await isAtCapacityResponse(upstream));
+      notifyAccountFailure(upstream.status, capacity);
+    }
     // Gateway error bodies leak LiteLLM's internal exception chain, which
     // reads like a router bug. Rewrite them to name the provider that failed.
     // Native traffic passes through untouched: OpenAI errors are already clear.

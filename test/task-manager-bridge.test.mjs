@@ -66,3 +66,9 @@ test("blocked accounts default empty and can be cleared", () => {
   bridge.clearBlockedAccount("some-id");
   assert.deepEqual(bridge.readTaskManagerConfig().blocked, {});
 });
+
+test("error log defaults empty and clears", () => {
+  assert.deepEqual(bridge.errorLog(), []);
+  bridge.clearErrorLog();
+  assert.deepEqual(bridge.errorLog(), []);
+});

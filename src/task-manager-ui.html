@@ -160,10 +160,12 @@
   }
   .result.ok { background: var(--ok-bg); border-color: #bfe8d8; color: var(--ok); }
   .result.err { background: var(--err-bg); border-color: #f6cdd8; color: var(--err); }
-  #injection-log { margin-top: 0; max-height: 220px; overflow: auto; }
-  #injection-log::-webkit-scrollbar { width: 8px; }
-  #injection-log::-webkit-scrollbar-thumb { background: #d6dde8; border-radius: 4px; }
-  #injection-log::-webkit-scrollbar-track { background: transparent; }
+  #injection-log, #error-log { margin-top: 0; overflow: auto; }
+  #injection-log { max-height: 220px; }
+  #error-log { max-height: 320px; }
+  #injection-log::-webkit-scrollbar, #error-log::-webkit-scrollbar { width: 8px; }
+  #injection-log::-webkit-scrollbar-thumb, #error-log::-webkit-scrollbar-thumb { background: #d6dde8; border-radius: 4px; }
+  #injection-log::-webkit-scrollbar-track, #error-log::-webkit-scrollbar-track { background: transparent; }
 
   /* ===== 表格 ===== */
   .table-wrap { overflow-x: auto; margin: 0 -4px; padding: 0 4px; }
@@ -301,6 +303,7 @@
   </section>
 
   <div class="main">
+    <div class="side">
     <div class="card">
       <div class="card-head">
         <h2>CTM 账号</h2>
@@ -318,6 +321,15 @@
         <tbody id="accounts-body"></tbody>
       </table>
       </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <h2>错误日志</h2>
+        <button class="ghost" id="clear-errors">清除</button>
+      </div>
+      <div id="error-log" class="result">暂无错误</div>
+    </div>
     </div>
 
     <div class="side">
@@ -504,6 +516,17 @@
           return formatTime(e.at) + '  ' + email + plan;
         }).join(String.fromCharCode(10))
       : '暂无注入记录';
+    const errors = Array.isArray(status.errors) ? status.errors : [];
+    el('error-log').textContent = errors.length
+      ? errors.map(function (e) {
+          const label = e.type === 'blocked'
+            ? '踢出'
+            : (e.type === 'capacity' ? '容量上限' : '限流');
+          const email = e.email || shortId(e.accountId);
+          return formatTime(e.at) + '  [' + label + '] ' + email +
+            (e.status ? ' (HTTP ' + e.status + ')' : '');
+        }).join(String.fromCharCode(10))
+      : '暂无错误';
     el('port-input').value = String(status.port);
   }
 
@@ -704,6 +727,15 @@
       await loadStatus();
     } catch (error) {
       setResult('accounts-error', false, '清空轮询池失败：' + error.message);
+    }
+  });
+
+  el('clear-errors').addEventListener('click', async function () {
+    try {
+      await api('/api/errors/clear', { method: 'POST' });
+      await loadStatus();
+    } catch (error) {
+      setResult('test-result', false, '清除错误日志失败：' + error.message);
     }
   });
 

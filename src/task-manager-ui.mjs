@@ -6,6 +6,8 @@ import { fileURLToPath } from "node:url";
 import {
   activeAccount,
   clearBlockedAccount,
+  clearErrorLog,
+  errorLog,
   failoverStatus,
   importTaskManagerAccount,
   injectionStats,
@@ -48,6 +50,7 @@ function statusPayload() {
   const account = activeAccount();
   return {
     enabled: config.enabled,
+    errors: errorLog(),
     failover: failoverStatus(),
     pool: poolStatus(),
     port: config.port,
@@ -124,6 +127,10 @@ export function startTaskManagerUi() {
       if (request.method === "POST" && url.pathname === "/api/unblock") {
         const body = await readJsonBody(request);
         clearBlockedAccount(body.id);
+        return sendJson(response, 200, statusPayload());
+      }
+      if (request.method === "POST" && url.pathname === "/api/errors/clear") {
+        clearErrorLog();
         return sendJson(response, 200, statusPayload());
       }
       if (request.method === "POST" && url.pathname === "/api/test") {

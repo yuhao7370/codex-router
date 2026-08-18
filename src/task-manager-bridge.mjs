@@ -1,4 +1,5 @@
 import {
+  appendFileSync,
   existsSync,
   mkdirSync,
   readFileSync,
@@ -25,6 +26,7 @@ const FAILOVER_TRIGGER_STATUSES = new Set([401, 402, 403, 429]);
 // required, 401/403 cover revoked or banned credentials.
 const BLOCK_STATUSES = new Set([401, 402, 403]);
 const STATE_PATH = path.join(STATE_DIR, "task-manager.json");
+const ERROR_LOG_PATH = path.join(STATE_DIR, "task-manager-errors.jsonl");
 
 const MAX_INJECTION_EVENTS = 100;
 
@@ -43,6 +45,54 @@ const accountFailureMemory = new Map();
 let poolCredentials = [];
 let poolCursor = 0;
 let lastInjectedId = null;
+
+function loadErrorLog() {
+  try {
+    if (!existsSync(ERROR_LOG_PATH)) return [];
+    return readFileSync(ERROR_LOG_PATH, "utf8")
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => {
+        try {
+          return JSON.parse(line);
+        } catch {
+          return null;
+        }
+      })
+      .filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+let errorLogEntries = loadErrorLog();
+
+function recordErrorLog(entry) {
+  const record = { at: new Date().toISOString(), ...entry };
+  errorLogEntries.unshift(record);
+  try {
+    mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
+    appendFileSync(ERROR_LOG_PATH, `${JSON.stringify(record)}\n`, {
+      encoding: "utf8",
+      mode: 0o600,
+    });
+  } catch {
+    // Error logging is best-effort and must never fail a request.
+  }
+}
+
+export function errorLog() {
+  return errorLogEntries;
+}
+
+export function clearErrorLog() {
+  errorLogEntries = [];
+  try {
+    writeFileSync(ERROR_LOG_PATH, "", { encoding: "utf8", mode: 0o600 });
+  } catch {
+    // Best-effort.
+  }
+}
 
 function defaults() {
   return {
@@ -322,6 +372,7 @@ export async function refreshActiveAccount() {
           : null;
       cached = {
         accountId: typeof body.account_id === "string" ? body.account_id : "",
+        email: typeof body.email === "string" ? body.email : "",
         accessToken: body.access_token,
         plan: usage && typeof usage.plan === "string" ? usage.plan : "",
         remainingPercent:
@@ -428,22 +479,37 @@ export async function failoverIfNeeded(reason = "poll") {
   return true;
 }
 
-export function notifyAccountFailure(status) {
+export function notifyAccountFailure(status, capacity = false) {
   if (!FAILOVER_TRIGGER_STATUSES.has(status)) return;
   const state = readTaskManagerConfig();
   if (!state.enabled) return;
   const accountId = lastInjectedId || (cached && cached.accountId);
+  const poolEntry = poolCredentials.find(
+    (account) => account.accountId === accountId,
+  );
+  const email = poolEntry?.email || cached?.email || "";
   if (accountId) {
     accountFailureMemory.set(accountId, Date.now());
   }
+
+  const isBlock = BLOCK_STATUSES.has(status);
+  recordErrorLog({
+    type: isBlock ? "blocked" : capacity ? "capacity" : "rate_limit",
+    status,
+    accountId: accountId || "",
+    email,
+    message: isBlock
+      ? "账号鉴权失败"
+      : capacity
+        ? "模型容量上限"
+        : "限流/额度",
+  });
+
   if (Array.isArray(state.pool) && state.pool.length > 0) {
     // Pool mode: a hard failure removes the account from the pool so it can
     // never be handed a request again, and records it as blocked for the UI.
-    if (BLOCK_STATUSES.has(status)) {
-      const entry = poolCredentials.find(
-        (account) => account.accountId === accountId,
-      );
-      const poolId = entry ? entry.id : accountId;
+    if (isBlock) {
+      const poolId = poolEntry ? poolEntry.id : accountId;
       const remaining = state.pool.filter((id) => id !== poolId);
       if (remaining.length !== state.pool.length) {
         writeTaskManagerConfig({
