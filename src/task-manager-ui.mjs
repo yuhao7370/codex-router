@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 
 import {
   activeAccount,
+  clearBlockedAccount,
   failoverStatus,
   importTaskManagerAccount,
   injectionStats,
@@ -118,6 +119,11 @@ export function startTaskManagerUi() {
       if (request.method === "POST" && url.pathname === "/api/pool") {
         const body = await readJsonBody(request);
         setTaskManagerPool(body.ids || []);
+        return sendJson(response, 200, statusPayload());
+      }
+      if (request.method === "POST" && url.pathname === "/api/unblock") {
+        const body = await readJsonBody(request);
+        clearBlockedAccount(body.id);
         return sendJson(response, 200, statusPayload());
       }
       if (request.method === "POST" && url.pathname === "/api/test") {

@@ -19,7 +19,11 @@ const REQUEST_TIMEOUT_MS = 3_000;
 const POLL_INTERVAL_MS = 15_000;
 const FAILOVER_COOLDOWN_MS = 30_000;
 const FAILURE_MEMORY_MS = 5 * 60 * 1000;
-const FAILOVER_TRIGGER_STATUSES = new Set([401, 403, 429]);
+const FAILOVER_TRIGGER_STATUSES = new Set([401, 402, 403, 429]);
+// Hard account failures that should remove the account from the pool, not just
+// skip it for a few minutes. 402 covers deactivated_workspace / payment
+// required, 401/403 cover revoked or banned credentials.
+const BLOCK_STATUSES = new Set([401, 402, 403]);
 const STATE_PATH = path.join(STATE_DIR, "task-manager.json");
 
 const MAX_INJECTION_EVENTS = 100;
@@ -46,6 +50,7 @@ function defaults() {
     enabled: false,
     failover: false,
     pool: [],
+    blocked: {},
     port: DEFAULT_PORT,
     token: "",
   };
@@ -61,6 +66,10 @@ export function readTaskManagerConfig() {
     state.pool = Array.isArray(state.pool)
       ? state.pool.map((id) => String(id)).filter(Boolean)
       : [];
+    state.blocked =
+      state.blocked && typeof state.blocked === "object" && !Array.isArray(state.blocked)
+        ? state.blocked
+        : {};
     state.port = Number.isInteger(state.port) ? state.port : DEFAULT_PORT;
     if (state.port < 1 || state.port > 65_535) state.port = DEFAULT_PORT;
     state.token = String(state.token || "").trim();
@@ -427,8 +436,30 @@ export function notifyAccountFailure(status) {
   if (accountId) {
     accountFailureMemory.set(accountId, Date.now());
   }
-  // Pool mode handles the failed account by skipping it on the next rotation.
-  if (Array.isArray(state.pool) && state.pool.length > 0) return;
+  if (Array.isArray(state.pool) && state.pool.length > 0) {
+    // Pool mode: a hard failure removes the account from the pool so it can
+    // never be handed a request again, and records it as blocked for the UI.
+    if (BLOCK_STATUSES.has(status)) {
+      const entry = poolCredentials.find(
+        (account) => account.accountId === accountId,
+      );
+      const poolId = entry ? entry.id : accountId;
+      const remaining = state.pool.filter((id) => id !== poolId);
+      if (remaining.length !== state.pool.length) {
+        writeTaskManagerConfig({
+          pool: remaining,
+          blocked: {
+            ...state.blocked,
+            [poolId]: { at: Date.now(), status },
+          },
+        });
+        poolCredentials = poolCredentials.filter(
+          (account) => account.id !== poolId,
+        );
+      }
+    }
+    return;
+  }
   if (!state.failover) return;
   failoverPending = true;
   scheduleImmediateFailover();
@@ -469,6 +500,7 @@ export async function refreshPool() {
     .map((account) => {
       const used = account.usage?.weekly_used_percent;
       return {
+        id: typeof account.id === "string" ? account.id : account.account_id || "",
         accountId:
           typeof account.account_id === "string"
             ? account.account_id
@@ -533,7 +565,15 @@ export function poolStatus() {
       plan: account.plan,
       remainingPercent: account.remainingPercent,
     })),
+    blocked: state.blocked || {},
   };
+}
+
+export function clearBlockedAccount(id) {
+  const state = readTaskManagerConfig();
+  const blocked = { ...(state.blocked || {}) };
+  delete blocked[id];
+  return writeTaskManagerConfig({ blocked });
 }
 
 export function failoverStatus() {

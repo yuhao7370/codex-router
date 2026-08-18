@@ -59,3 +59,10 @@ test("task manager pool persists and defaults empty", () => {
   bridge.setTaskManagerPool([]);
   assert.deepEqual(bridge.readTaskManagerConfig().pool, []);
 });
+
+test("blocked accounts default empty and can be cleared", () => {
+  assert.deepEqual(bridge.readTaskManagerConfig().blocked, {});
+  assert.deepEqual(bridge.poolStatus().blocked, {});
+  bridge.clearBlockedAccount("some-id");
+  assert.deepEqual(bridge.readTaskManagerConfig().blocked, {});
+});

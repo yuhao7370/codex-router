@@ -148,7 +148,7 @@
   button.ghost:hover { background: #f4f6fa; }
   button:disabled { opacity: 0.4; cursor: default; transform: none; filter: none; box-shadow: none; }
   .head-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-  .select-btn, #refresh-accounts, #save-pool, #clear-pool { padding: 7px 13px; font-size: 12px; margin: 0; }
+  .select-btn, .unblock-btn, #refresh-accounts, #save-pool, #clear-pool { padding: 7px 13px; font-size: 12px; margin: 0; }
 
   /* ===== 结果框 / 日志 ===== */
   .result {
@@ -406,6 +406,7 @@
 
   let accountIndex = new Map();
   let currentPool = new Set();
+  let blockedAccounts = new Set();
 
   function buildAccountIndex(accounts) {
     accountIndex = new Map();
@@ -482,6 +483,7 @@
     el('failover-toggle').checked = Boolean(failover.enabled);
     const pool = status.pool || {};
     currentPool = new Set(Array.isArray(pool.ids) ? pool.ids : []);
+    blockedAccounts = new Set(Object.keys(pool.blocked || {}));
     const poolIds = Array.isArray(pool.ids) ? pool.ids : [];
     const poolAccounts = Array.isArray(pool.accounts) ? pool.accounts : [];
     const poolHint = el('pool-hint');
@@ -518,9 +520,12 @@
         const email = account.email || '';
         const id = account.id || account.account_id || '';
         const source = account.source === 'native' ? '原生' : '托管';
-        const state = account.valid === false
-          ? '<span class="badge off">失效</span>'
-          : (account.is_default ? '<span class="badge on">当前</span>' : '<span class="badge">—</span>');
+        const blocked = blockedAccounts.has(id);
+        const state = blocked
+          ? '<span class="badge off">已踢出</span>'
+          : (account.valid === false
+              ? '<span class="badge off">失效</span>'
+              : (account.is_default ? '<span class="badge on">当前</span>' : '<span class="badge">—</span>'));
         const usage = account.usage;
         const quota = usage && typeof usage.weekly_used_percent === 'number'
           ? (usage.plan ? String(usage.plan).toUpperCase() + ' ' : '') +
@@ -528,14 +533,16 @@
           : '—';
         tr.innerHTML =
           '<td><input type="checkbox" class="pool-check" data-id="' + escapeHtml(id) + '"' +
-            (currentPool.has(id) ? ' checked' : '') + '></td>' +
+            (currentPool.has(id) ? ' checked' : '') + (blocked ? ' disabled' : '') + '></td>' +
           '<td>' + escapeHtml(email || '—') + '</td>' +
           '<td class="mono">' + escapeHtml(id) + '</td>' +
           '<td>' + source + '</td>' +
           '<td>' + state + '</td>' +
           '<td>' + escapeHtml(quota) + '</td>' +
-          '<td><button data-id="' + escapeHtml(id) + '" class="ghost select-btn"' +
-            (account.is_default ? ' disabled' : '') + '>选择</button></td>';
+          '<td>' + (blocked
+            ? '<button data-id="' + escapeHtml(id) + '" class="ghost unblock-btn">解除</button>'
+            : '<button data-id="' + escapeHtml(id) + '" class="ghost select-btn"' +
+              (account.is_default ? ' disabled' : '') + '>选择</button>') + '</td>';
         body.appendChild(tr);
       }
       if (accounts.length === 0) {
@@ -552,6 +559,20 @@
             await Promise.all([loadStatus(), loadAccounts()]);
           } catch (error) {
             setResult('accounts-error', false, '选择失败：' + error.message);
+          }
+        });
+      }
+      for (const btn of document.querySelectorAll('.unblock-btn')) {
+        btn.addEventListener('click', async function () {
+          try {
+            await api('/api/unblock', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ id: btn.getAttribute('data-id') }),
+            });
+            await Promise.all([loadStatus(), loadAccounts()]);
+          } catch (error) {
+            setResult('accounts-error', false, '解除失败：' + error.message);
           }
         });
       }
