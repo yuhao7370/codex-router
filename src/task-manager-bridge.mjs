@@ -536,7 +536,7 @@ function kickPoolAccount(
   return true;
 }
 
-export function notifyAccountFailure(status, capacity = false) {
+export function notifyAccountFailure(status, capacity = false, quota = false) {
   if (!FAILOVER_TRIGGER_STATUSES.has(status)) return;
   const state = readTaskManagerConfig();
   if (!state.enabled) return;
@@ -550,13 +550,15 @@ export function notifyAccountFailure(status, capacity = false) {
   }
 
   const isBlock = BLOCK_STATUSES.has(status);
+  const isQuota = !isBlock && quota;
   const poolActive = Array.isArray(state.pool) && state.pool.length > 0;
 
-  if (isBlock && poolActive) {
-    // A hard failure removes the account from the pool so it can never be
-    // handed a request again.
+  if ((isBlock || isQuota) && poolActive) {
+    // A hard failure or a spent quota removes the account from the pool so it
+    // can never be handed a request again.
     kickPoolAccount(poolEntry ? poolEntry.id : accountId, {
       status,
+      reason: isQuota ? "quota" : "blocked",
       email,
       accountId,
     });
@@ -564,15 +566,23 @@ export function notifyAccountFailure(status, capacity = false) {
   }
 
   recordErrorLog({
-    type: isBlock ? "blocked" : capacity ? "capacity" : "rate_limit",
+    type: isBlock
+      ? "blocked"
+      : isQuota
+        ? "quota"
+        : capacity
+          ? "capacity"
+          : "rate_limit",
     status,
     accountId: accountId || "",
     email,
     message: isBlock
       ? "账号鉴权失败"
-      : capacity
-        ? "模型容量上限"
-        : "限流/额度",
+      : isQuota
+        ? "额度用完"
+        : capacity
+          ? "模型容量上限"
+          : "限流/额度",
   });
 
   if (poolActive) return;

@@ -12,6 +12,7 @@ import { callerBaseUrl } from "../src/caller-auth.mjs";
 import {
   fetchWithRetry,
   isAtCapacityResponse,
+  isQuotaExhaustedResponse,
   isRetryableResponse,
 } from "../src/upstream-retry.mjs";
 import { openPort } from "./port-pool.mjs";
@@ -182,6 +183,26 @@ test("a capacity error body is retryable while a quota 429 is not", async () => 
   assert.equal(await isAtCapacityResponse(capacity), true);
   assert.equal(await isAtCapacityResponse(quota), false);
   assert.equal(await isAtCapacityResponse(new Response("ok", { status: 200 })), false);
+});
+
+test("a quota-exhausted body is classified separately from capacity", async () => {
+  const quota = new Response(
+    JSON.stringify({
+      error: {
+        type: "insufficient_quota",
+        message: "You've reached your usage limit. Please check your plan and billing details.",
+      },
+    }),
+    { status: 429, headers: { "Content-Type": "application/json" } },
+  );
+  const capacity = new Response(
+    JSON.stringify({ error: { message: "Selected model is at capacity." } }),
+    { status: 429, headers: { "Content-Type": "application/json" } },
+  );
+  assert.equal(await isQuotaExhaustedResponse(quota), true);
+  assert.equal(await isAtCapacityResponse(quota), false);
+  assert.equal(await isQuotaExhaustedResponse(capacity), false);
+  assert.equal(await isAtCapacityResponse(capacity), true);
 });
 
 test("twenty retries permit a successful twenty-first attempt", async () => {

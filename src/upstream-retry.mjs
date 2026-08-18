@@ -122,6 +122,20 @@ export async function isAtCapacityResponse(response) {
   }
 }
 
+// A 429 whose body names a spent quota (insufficient_quota / usage limit) is
+// terminal for the account until the weekly window resets, unlike a transient
+// rate-limit burst or the model being at capacity.
+export async function isQuotaExhaustedResponse(response) {
+  if (!response) return false;
+  if (Number(response?.status) !== 429) return false;
+  try {
+    const text = await response.clone().text();
+    return /insufficient_quota|usage limit|quota exceeded|reached your usage/i.test(text);
+  } catch {
+    return false;
+  }
+}
+
 export function isRetryableTransportError(error) {
   if (!error) return false;
   // An abort is the caller leaving, and a router-side error (a body that is too

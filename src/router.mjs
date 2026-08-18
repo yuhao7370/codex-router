@@ -45,7 +45,11 @@ import {
   ResponseUsageTransform,
   tokenUsageFromPayload,
 } from "./response-usage.mjs";
-import { fetchWithRetry, isAtCapacityResponse } from "./upstream-retry.mjs";
+import {
+  fetchWithRetry,
+  isAtCapacityResponse,
+  isQuotaExhaustedResponse,
+} from "./upstream-retry.mjs";
 import { nativeProxyFetch } from "./native-proxy.mjs";
 import {
   NamespaceToolCallTransform,
@@ -1781,7 +1785,11 @@ async function handleResponses(request, response, requestUrl) {
         !upstream.ok &&
         upstream.status === 429 &&
         (await isAtCapacityResponse(upstream));
-      notifyAccountFailure(upstream.status, capacity);
+      const quota =
+        !upstream.ok &&
+        upstream.status === 429 &&
+        (await isQuotaExhaustedResponse(upstream));
+      notifyAccountFailure(upstream.status, capacity, quota);
     }
     // Gateway error bodies leak LiteLLM's internal exception chain, which
     // reads like a router bug. Rewrite them to name the provider that failed.
