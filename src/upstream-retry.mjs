@@ -108,6 +108,20 @@ export function isRetryableResponse(response) {
   return /^text\/html(?:\s*;|$)/i.test(contentType) && Boolean(cfRay);
 }
 
+// OpenAI's "Selected model is at capacity" error arrives as a 429/5xx whose
+// body names capacity rather than the caller's own quota. It is transient and
+// safe to retry, unlike a quota 429 which retrying only makes worse.
+export async function isAtCapacityResponse(response) {
+  if (!response) return false;
+  if (Number(response?.status) < 400) return false;
+  try {
+    const text = await response.clone().text();
+    return /capacity/i.test(text);
+  } catch {
+    return false;
+  }
+}
+
 export function isRetryableTransportError(error) {
   if (!error) return false;
   // An abort is the caller leaving, and a router-side error (a body that is too
@@ -187,7 +201,7 @@ export async function fetchWithRetry(target, init = {}, options = {}) {
     if (attempt >= retries) return settle(response, failure, attempt);
     const retryable = failure
       ? isRetryableTransportError(failure)
-      : isRetryableResponse(response);
+      : isRetryableResponse(response) || (await isAtCapacityResponse(response));
     if (!retryable) return settle(response, failure, attempt);
     // The caller is gone, or has already relayed something. Either way this
     // request is over: a retry would be work for nobody, or a duplicated

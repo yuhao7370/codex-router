@@ -9,7 +9,11 @@ import { fileURLToPath } from "node:url";
 import { zstdDecompressSync } from "node:zlib";
 
 import { callerBaseUrl } from "../src/caller-auth.mjs";
-import { fetchWithRetry, isRetryableResponse } from "../src/upstream-retry.mjs";
+import {
+  fetchWithRetry,
+  isAtCapacityResponse,
+  isRetryableResponse,
+} from "../src/upstream-retry.mjs";
 import { openPort } from "./port-pool.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -161,6 +165,23 @@ test("only a Cloudflare-marked HTML 403 is retryable", () => {
   assert.equal(isRetryableResponse(response("text/html", undefined)), false);
   assert.equal(isRetryableResponse(new Response("error", { status: 500 })), false);
   assert.equal(isRetryableResponse(new Response("edge", { status: 503 })), true);
+});
+
+test("a capacity error body is retryable while a quota 429 is not", async () => {
+  const capacity = new Response(
+    JSON.stringify({
+      error: { message: "Selected model is at capacity. Please try a different model." },
+    }),
+    { status: 429, headers: { "Content-Type": "application/json" } },
+  );
+  const quota = new Response(
+    JSON.stringify({ error: { message: "You have reached your weekly usage limit." } }),
+    { status: 429, headers: { "Content-Type": "application/json" } },
+  );
+  assert.equal(isRetryableResponse(capacity), false);
+  assert.equal(await isAtCapacityResponse(capacity), true);
+  assert.equal(await isAtCapacityResponse(quota), false);
+  assert.equal(await isAtCapacityResponse(new Response("ok", { status: 200 })), false);
 });
 
 test("twenty retries permit a successful twenty-first attempt", async () => {
