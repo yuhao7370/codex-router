@@ -163,9 +163,32 @@
     return Math.floor(hours / 24) + ' 天前';
   }
 
+  function formatTime(iso) {
+    const d = new Date(iso);
+    if (isNaN(d.getTime())) return String(iso || '');
+    const p = function (n) { return String(n).padStart(2, '0'); };
+    return p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
+  }
+
   function shortId(id) {
     const value = String(id || '');
     return value.length > 12 ? value.slice(0, 8) + '…' : value;
+  }
+
+  let accountIndex = new Map();
+
+  function buildAccountIndex(accounts) {
+    accountIndex = new Map();
+    for (const account of accounts || []) {
+      const info = {
+        email: account.email || '',
+        plan: account.usage && account.usage.plan
+          ? String(account.usage.plan).toUpperCase()
+          : '',
+      };
+      if (account.account_id) accountIndex.set(account.account_id, info);
+      if (account.id) accountIndex.set(account.id, info);
+    }
   }
 
   function normalizeImport(raw) {
@@ -216,9 +239,13 @@
     el('failover-toggle').checked = Boolean(failover.enabled);
     const injections = status.injections || { count: 0, recent: [] };
     el('injection-count').textContent = String(injections.count);
-    el('injection-log').textContent = injections.recent && injections.recent.length
-      ? injections.recent.map(function (e) {
-          return e.at + '  ' + e.accountId + '  ' + (e.path || '');
+    const recent = (injections.recent || []).slice(0, 10);
+    el('injection-log').textContent = recent.length
+      ? recent.map(function (e) {
+          const info = accountIndex.get(e.accountId);
+          const email = (info && info.email) ? info.email : shortId(e.accountId);
+          const plan = (info && info.plan) ? ' · ' + info.plan : '';
+          return formatTime(e.at) + '  ' + email + plan;
         }).join(String.fromCharCode(10))
       : '暂无注入记录';
     el('port-input').value = String(status.port);
@@ -231,6 +258,7 @@
       const body = el('accounts-body');
       body.textContent = '';
       const accounts = Array.isArray(payload.accounts) ? payload.accounts : [];
+      buildAccountIndex(accounts);
       for (const account of accounts) {
         const tr = document.createElement('tr');
         const email = account.email || '';
@@ -365,8 +393,11 @@
     }
   });
 
-  loadStatus().catch(function (error) { setResult('test-result', false, '加载状态失败：' + error.message); });
-  loadAccounts();
+  async function boot() {
+    await loadAccounts();
+    await loadStatus();
+  }
+  boot().catch(function (error) { setResult('test-result', false, '加载失败：' + error.message); });
   setInterval(function () { loadStatus().catch(function () {}); }, 5000);
 </script>
 </body>
