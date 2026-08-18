@@ -12,12 +12,19 @@
     background: #0b1120; color: #e6edf7;
     font: 14px/1.5 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
   }
-  .wrap { max-width: 760px; margin: 0 auto; }
-  h1 { font-size: 22px; margin: 0 0 2px; }
-  .sub { color: #7d8aa3; margin-bottom: 20px; }
+  .wrap {
+    max-width: 1240px; margin: 0 auto;
+    display: grid;
+    grid-template-columns: minmax(360px, 1fr) minmax(460px, 1.25fr);
+    gap: 16px;
+    align-items: start;
+  }
+  h1 { font-size: 22px; margin: 0 0 2px; grid-column: 1 / -1; }
+  .sub { color: #7d8aa3; margin-bottom: 8px; grid-column: 1 / -1; }
+  .col { display: flex; flex-direction: column; gap: 16px; }
   .card {
     background: #121a2b; border: 1px solid #24304a;
-    border-radius: 10px; padding: 18px; margin-bottom: 16px;
+    border-radius: 10px; padding: 18px;
   }
   .card h2 { margin: 0 0 12px; font-size: 15px; color: #9fd4ff; }
   .row { display: flex; justify-content: space-between; padding: 6px 0; border-bottom: 1px solid #1b2740; }
@@ -61,6 +68,10 @@
   textarea:focus { outline: 1px solid #3b8fd0; }
   .hint { color: #7d8aa3; font-size: 12px; margin: 0 0 8px; }
   .hint a { color: #9fd4ff; }
+  @media (max-width: 900px) {
+    .wrap { grid-template-columns: 1fr; }
+    h1, .sub { grid-column: auto; }
+  }
 </style>
 </head>
 <body>
@@ -68,6 +79,7 @@
   <h1>Codex Router</h1>
   <div class="sub">Codex_Task_Manager 账号代理控制台</div>
 
+  <div class="col">
   <div class="card">
     <h2>状态</h2>
     <div class="row"><span class="k">代理状态</span><span class="v"><span id="enabled-badge" class="badge off">…</span></span></div>
@@ -95,7 +107,9 @@
       <tbody id="accounts-body"></tbody>
     </table>
   </div>
+  </div>
 
+  <div class="col">
   <div class="card">
     <h2>导入账号</h2>
     <p class="hint">粘贴 auth.json，或直接粘贴 sub2api 导出的 JSON（会自动转换）。<a href="/converter" target="_blank">打开独立转换器</a></p>
@@ -129,6 +143,7 @@
       <button class="ghost" id="save-token">保存 Token</button>
       <button class="ghost" id="clear-token">清除 Token</button>
     </div>
+  </div>
   </div>
 </div>
 
@@ -398,7 +413,7 @@
     await loadStatus();
   }
   boot().catch(function (error) { setResult('test-result', false, '加载失败：' + error.message); });
-  setInterval(function () { loadStatus().catch(function () {}); }, 5000);
+  setInterval(function () { loadStatus().catch(function () {}); }, 2000);
 </script>
 </body>
 </html>
