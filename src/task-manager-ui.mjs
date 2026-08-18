@@ -113,32 +113,40 @@ export function startTaskManagerUi() {
       if (request.method === "GET" && url.pathname === "/api/usage") {
         const snapshot = panelUsageSnapshot();
         const accountMeta = new Map();
+        const validIds = new Set();
+        let ctmReachable = false;
         try {
           const accounts = await listTaskManagerAccounts();
+          ctmReachable = true;
           for (const account of Array.isArray(accounts?.accounts) ? accounts.accounts : []) {
-            const id = account.account_id || account.id;
-            if (id) {
-              accountMeta.set(String(id), {
-                email: typeof account.email === "string" ? account.email : "",
-                plan:
-                  account.usage && typeof account.usage.plan === "string"
-                    ? account.usage.plan
-                    : "",
-              });
+            const meta = {
+              email: typeof account.email === "string" ? account.email : "",
+              plan:
+                account.usage && typeof account.usage.plan === "string"
+                  ? account.usage.plan
+                  : "",
+            };
+            for (const key of [account.account_id, account.id]) {
+              if (!key) continue;
+              const id = String(key);
+              accountMeta.set(id, meta);
+              validIds.add(id);
             }
           }
         } catch {
           // CTM may be stopped or unauthenticated; the account list stays
           // usable keyed by its raw id without names.
         }
-        const accounts = (snapshot.accounts || []).map((account) => {
-          const meta = accountMeta.get(account.accountId);
-          return {
-            ...account,
-            email: meta?.email || "",
-            plan: meta?.plan || "",
-          };
-        });
+        const accounts = (snapshot.accounts || [])
+          .filter((account) => !ctmReachable || validIds.has(account.accountId))
+          .map((account) => {
+            const meta = accountMeta.get(account.accountId);
+            return {
+              ...account,
+              email: meta?.email || "",
+              plan: meta?.plan || "",
+            };
+          });
         return sendJson(response, 200, { ...snapshot, accounts });
       }
       if (request.method === "POST" && url.pathname === "/api/usage/sync") {
