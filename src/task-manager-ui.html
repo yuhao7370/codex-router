@@ -308,6 +308,7 @@
       <div class="card-head">
         <h2>CTM 账号</h2>
         <div class="head-actions">
+          <span class="stat-foot" style="margin:0"><span class="mono" id="accounts-countdown">…</span> 后刷新</span>
           <button class="ghost" id="refresh-accounts">刷新账号</button>
           <button class="ghost" id="save-pool">保存轮询池</button>
           <button class="ghost" id="clear-pool">清空池</button>
@@ -347,7 +348,7 @@
       <div class="card">
         <div class="card-head">
           <h2>注入日志</h2>
-          <span class="stat-foot" style="margin:0">成功 <span class="mono" id="injection-count">0</span> 次</span>
+          <span class="stat-foot" style="margin:0">成功 <span class="mono" id="injection-count">0</span> 次 · <span class="mono" id="log-countdown">…</span> 后刷新</span>
         </div>
         <div id="injection-log" class="result">暂无注入记录</div>
       </div>
@@ -356,6 +357,12 @@
         <div class="card-head"><h2>设置</h2></div>
         <div class="field">
           <label class="switch-label"><input type="checkbox" id="failover-toggle" class="switch"> 额度用光/不可用时自动切换账号</label>
+        </div>
+        <div class="field">
+          <label>轮询</label>
+          <input id="log-interval-input" type="number" min="1" max="60" style="width:72px"> <span class="muted">日志秒</span>
+          <input id="accounts-interval-input" type="number" min="1" max="60" style="width:72px"> <span class="muted">账号秒</span>
+          <button class="ghost" id="save-intervals">保存</button>
         </div>
         <div class="field">
           <label>端口</label>
@@ -750,19 +757,71 @@
     }
   });
 
+  let logIntervalMs = 2000;
+  let accountsIntervalMs = 15000;
+  let logNextAt = 0;
+  let accountsNextAt = 0;
+  let logTimer = null;
+  let accountsTimer = null;
+
+  async function pollLog() {
+    try { await loadStatus(); } catch (error) {}
+    logNextAt = Date.now() + logIntervalMs;
+    logTimer = setTimeout(pollLog, logIntervalMs);
+  }
+
+  async function pollAccounts() {
+    try { await loadAccounts(true); } catch (error) {}
+    accountsNextAt = Date.now() + accountsIntervalMs;
+    accountsTimer = setTimeout(pollAccounts, accountsIntervalMs);
+  }
+
+  function tickCountdown() {
+    const now = Date.now();
+    el('log-countdown').textContent = Math.max(0, Math.ceil((logNextAt - now) / 1000)) + 's';
+    el('accounts-countdown').textContent = Math.max(0, Math.ceil((accountsNextAt - now) / 1000)) + 's';
+  }
+
+  el('save-intervals').addEventListener('click', async function () {
+    try {
+      const status = await api('/api/intervals', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          logIntervalMs: Math.round(Number(el('log-interval-input').value) * 1000),
+          accountsIntervalMs: Math.round(Number(el('accounts-interval-input').value) * 1000),
+        }),
+      });
+      logIntervalMs = status.logIntervalMs;
+      accountsIntervalMs = status.accountsIntervalMs;
+      el('log-interval-input').value = String(Math.round(logIntervalMs / 1000));
+      el('accounts-interval-input').value = String(Math.round(accountsIntervalMs / 1000));
+      clearTimeout(logTimer);
+      clearTimeout(accountsTimer);
+      pollLog();
+      pollAccounts();
+    } catch (error) {
+      setResult('test-result', false, '保存轮询间隔失败：' + error.message);
+    }
+  });
+
   async function boot() {
     try {
       const status = await api('/api/status');
       currentPool = new Set(
         status.pool && Array.isArray(status.pool.ids) ? status.pool.ids : [],
       );
+      logIntervalMs = status.logIntervalMs || 2000;
+      accountsIntervalMs = status.accountsIntervalMs || 15000;
+      el('log-interval-input').value = String(Math.round(logIntervalMs / 1000));
+      el('accounts-interval-input').value = String(Math.round(accountsIntervalMs / 1000));
     } catch (error) {}
     await loadAccounts();
     await loadStatus();
+    pollLog();
+    pollAccounts();
   }
   boot().catch(function (error) { setResult('test-result', false, '加载失败：' + error.message); });
-  setInterval(function () { loadStatus().catch(function () {}); }, 2000);
-  setInterval(function () { loadAccounts(true).catch(function () {}); }, 15000);
+  setInterval(tickCountdown, 1000);
 </script>
 </body>
 </html>

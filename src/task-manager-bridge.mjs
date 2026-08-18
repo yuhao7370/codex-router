@@ -18,6 +18,10 @@ const VERSION = 1;
 const DEFAULT_PORT = 6000;
 const REQUEST_TIMEOUT_MS = 3_000;
 const POLL_INTERVAL_MS = 15_000;
+const MIN_POLL_MS = 500;
+const MAX_POLL_MS = 60_000;
+const DEFAULT_LOG_POLL_MS = 2_000;
+const DEFAULT_ACCOUNTS_POLL_MS = 15_000;
 const FAILOVER_COOLDOWN_MS = 30_000;
 const FAILURE_MEMORY_MS = 5 * 60 * 1000;
 const FAILOVER_TRIGGER_STATUSES = new Set([401, 402, 403, 429]);
@@ -94,6 +98,12 @@ export function clearErrorLog() {
   }
 }
 
+function clampInterval(value, fallback) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return fallback;
+  return Math.min(MAX_POLL_MS, Math.max(MIN_POLL_MS, Math.round(number)));
+}
+
 function defaults() {
   return {
     version: VERSION,
@@ -101,6 +111,8 @@ function defaults() {
     failover: false,
     pool: [],
     blocked: {},
+    logIntervalMs: DEFAULT_LOG_POLL_MS,
+    accountsIntervalMs: DEFAULT_ACCOUNTS_POLL_MS,
     port: DEFAULT_PORT,
     token: "",
   };
@@ -120,6 +132,11 @@ export function readTaskManagerConfig() {
       state.blocked && typeof state.blocked === "object" && !Array.isArray(state.blocked)
         ? state.blocked
         : {};
+    state.logIntervalMs = clampInterval(state.logIntervalMs, DEFAULT_LOG_POLL_MS);
+    state.accountsIntervalMs = clampInterval(
+      state.accountsIntervalMs,
+      DEFAULT_ACCOUNTS_POLL_MS,
+    );
     state.port = Number.isInteger(state.port) ? state.port : DEFAULT_PORT;
     if (state.port < 1 || state.port > 65_535) state.port = DEFAULT_PORT;
     state.token = String(state.token || "").trim();
@@ -193,6 +210,21 @@ export function setTaskManagerPool(ids) {
     refreshPool().catch(() => {});
   }
   return state;
+}
+
+export function setTaskManagerIntervals(intervals = {}) {
+  const state = readTaskManagerConfig();
+  const next = {};
+  if (intervals.logIntervalMs !== undefined) {
+    next.logIntervalMs = clampInterval(intervals.logIntervalMs, state.logIntervalMs);
+  }
+  if (intervals.accountsIntervalMs !== undefined) {
+    next.accountsIntervalMs = clampInterval(
+      intervals.accountsIntervalMs,
+      state.accountsIntervalMs,
+    );
+  }
+  return writeTaskManagerConfig(next);
 }
 
 function defaultTokenPath() {

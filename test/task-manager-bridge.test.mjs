@@ -72,3 +72,16 @@ test("error log defaults empty and clears", () => {
   bridge.clearErrorLog();
   assert.deepEqual(bridge.errorLog(), []);
 });
+
+test("poll intervals default, persist, and clamp", () => {
+  assert.equal(bridge.readTaskManagerConfig().logIntervalMs, 2000);
+  assert.equal(bridge.readTaskManagerConfig().accountsIntervalMs, 15000);
+  bridge.setTaskManagerIntervals({ logIntervalMs: 3000, accountsIntervalMs: 10000 });
+  assert.equal(bridge.readTaskManagerConfig().logIntervalMs, 3000);
+  assert.equal(bridge.readTaskManagerConfig().accountsIntervalMs, 10000);
+  // Out-of-range values are clamped.
+  bridge.setTaskManagerIntervals({ logIntervalMs: 10, accountsIntervalMs: 999999 });
+  assert.equal(bridge.readTaskManagerConfig().logIntervalMs, 500);
+  assert.equal(bridge.readTaskManagerConfig().accountsIntervalMs, 60000);
+  bridge.setTaskManagerIntervals({ logIntervalMs: 2000, accountsIntervalMs: 15000 });
+});

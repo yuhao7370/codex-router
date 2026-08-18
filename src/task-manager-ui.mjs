@@ -18,6 +18,7 @@ import {
   selectTaskManagerAccount,
   setTaskManagerFailover,
   setTaskManagerEnabled,
+  setTaskManagerIntervals,
   setTaskManagerPort,
   setTaskManagerPool,
   setTaskManagerToken,
@@ -52,6 +53,8 @@ function statusPayload() {
     enabled: config.enabled,
     errors: errorLog(),
     failover: failoverStatus(),
+    logIntervalMs: config.logIntervalMs,
+    accountsIntervalMs: config.accountsIntervalMs,
     pool: poolStatus(),
     port: config.port,
     token: config.token ? "set" : "auto",
@@ -131,6 +134,11 @@ export function startTaskManagerUi() {
       }
       if (request.method === "POST" && url.pathname === "/api/errors/clear") {
         clearErrorLog();
+        return sendJson(response, 200, statusPayload());
+      }
+      if (request.method === "POST" && url.pathname === "/api/intervals") {
+        const body = await readJsonBody(request);
+        setTaskManagerIntervals(body);
         return sendJson(response, 200, statusPayload());
       }
       if (request.method === "POST" && url.pathname === "/api/test") {
