@@ -85,6 +85,7 @@ import {
   nextInjectionAccount,
   notifyAccountFailure,
   readTaskManagerConfig,
+  recordCapacityFailure,
   recordInjection,
   startTaskManagerPoller,
 } from "./task-manager-bridge.mjs";
@@ -467,6 +468,41 @@ function responseWithBody(upstream, body) {
     statusText: upstream.statusText,
     headers: upstream.headers,
   });
+}
+
+const MAX_CAPACITY_PEEK_BYTES = 4 * 1024;
+const CAPACITY_PEEK_TIMEOUT_MS = 1_500;
+
+// The ChatGPT backend can report "model at capacity" inside a 200 SSE stream
+// rather than as a 4xx status. Peek the first bytes of a 200 stream for that
+// error so the capacity retry can switch accounts before anything reaches the
+// client; when it is not capacity, relay the untouched branch unchanged.
+async function peekNativeCapacity(upstream) {
+  const contentType = String(upstream?.headers?.get("content-type") || "").trim();
+  if (!contentType.toLowerCase().includes("text/event-stream")) {
+    return { capacity: false, response: upstream };
+  }
+  if (!upstream?.body) return { capacity: false, response: upstream };
+
+  const [probe, relay] = upstream.body.tee();
+  const reader = probe.getReader();
+  let capacity = false;
+  try {
+    const result = await readHeaderlessSseChunk(
+      reader,
+      CAPACITY_PEEK_TIMEOUT_MS,
+    );
+    if (result !== HEADERLESS_SSE_TIMEOUT && !result.done && result.value?.byteLength) {
+      const first = Buffer.from(result.value).subarray(0, MAX_CAPACITY_PEEK_BYTES);
+      capacity = /capacity/i.test(first.toString("utf8"));
+    }
+  } catch (error) {
+    void reader.cancel().catch(() => {});
+    void relay.cancel().catch(() => {});
+    throw error;
+  }
+  void reader.cancel().catch(() => {});
+  return { capacity, response: responseWithBody(upstream, relay) };
 }
 
 // Rejected retries are still upstream requests and may be billed. Drain only
@@ -1864,9 +1900,18 @@ async function handleResponses(request, response, requestUrl) {
         );
         upstream = result.response;
         retries += result.retries;
-        const capacity = !upstream.ok && (await isAtCapacityResponse(upstream));
+        let capacity = !upstream.ok && (await isAtCapacityResponse(upstream));
+        let streamCapacity = false;
+        if (!capacity && upstream.ok) {
+          const peek = await peekNativeCapacity(upstream);
+          capacity = peek.capacity;
+          streamCapacity = peek.capacity;
+          upstream = peek.response;
+        }
+        if (capacity) {
+          recordCapacityFailure(streamCapacity ? null : upstream.status);
+        }
         if (!capacity || attempt === capacityAttempts - 1) break;
-        notifyAccountFailure(upstream.status, true, false);
         await upstream.body?.cancel().catch(() => {});
         // Let the model shed load before the next account tries again.
         await sleep(capacityBackoffMs, controller.signal);
@@ -1893,15 +1938,11 @@ async function handleResponses(request, response, requestUrl) {
     // the bridge mark it failed so the poller can switch to a healthy account
     // when failover is enabled; the current turn still relays the error.
     if (!route) {
-      const capacity =
-        !upstream.ok &&
-        upstream.status === 429 &&
-        (await isAtCapacityResponse(upstream));
       const quota =
         !upstream.ok &&
         upstream.status === 429 &&
         (await isQuotaExhaustedResponse(upstream));
-      notifyAccountFailure(upstream.status, capacity, quota);
+      notifyAccountFailure(upstream.status, false, quota);
     }
     // Gateway error bodies leak LiteLLM's internal exception chain, which
     // reads like a router bug. Rewrite them to name the provider that failed.
