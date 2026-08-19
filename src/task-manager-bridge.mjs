@@ -466,7 +466,7 @@ async function chooseFallbackAccount() {
   const candidates = accounts.filter((account) => {
     if (account.valid === false) return false;
     if (account.id === defaultId) return false;
-    if (recentlyFailed(account.id) || recentlyFailed(account.account_id)) {
+    if (recentlyFailed(account.id)) {
       return false;
     }
     return true;
@@ -512,8 +512,8 @@ export async function failoverIfNeeded(reason = "poll") {
   }
   if (!fallback) return false;
 
-  if (current?.accountId) {
-    accountFailureMemory.set(current.accountId, Date.now());
+  if (current?.id) {
+    accountFailureMemory.set(current.id, Date.now());
   }
   try {
     await selectTaskManagerAccount(fallback.id);
@@ -560,9 +560,9 @@ export function notifyAccountFailure(status, capacity = false, quota = false) {
   if (!FAILOVER_TRIGGER_STATUSES.has(status)) return;
   const state = readTaskManagerConfig();
   if (!state.enabled) return;
-  const accountId = lastInjectedId || (cached && cached.accountId);
+  const accountId = lastInjectedId || (cached && cached.id);
   const poolEntry = poolCredentials.find(
-    (account) => account.accountId === accountId,
+    (account) => account.id === accountId,
   );
   const email = poolEntry?.email || cached?.email || "";
   if (accountId) {
@@ -700,9 +700,9 @@ export function nextInjectionAccount() {
     for (let step = 0; step < poolCredentials.length; step += 1) {
       const account =
         poolCredentials[(poolCursor + step) % poolCredentials.length];
-      if (!recentlyFailed(account.accountId)) {
+      if (!recentlyFailed(account.id)) {
         poolCursor = (poolCursor + step + 1) % poolCredentials.length;
-        lastInjectedId = account.accountId;
+        lastInjectedId = account.id;
         return account;
       }
     }
@@ -712,10 +712,10 @@ export function nextInjectionAccount() {
   const account = cached;
   if (
     account?.accessToken &&
-    !recentlyFailed(account.accountId) &&
-    !blocked[account.accountId]
+    !recentlyFailed(account.id) &&
+    !blocked[account.id]
   ) {
-    lastInjectedId = account.accountId;
+    lastInjectedId = account.id;
     return account;
   }
 
