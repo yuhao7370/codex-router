@@ -185,6 +185,20 @@ test("a capacity error body is retryable while a quota 429 is not", async () => 
   assert.equal(await isAtCapacityResponse(new Response("ok", { status: 200 })), false);
 });
 
+test("the native server_is_overloaded body is classified as capacity", async () => {
+  const overloaded = new Response(
+    JSON.stringify({
+      error: {
+        type: "service_unavailable_error",
+        code: "server_is_overloaded",
+        message: "Our servers are currently overloaded. Please try again later.",
+      },
+    }),
+    { status: 503, headers: { "Content-Type": "application/json" } },
+  );
+  assert.equal(await isAtCapacityResponse(overloaded), true);
+});
+
 test("a quota-exhausted body is classified separately from capacity", async () => {
   const quota = new Response(
     JSON.stringify({

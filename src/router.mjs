@@ -46,6 +46,7 @@ import {
   tokenUsageFromPayload,
 } from "./response-usage.mjs";
 import {
+  CAPACITY_RESPONSE_RE,
   fetchWithRetry,
   isAtCapacityResponse,
   isQuotaExhaustedResponse,
@@ -515,7 +516,7 @@ async function peekNativeCapacity(upstream) {
           Buffer.from(result.value).subarray(0, remaining),
         ]);
         const text = prefix.toString("utf8");
-        if (/capacity/i.test(text)) {
+        if (CAPACITY_RESPONSE_RE.test(text)) {
           capacity = true;
           break;
         }

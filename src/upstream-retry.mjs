@@ -111,12 +111,21 @@ export function isRetryableResponse(response) {
 // OpenAI's "Selected model is at capacity" error arrives as a 429/5xx whose
 // body names capacity rather than the caller's own quota. It is transient and
 // safe to retry, unlike a quota 429 which retrying only makes worse.
+//
+// The native ChatGPT backend also reports the same overload as
+// `server_is_overloaded` / `service_unavailable_error` with the message
+// "Our servers are currently overloaded", both as a non-2xx JSON body and
+// inside a 200 headerless SSE stream. Keep every spelling in one place so the
+// status-gated check and the stream peek agree on what counts as capacity.
+export const CAPACITY_RESPONSE_RE =
+  /capacity|server_is_overloaded|service_unavailable_error|overloaded/i;
+
 export async function isAtCapacityResponse(response) {
   if (!response) return false;
   if (Number(response?.status) < 400) return false;
   try {
     const text = await response.clone().text();
-    return /capacity/i.test(text);
+    return CAPACITY_RESPONSE_RE.test(text);
   } catch {
     return false;
   }
