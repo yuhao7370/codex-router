@@ -1925,12 +1925,16 @@ async function handleResponses(request, response, requestUrl) {
         controller.signal.throwIfAborted();
       }
     } else {
-      // A native turn that hits "model at capacity" retries on the next pooled
-      // account instead of relaying the error, so one saturated account never
-      // blocks the whole request.
+      // A native turn that hits "model at capacity" retries on the next
+      // pooled account instead of relaying the error, so one saturated account
+      // never blocks the whole request. A single selected account has no pool
+      // to rotate through, so replaying it would only repeat the same
+      // overloaded seat; relay the capacity error on the first attempt.
+      const poolActive = Array.isArray(taskConfig.pool) && taskConfig.pool.length > 0;
+      const nativeCapacityAttempts = poolActive ? capacityAttempts : 1;
       let result;
       let capacityBackoffMs = 500;
-      for (let attempt = 0; attempt < capacityAttempts; attempt += 1) {
+      for (let attempt = 0; attempt < nativeCapacityAttempts; attempt += 1) {
         result = await fetchWithRetry(
           target,
           {
@@ -1958,7 +1962,7 @@ async function handleResponses(request, response, requestUrl) {
         if (capacity) {
           recordCapacityFailure(streamCapacity ? null : upstream.status);
         }
-        if (!capacity || attempt === capacityAttempts - 1) break;
+        if (!capacity || attempt === nativeCapacityAttempts - 1) break;
         await upstream.body?.cancel().catch(() => {});
         // Let the model shed load before the next account tries again.
         await sleep(capacityBackoffMs, controller.signal);

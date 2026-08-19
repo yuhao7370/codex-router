@@ -1,6 +1,13 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
@@ -137,13 +144,14 @@ function largeNativeTurn() {
   };
 }
 
-function startRouter({ nativePort, routerPort, stateDir, backoffMs = 20, retries }) {
+function startRouter({ nativePort, routerPort, stateDir, controlPort, backoffMs = 20, retries }) {
   return run({
     CODEX_ROUTER_PORT: String(routerPort),
     CODEX_NATIVE_BASE_URL: `http://127.0.0.1:${nativePort}/backend-api/codex`,
     CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${nativePort}/v1`,
     MODEL_ROUTER_STATE_DIR: stateDir,
     CODEX_ROUTER_NATIVE_RETRY_BACKOFF_MS: String(backoffMs),
+    ...(controlPort === undefined ? {} : { CODEX_ROUTER_CONTROL_PORT: String(controlPort) }),
     ...(retries === undefined ? {} : { CODEX_ROUTER_NATIVE_RETRIES: String(retries) }),
   });
 }
@@ -392,25 +400,129 @@ test("a native 503 that outlives the retry bound is relayed unchanged", async ()
   }
 });
 
-test("a capacity 200 SSE retries without dropping Content-Encoding on the zstd body", async () => {
+function writePoolConfig(stateDir, ctmPort) {
+  mkdirSync(stateDir, { recursive: true });
+  writeFileSync(
+    path.join(stateDir, "task-manager.json"),
+    JSON.stringify({
+      enabled: true,
+      port: ctmPort,
+      token: "test-token",
+      pool: ["seat-a", "seat-b"],
+      capacityRetry: true,
+      capacityRetryAttempts: 3,
+    }),
+    "utf8",
+  );
+}
+
+async function mockCtm(accounts) {
+  let credentialsRequests = 0;
+  const server = http.createServer((request, response) => {
+    const send = (status, body) => {
+      const payload = Buffer.from(JSON.stringify(body), "utf8");
+      response.writeHead(status, {
+        "Content-Type": "application/json",
+        "Content-Length": String(payload.length),
+      });
+      response.end(payload);
+    };
+    const chunks = [];
+    request.on("data", (chunk) => chunks.push(chunk));
+    request.on("end", () => {
+      if (request.url === "/api/auth/credentials") {
+        credentialsRequests += 1;
+        return send(200, { accounts });
+      }
+      if (request.url === "/api/auth/current") {
+        const active = accounts[0];
+        return send(200, {
+          id: active.id,
+          account_id: active.account_id,
+          access_token: active.access_token,
+          email: active.email,
+          usage: active.usage,
+        });
+      }
+      return send(404, { error: "not found" });
+    });
+  });
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  return { server, port: server.address().port, credentialsRequests: () => credentialsRequests };
+}
+
+const CAPACITY_SSE = [
+  "event: response.created",
+  'data: {"type":"response.created"}',
+  "",
+  "event: error",
+  'data: {"type":"error","error":{"type":"service_unavailable_error","code":"server_is_overloaded","message":"Our servers are currently overloaded. Please try again later."}}',
+  "",
+  "event: response.failed",
+  'data: {"type":"response.failed","response":{"status":"failed","error":{"code":"server_is_overloaded"}}}',
+  "",
+  "",
+].join("\n");
+
+test("a single selected account relays a capacity 200 SSE without retrying", async () => {
   const attempts = [];
   const native = await mockServer(async (request, response) => {
     attempts.push(await readBody(request));
+    response.writeHead(200, { "Cache-Control": "no-cache" });
+    response.end(CAPACITY_SSE);
+  });
+  const stateDir = stateDirectory();
+  const routerPort = await openPort();
+  const controlPort = await openPort();
+  const router = startRouter({ nativePort: native.port, routerPort, controlPort, stateDir });
+
+  try {
+    await waitFor(`${routerBase(routerPort)}/models`, router);
+    const result = await fetch(`${routerBase(routerPort)}/responses`, {
+      method: "POST",
+      headers: { Authorization: "Bearer caller", "Content-Type": "application/json" },
+      body: JSON.stringify(largeNativeTurn()),
+    });
+
+    assert.equal(result.status, 200);
+    const relayed = await result.text();
+    assert.match(relayed, /server_is_overloaded/);
+    assert.equal(attempts.length, 1, "a single account must not be replayed on capacity");
+  } finally {
+    await stopChild(router);
+    await closeServer(native.server);
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("a pool rotates accounts on capacity without dropping Content-Encoding", async () => {
+  const accounts = [
+    {
+      id: "seat-a",
+      account_id: "acct-a",
+      access_token: "tok-a",
+      email: "a@example.com",
+      usage: { weekly_used_percent: 0, plan: "plus" },
+    },
+    {
+      id: "seat-b",
+      account_id: "acct-b",
+      access_token: "tok-b",
+      email: "b@example.com",
+      usage: { weekly_used_percent: 0, plan: "plus" },
+    },
+  ];
+  const ctm = await mockCtm(accounts);
+  const attempts = [];
+  const native = await mockServer(async (request, response) => {
+    const body = await readBody(request);
+    attempts.push({ authorization: request.headers.authorization, encoding: body.encoding });
     if (attempts.length === 1) {
-      const sse = [
-        "event: response.created",
-        'data: {"type":"response.created"}',
-        "",
-        "event: error",
-        'data: {"type":"error","error":{"type":"service_unavailable_error","code":"server_is_overloaded","message":"Our servers are currently overloaded. Please try again later."}}',
-        "",
-        "event: response.failed",
-        'data: {"type":"response.failed","response":{"status":"failed","error":{"code":"server_is_overloaded"}}}',
-        "",
-        "",
-      ].join("\n");
       response.writeHead(200, { "Cache-Control": "no-cache" });
-      response.end(sse);
+      response.end(CAPACITY_SSE);
       return;
     }
     const payload = Buffer.from(
@@ -424,11 +536,19 @@ test("a capacity 200 SSE retries without dropping Content-Encoding on the zstd b
     response.end(payload);
   });
   const stateDir = stateDirectory();
+  writePoolConfig(stateDir, ctm.port);
   const routerPort = await openPort();
-  const router = startRouter({ nativePort: native.port, routerPort, stateDir });
+  const controlPort = await openPort();
+  const router = startRouter({ nativePort: native.port, routerPort, controlPort, stateDir });
 
   try {
     await waitFor(`${routerBase(routerPort)}/models`, router);
+    await waitUntil(async () => {
+      const response = await fetch(`http://127.0.0.1:${controlPort}/api/status`);
+      if (!response.ok) return false;
+      const status = await response.json();
+      return (status.pool?.accounts?.length ?? 0) >= 2;
+    }, "the pool accounts were never populated");
     const result = await fetch(`${routerBase(routerPort)}/responses`, {
       method: "POST",
       headers: { Authorization: "Bearer caller", "Content-Type": "application/json" },
@@ -439,6 +559,7 @@ test("a capacity 200 SSE retries without dropping Content-Encoding on the zstd b
     assert.equal(result.status, 200, relayed);
     assert.equal(JSON.parse(relayed).id, "resp-after-capacity");
     assert.equal(attempts.length, 2, "the capacity stream was relayed instead of retried");
+    assert.notEqual(attempts[0].authorization, attempts[1].authorization);
     assert.equal(attempts[0].encoding, "zstd");
     assert.equal(
       attempts[1].encoding,
@@ -448,6 +569,7 @@ test("a capacity 200 SSE retries without dropping Content-Encoding on the zstd b
   } finally {
     await stopChild(router);
     await closeServer(native.server);
+    await closeServer(ctm.server);
     rmSync(stateDir, { recursive: true, force: true });
   }
 });
