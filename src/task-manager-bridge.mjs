@@ -519,8 +519,8 @@ export async function failoverIfNeeded(reason = "poll") {
   lastFailoverAt = Date.now();
   lastFailover = {
     at: new Date().toISOString(),
-    from: current?.accountId || null,
-    to: fallback.account_id || fallback.id,
+    from: current?.email || current?.accountId || null,
+    to: fallback.email || fallback.id || fallback.account_id,
     reason,
   };
   return true;

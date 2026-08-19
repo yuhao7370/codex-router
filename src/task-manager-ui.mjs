@@ -79,6 +79,7 @@ function statusPayload() {
     account: account
       ? {
           accountId: account.accountId,
+          email: account.email || "",
           hasToken: Boolean(account.accessToken),
           plan: account.plan || "",
           remainingPercent: account.remainingPercent ?? null,

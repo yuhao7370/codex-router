@@ -484,7 +484,10 @@
     headerStatus.className = 'pill ' + (status.enabled ? 'on' : 'off');
     el('port').textContent = String(status.port);
     el('token').textContent = status.token === 'set' ? '已设置' : '自动读取';
-    el('active-account').textContent = status.account && status.account.accountId ? status.account.accountId : '（未获取 / 回退原生）';
+    const active = status.account;
+    el('active-account').textContent = active && (active.email || active.accountId)
+      ? (active.email || active.accountId)
+      : '（未获取 / 回退原生）';
     const account = status.account;
     el('account-quota').textContent = account && account.remainingPercent != null
       ? (account.plan ? account.plan.toUpperCase() + ' · ' : '') + account.remainingPercent + '% 剩余'
