@@ -1756,6 +1756,10 @@ async function handleResponses(request, response, requestUrl) {
       if (Array.isArray(payload.input)) {
         native.input = normalizeNativeInput(payload.input);
       }
+      // The Codex client can send a prompt-cache retention hint, but the
+      // native upstream rejects it for models without cache retention support.
+      // It is only a caching hint, so dropping it never changes the response.
+      delete native.prompt_cache_retention;
       if (!compactV1) delete native.previous_response_id;
       target = nativeTarget(requestUrl.pathname);
       // Compress the body once: the bytes are account-independent, so a
