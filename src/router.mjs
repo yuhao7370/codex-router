@@ -378,7 +378,14 @@ function nativeHeaders(request) {
       headers["chatgpt-account-id"] = account.accountId;
     }
     nativeSeats.set(headers, account.id || account.accountId || undefined);
-    recordInjection(nativeSeats.get(headers), request.url);
+    const seatId = nativeSeats.get(headers);
+    const config = readTaskManagerConfig();
+    const fast = Boolean(
+      seatId &&
+        Array.isArray(config.fastAccounts) &&
+        config.fastAccounts.includes(seatId),
+    );
+    recordInjection(seatId, request.url, fast);
   }
   return headers;
 }

@@ -540,7 +540,10 @@
           const info = accountIndex.get(e.accountId);
           const email = (info && info.email) ? info.email : shortId(e.accountId);
           const plan = (info && info.plan) ? ' · ' + info.plan : '';
-          return formatTime(e.at) + '  ' + email + plan;
+          const speed = e.fast
+            ? (e.accountId === 'native' ? ' · 原生fast' : ' · fast')
+            : ' · 标准';
+          return formatTime(e.at) + '  ' + email + plan + speed;
         }).join(String.fromCharCode(10))
       : '暂无注入记录';
     const errors = Array.isArray(status.errors) ? status.errors : [];

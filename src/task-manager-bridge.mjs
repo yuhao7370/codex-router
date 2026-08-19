@@ -347,12 +347,13 @@ function requestJson(port, token, pathname, method = "GET", body) {
   });
 }
 
-export function recordInjection(accountId, pathname) {
+export function recordInjection(accountId, pathname, fast = false) {
   injectionCount += 1;
   injectionEvents.unshift({
     at: new Date().toISOString(),
     accountId,
     path: pathname || "",
+    ...(fast ? { fast: true } : {}),
   });
   if (injectionEvents.length > MAX_INJECTION_EVENTS) {
     injectionEvents.length = MAX_INJECTION_EVENTS;
