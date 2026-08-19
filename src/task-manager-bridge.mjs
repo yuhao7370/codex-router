@@ -647,8 +647,13 @@ export function notifyAccountFailure(status, capacity = false, quota = false) {
 
 // The native upstream can report "model at capacity" inside a 200 SSE stream
 // rather than as a 4xx status, so the status-gated path above never sees it.
-// Record it with the same per-account attribution and failure memory so the
-// panel shows which seat hit capacity and failover can move on.
+// Record it with per-account attribution so the panel shows which seat hit
+// capacity. Capacity is a transient, model-wide overload rather than an
+// account fault, so it must not mark the account failed in the 5-minute
+// failure memory or trigger a CTM active-account switch: the per-turn retry
+// loop already round-robins through the pool with `nextInjectionAccount`, and
+// pinning every seat as failed would stop injection entirely until the memory
+// expires.
 export function recordCapacityFailure(status = null) {
   const state = readTaskManagerConfig();
   if (!state.enabled) return;
@@ -657,9 +662,6 @@ export function recordCapacityFailure(status = null) {
     (account) => account.id === accountId,
   );
   const email = poolEntry?.email || cached?.email || "";
-  if (accountId) {
-    accountFailureMemory.set(accountId, Date.now());
-  }
   recordErrorLog({
     type: "capacity",
     status,
@@ -667,9 +669,6 @@ export function recordCapacityFailure(status = null) {
     email,
     message: "模型容量上限",
   });
-  if (!state.failover) return;
-  failoverPending = true;
-  scheduleImmediateFailover();
 }
 
 // Routed traffic has no CTM account, but its gateway can still return "model
