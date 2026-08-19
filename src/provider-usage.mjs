@@ -331,6 +331,97 @@ export function attachAccountCosts(accounts, index = loadPricingIndex()) {
   });
 }
 
+// Deleted CTM accounts leave the account list, but their token usage is still
+// real spend. Fold every account that is no longer present in the CTM account
+// list into one synthetic "已删除" bucket so the total stays whole instead of
+// silently dropping those rows.
+export function mergeDeletedAccounts(accounts, validIds) {
+  const kept = [];
+  const deleted = [];
+  for (const account of accounts) {
+    if (validIds.has(account.accountId)) kept.push(account);
+    else deleted.push(account);
+  }
+  if (deleted.length === 0) return kept;
+  kept.push(foldDeletedAccounts(deleted));
+  return kept;
+}
+
+function foldDeletedAccounts(accounts) {
+  const models = new Map();
+  let requests = 0;
+  let successfulRequests = 0;
+  let meteredRequests = 0;
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let cachedInputTokens = 0;
+  let totalTokens = 0;
+  let totalCost = 0;
+
+  for (const account of accounts) {
+    requests += account.requests || 0;
+    successfulRequests += account.successfulRequests || 0;
+    meteredRequests += account.meteredRequests || 0;
+    inputTokens += account.inputTokens || 0;
+    outputTokens += account.outputTokens || 0;
+    cachedInputTokens += account.cachedInputTokens || 0;
+    totalTokens += account.totalTokens || 0;
+    totalCost += account.totalCost || 0;
+    for (const model of Array.isArray(account.models) ? account.models : []) {
+      const existing = models.get(model.slug);
+      if (!existing) {
+        models.set(model.slug, {
+          ...model,
+          inputCost: model.inputCost || 0,
+          outputCost: model.outputCost || 0,
+          cacheReadCost: model.cacheReadCost || 0,
+          totalCost: model.totalCost || 0,
+          priced: Boolean(model.priced),
+        });
+        continue;
+      }
+      existing.requests += model.requests || 0;
+      existing.successfulRequests += model.successfulRequests || 0;
+      existing.meteredRequests += model.meteredRequests || 0;
+      existing.inputTokens += model.inputTokens || 0;
+      existing.outputTokens += model.outputTokens || 0;
+      existing.cachedInputTokens += model.cachedInputTokens || 0;
+      existing.totalTokens += model.totalTokens || 0;
+      existing.inputCost += model.inputCost || 0;
+      existing.outputCost += model.outputCost || 0;
+      existing.cacheReadCost += model.cacheReadCost || 0;
+      existing.totalCost += model.totalCost || 0;
+      existing.priced = existing.priced || Boolean(model.priced);
+      if (
+        model.lastUsedAt &&
+        (!existing.lastUsedAt || model.lastUsedAt > existing.lastUsedAt)
+      ) {
+        existing.lastUsedAt = model.lastUsedAt;
+      }
+    }
+  }
+
+  const mergedModels = [...models.values()].sort(
+    (left, right) => right.totalTokens - left.totalTokens || right.requests - left.requests,
+  );
+
+  return {
+    accountId: "__deleted__",
+    email: "已删除",
+    plan: "",
+    requests,
+    successfulRequests,
+    meteredRequests,
+    inputTokens,
+    outputTokens,
+    cachedInputTokens,
+    totalTokens,
+    totalCost: Math.round(totalCost * 1e6) / 1e6,
+    pricedModels: mergedModels.filter((model) => model.priced).length,
+    models: mergedModels,
+  };
+}
+
 // The panel path reads only local usage events and pricing; unlike
 // `providerUsageSnapshot` it never calls provider account APIs, so a dashboard
 // refresh stays fast and failure-tolerant.

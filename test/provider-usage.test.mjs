@@ -6,6 +6,7 @@ import {
   aggregateProviderUsage,
   attachAccountCosts,
   attachUsageCosts,
+  mergeDeletedAccounts,
 } from "../src/provider-usage.mjs";
 
 test("protocol variants never appear as separate usage providers", () => {
@@ -289,4 +290,90 @@ test("attaches account cost from a pricing index", () => {
   // billable input 800 * 5/M = 0.004; output 500 * 30/M = 0.015; cache 200 * 0.5/M = 0.0001.
   assert.equal(enriched[0].totalCost, 0.0191);
   assert.equal(enriched[0].models[0].priced, true);
+});
+
+test("deleted accounts fold into one kept 已删除 bucket", () => {
+  const accounts = [
+    {
+      accountId: "acct-a",
+      requests: 2,
+      successfulRequests: 2,
+      meteredRequests: 2,
+      inputTokens: 100,
+      outputTokens: 40,
+      cachedInputTokens: 10,
+      totalTokens: 150,
+      totalCost: 0.1,
+      pricedModels: 1,
+      models: [
+        {
+          slug: "gpt-5.6-sol",
+          displayName: "gpt-5.6-sol",
+          requests: 2,
+          successfulRequests: 2,
+          meteredRequests: 2,
+          inputTokens: 100,
+          outputTokens: 40,
+          cachedInputTokens: 10,
+          totalTokens: 150,
+          lastUsedAt: "2026-07-20T12:00:00.000Z",
+          inputCost: 0.05,
+          outputCost: 0.05,
+          cacheReadCost: 0,
+          totalCost: 0.1,
+          priced: true,
+        },
+      ],
+    },
+    {
+      accountId: "acct-b",
+      requests: 1,
+      successfulRequests: 1,
+      meteredRequests: 1,
+      inputTokens: 50,
+      outputTokens: 20,
+      cachedInputTokens: 0,
+      totalTokens: 70,
+      totalCost: 0.03,
+      pricedModels: 1,
+      models: [
+        {
+          slug: "gpt-5.6-sol",
+          displayName: "gpt-5.6-sol",
+          requests: 1,
+          successfulRequests: 1,
+          meteredRequests: 1,
+          inputTokens: 50,
+          outputTokens: 20,
+          cachedInputTokens: 0,
+          totalTokens: 70,
+          lastUsedAt: "2026-07-21T12:00:00.000Z",
+          inputCost: 0.02,
+          outputCost: 0.01,
+          cacheReadCost: 0,
+          totalCost: 0.03,
+          priced: true,
+        },
+      ],
+    },
+  ];
+
+  const merged = mergeDeletedAccounts(accounts, new Set(["acct-a"]));
+
+  assert.equal(merged.length, 2);
+  assert.equal(merged[0].accountId, "acct-a");
+  assert.equal(merged[1].accountId, "__deleted__");
+  assert.equal(merged[1].email, "已删除");
+  assert.equal(merged[1].totalTokens, 70);
+  assert.equal(merged[1].requests, 1);
+  assert.equal(merged[1].totalCost, 0.03);
+  assert.equal(merged[1].models.length, 1);
+  assert.equal(merged[1].models[0].slug, "gpt-5.6-sol");
+  assert.equal(merged[1].models[0].totalTokens, 70);
+});
+
+test("mergeDeletedAccounts keeps everything when every account is still valid", () => {
+  const accounts = [{ accountId: "acct-a", totalTokens: 10, models: [] }];
+  const merged = mergeDeletedAccounts(accounts, new Set(["acct-a"]));
+  assert.deepEqual(merged, accounts);
 });

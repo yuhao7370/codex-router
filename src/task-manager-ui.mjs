@@ -27,7 +27,7 @@ import {
   setUsagePanelVisible,
   testTaskManagerConnection,
 } from "./task-manager-bridge.mjs";
-import { panelUsageSnapshot } from "./provider-usage.mjs";
+import { mergeDeletedAccounts, panelUsageSnapshot } from "./provider-usage.mjs";
 import { pricingSyncState, syncModelsDevPricing } from "./model-pricing.mjs";
 
 const HOST = "127.0.0.1";
@@ -173,16 +173,19 @@ export function startTaskManagerUi() {
           // CTM may be stopped or unauthenticated; the account list stays
           // usable keyed by its raw id without names.
         }
-        const accounts = (snapshot.accounts || [])
-          .filter((account) => !ctmReachable || validIds.has(account.accountId))
-          .map((account) => {
-            const meta = accountMeta.get(account.accountId);
-            return {
-              ...account,
-              email: meta?.email || "",
-              plan: meta?.plan || "",
-            };
-          });
+        const snapshotAccounts = Array.isArray(snapshot.accounts)
+          ? snapshot.accounts
+          : [];
+        const accounts = !ctmReachable
+          ? snapshotAccounts.map((account) => ({ ...account, email: "", plan: "" }))
+          : mergeDeletedAccounts(snapshotAccounts, validIds).map((account) => {
+              const meta = accountMeta.get(account.accountId);
+              return {
+                ...account,
+                email: meta?.email || account.email || "",
+                plan: meta?.plan || "",
+              };
+            });
         return sendJson(response, 200, { ...snapshot, accounts });
       }
       if (request.method === "POST" && url.pathname === "/api/usage/sync") {
