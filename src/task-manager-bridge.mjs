@@ -524,7 +524,7 @@ export async function failoverIfNeeded(reason = "poll") {
   lastFailoverAt = Date.now();
   lastFailover = {
     at: new Date().toISOString(),
-    from: current?.email || current?.accountId || null,
+    from: current?.email || current?.id || null,
     to: fallback.email || fallback.id || fallback.account_id,
     reason,
   };
@@ -680,7 +680,7 @@ export async function refreshPool() {
       status: 429,
       reason: "quota",
       email: account?.email || "",
-      accountId: account?.accountId || "",
+      accountId: id,
     });
   }
   return poolCredentials;
@@ -730,7 +730,7 @@ export function poolStatus() {
   return {
     ids: Array.isArray(state.pool) ? state.pool : [],
     accounts: poolCredentials.map((account) => ({
-      accountId: account.accountId,
+      accountId: account.id,
       email: account.email,
       plan: account.plan,
       remainingPercent: account.remainingPercent,
