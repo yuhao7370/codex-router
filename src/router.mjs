@@ -471,8 +471,8 @@ function responseWithBody(upstream, body) {
   });
 }
 
-const MAX_CAPACITY_PEEK_BYTES = 4 * 1024;
-const CAPACITY_PEEK_TIMEOUT_MS = 1_500;
+const MAX_CAPACITY_PEEK_BYTES = 256 * 1024;
+const CAPACITY_PEEK_TIMEOUT_MS = 3_000;
 
 // The ChatGPT backend can report "model at capacity" inside a 200 SSE stream
 // rather than as a 4xx status. Peek the first bytes of a 200 stream for that
@@ -480,7 +480,10 @@ const CAPACITY_PEEK_TIMEOUT_MS = 1_500;
 // client; when it is not capacity, relay the untouched branch unchanged.
 async function peekNativeCapacity(upstream) {
   const contentType = String(upstream?.headers?.get("content-type") || "").trim();
-  if (!contentType.toLowerCase().includes("text/event-stream")) {
+  // A missing content-type is a headerless SSE stream, which is exactly what
+  // the native upstream returns. Only skip peeking when the content-type
+  // explicitly says it is not a stream (e.g. a JSON error body).
+  if (contentType && !contentType.toLowerCase().includes("text/event-stream")) {
     return { capacity: false, response: upstream };
   }
   if (!upstream?.body) return { capacity: false, response: upstream };
