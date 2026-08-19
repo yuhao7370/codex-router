@@ -671,6 +671,21 @@ export function recordCapacityFailure(status = null) {
   scheduleImmediateFailover();
 }
 
+// Routed traffic has no CTM account, but its gateway can still return "model
+// at capacity". Record it with the model name so the panel shows which model
+// hit capacity even when no account was injected.
+export function recordRoutedCapacityFailure(model, status = null) {
+  const state = readTaskManagerConfig();
+  if (!state.enabled) return;
+  recordErrorLog({
+    type: "capacity",
+    status,
+    accountId: "",
+    email: model || "",
+    message: "模型容量上限",
+  });
+}
+
 function scheduleImmediateFailover() {
   if (failoverScheduled) return;
   failoverScheduled = true;

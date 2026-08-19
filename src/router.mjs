@@ -87,6 +87,7 @@ import {
   readTaskManagerConfig,
   recordCapacityFailure,
   recordInjection,
+  recordRoutedCapacityFailure,
   startTaskManagerPoller,
 } from "./task-manager-bridge.mjs";
 import { startTaskManagerUi } from "./task-manager-ui.mjs";
@@ -486,15 +487,38 @@ async function peekNativeCapacity(upstream) {
 
   const [probe, relay] = upstream.body.tee();
   const reader = probe.getReader();
+  let prefix = Buffer.alloc(0);
   let capacity = false;
+  const deadline = Date.now() + CAPACITY_PEEK_TIMEOUT_MS;
   try {
-    const result = await readHeaderlessSseChunk(
-      reader,
-      CAPACITY_PEEK_TIMEOUT_MS,
-    );
-    if (result !== HEADERLESS_SSE_TIMEOUT && !result.done && result.value?.byteLength) {
-      const first = Buffer.from(result.value).subarray(0, MAX_CAPACITY_PEEK_BYTES);
-      capacity = /capacity/i.test(first.toString("utf8"));
+    while (prefix.length < MAX_CAPACITY_PEEK_BYTES) {
+      const result = await readHeaderlessSseChunk(
+        reader,
+        Math.max(0, deadline - Date.now()),
+      );
+      if (result === HEADERLESS_SSE_TIMEOUT) break;
+      if (result.done) break;
+      if (result.value?.byteLength) {
+        const remaining = MAX_CAPACITY_PEEK_BYTES - prefix.length;
+        prefix = Buffer.concat([
+          prefix,
+          Buffer.from(result.value).subarray(0, remaining),
+        ]);
+        const text = prefix.toString("utf8");
+        if (/capacity/i.test(text)) {
+          capacity = true;
+          break;
+        }
+        // A normal output event proves the model is responding, so stop
+        // peeking instead of waiting for a slow model to fill the window.
+        if (
+          /output_text\.delta|output_item\.added|reasoning_summary_text\.delta|response\.completed/i.test(
+            text,
+          )
+        ) {
+          break;
+        }
+      }
     }
   } catch (error) {
     void reader.cancel().catch(() => {});
@@ -1721,6 +1745,10 @@ async function handleResponses(request, response, requestUrl) {
     let nativeInjectAccount = null;
     let namespacesFlattened = false;
     let flattenedNamespaces = new Map();
+    const taskConfig = readTaskManagerConfig();
+    capacityAttempts = taskConfig.capacityRetry === false
+      ? 1
+      : Math.max(1, Number(taskConfig.capacityRetryAttempts) || 5);
     if (route) {
       const input = await bridgeVisionInput(
         await normalizeRoutedAgentInput(request, payload.input, controller.signal),
@@ -1804,13 +1832,9 @@ async function handleResponses(request, response, requestUrl) {
       if (!compactV1) delete native.previous_response_id;
       target = nativeTarget(requestUrl.pathname);
 
-      const taskConfig = readTaskManagerConfig();
       const fastAccounts = new Set(
         Array.isArray(taskConfig.fastAccounts) ? taskConfig.fastAccounts : [],
       );
-      capacityAttempts = taskConfig.capacityRetry === false
-        ? 1
-        : Math.max(1, Number(taskConfig.capacityRetryAttempts) || 5);
 
       // Fast mode only changes one body field, so cache at most two compressed
       // variants and pick the right one per injected account. This keeps the
@@ -1857,26 +1881,38 @@ async function handleResponses(request, response, requestUrl) {
     let upstream;
     let retries = 0;
     if (route) {
-      const result = await fetchWithRetry(
-        target,
-        {
-          method: "POST",
-          headers,
-          body: routedBody,
-          signal: controller.signal,
-        },
-        {
-          // Routed traffic terminates at the local gateway, which has its own
-          // error translation and Retry-After handling below; leave it exactly
-          // as it was.
-          retries: 0,
-          fetchImpl: fetch,
-          canRetry: () => nothingRelayed(response),
-          onRetry: (event) => logUpstreamRetry(event, requestedModel, requestUrl.pathname),
-        },
-      );
-      upstream = result.response;
-      retries += result.retries;
+      // Routed traffic can hit "model at capacity" from OpenAI-compatible
+      // gateways too. Retry the same provider with backoff before relaying.
+      let result;
+      let routedBackoffMs = 500;
+      for (let attempt = 0; attempt < capacityAttempts; attempt += 1) {
+        result = await fetchWithRetry(
+          target,
+          {
+            method: "POST",
+            headers,
+            body: routedBody,
+            signal: controller.signal,
+          },
+          {
+            retries: 0,
+            fetchImpl: fetch,
+            canRetry: () => nothingRelayed(response),
+            onRetry: (event) => logUpstreamRetry(event, requestedModel, requestUrl.pathname),
+          },
+        );
+        upstream = result.response;
+        retries += result.retries;
+        const capacity = !upstream.ok && (await isAtCapacityResponse(upstream));
+        if (capacity) {
+          recordRoutedCapacityFailure(requestedModel, upstream.status);
+        }
+        if (!capacity || attempt === capacityAttempts - 1) break;
+        await upstream.body?.cancel().catch(() => {});
+        await sleep(routedBackoffMs, controller.signal);
+        routedBackoffMs = Math.min(routedBackoffMs * 2, 8_000);
+        controller.signal.throwIfAborted();
+      }
     } else {
       // A native turn that hits "model at capacity" retries on the next pooled
       // account instead of relaying the error, so one saturated account never
