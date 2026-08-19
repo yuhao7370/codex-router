@@ -418,6 +418,11 @@ export async function refreshActiveAccount() {
           ? usage.weekly_used_percent
           : null;
       cached = {
+        id: typeof body.id === "string" && body.id
+          ? body.id
+          : typeof body.account_id === "string"
+            ? body.account_id
+            : "",
         accountId: typeof body.account_id === "string" ? body.account_id : "",
         email: typeof body.email === "string" ? body.email : "",
         accessToken: body.access_token,

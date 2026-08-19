@@ -350,6 +350,13 @@ async function compressedNativeBody(body, headers) {
   }
 }
 
+// The native path stamps the injected CTM account's real account id as
+// `chatgpt-account-id` for the upstream, and carries the per-seat selection id
+// on a Symbol so local usage is attributed to the seat, not the shared team
+// account. Symbol keys are not forwarded by `fetch`, so only `chatgpt-account-id`
+// reaches ChatGPT.
+const NATIVE_SEAT = Symbol("native-seat-id");
+
 function nativeHeaders(request) {
   const headers = {
     "Content-Type": "application/json",
@@ -367,16 +374,17 @@ function nativeHeaders(request) {
     if (account.accountId) {
       headers["chatgpt-account-id"] = account.accountId;
     }
-    recordInjection(account.accountId, request.url);
+    headers[NATIVE_SEAT] = account.id || account.accountId || undefined;
+    recordInjection(headers[NATIVE_SEAT], request.url);
   }
   return headers;
 }
 
 // The native path stamps the injected CTM account on the upstream request as
-// `chatgpt-account-id`; read it back so usage can be attributed per account
-// rather than collapsing every subscription into one "native" bucket.
+// `chatgpt-account-id`; read the per-seat id back so usage is attributed per
+// account rather than collapsing every team seat into one bucket.
 function injectedAccountId(headers) {
-  const value = headers["chatgpt-account-id"];
+  const value = headers[NATIVE_SEAT] || headers["chatgpt-account-id"];
   return typeof value === "string" && value ? value : undefined;
 }
 

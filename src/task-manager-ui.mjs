@@ -158,11 +158,10 @@ export function startTaskManagerUi() {
                   ? account.usage.plan
                   : "",
             };
-            for (const key of [account.account_id, account.id]) {
-              if (!key) continue;
-              const id = String(key);
-              accountMeta.set(id, meta);
-              validIds.add(id);
+            const id = account.id || account.account_id;
+            if (id) {
+              accountMeta.set(String(id), meta);
+              validIds.add(String(id));
             }
           }
         } catch {
