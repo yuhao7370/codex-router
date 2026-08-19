@@ -392,6 +392,66 @@ test("a native 503 that outlives the retry bound is relayed unchanged", async ()
   }
 });
 
+test("a capacity 200 SSE retries without dropping Content-Encoding on the zstd body", async () => {
+  const attempts = [];
+  const native = await mockServer(async (request, response) => {
+    attempts.push(await readBody(request));
+    if (attempts.length === 1) {
+      const sse = [
+        "event: response.created",
+        'data: {"type":"response.created"}',
+        "",
+        "event: error",
+        'data: {"type":"error","error":{"type":"service_unavailable_error","code":"server_is_overloaded","message":"Our servers are currently overloaded. Please try again later."}}',
+        "",
+        "event: response.failed",
+        'data: {"type":"response.failed","response":{"status":"failed","error":{"code":"server_is_overloaded"}}}',
+        "",
+        "",
+      ].join("\n");
+      response.writeHead(200, { "Cache-Control": "no-cache" });
+      response.end(sse);
+      return;
+    }
+    const payload = Buffer.from(
+      JSON.stringify({ id: "resp-after-capacity", output: [] }),
+      "utf8",
+    );
+    response.writeHead(200, {
+      "Content-Type": "application/json",
+      "Content-Length": String(payload.length),
+    });
+    response.end(payload);
+  });
+  const stateDir = stateDirectory();
+  const routerPort = await openPort();
+  const router = startRouter({ nativePort: native.port, routerPort, stateDir });
+
+  try {
+    await waitFor(`${routerBase(routerPort)}/models`, router);
+    const result = await fetch(`${routerBase(routerPort)}/responses`, {
+      method: "POST",
+      headers: { Authorization: "Bearer caller", "Content-Type": "application/json" },
+      body: JSON.stringify(largeNativeTurn()),
+    });
+
+    const relayed = await result.text();
+    assert.equal(result.status, 200, relayed);
+    assert.equal(JSON.parse(relayed).id, "resp-after-capacity");
+    assert.equal(attempts.length, 2, "the capacity stream was relayed instead of retried");
+    assert.equal(attempts[0].encoding, "zstd");
+    assert.equal(
+      attempts[1].encoding,
+      "zstd",
+      "the retry dropped Content-Encoding on the zstd body",
+    );
+  } finally {
+    await stopChild(router);
+    await closeServer(native.server);
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
 test("five native retries can rescue the sixth attempt", async () => {
   let attempts = 0;
   const native = await mockServer((_request, response) => {

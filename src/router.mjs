@@ -1970,8 +1970,12 @@ async function handleResponses(request, response, requestUrl) {
           const nextVariant = await nativeBodyFor(nativeFast);
           routedBody = nextVariant.routedBody;
           nativeContentEncoding = nextVariant.contentEncoding;
-          if (nativeContentEncoding) headers["Content-Encoding"] = nativeContentEncoding;
         }
+        // `nativeInjectAccount()` rebuilt the header object for the next
+        // account, so the encoding that matches `routedBody` must be restored
+        // on every re-injection. A zstd frame without this header is a
+        // `{"detail":"Bad Request"}` upstream.
+        if (nativeContentEncoding) headers["Content-Encoding"] = nativeContentEncoding;
       }
     }
     upstreamRetries = retries;
