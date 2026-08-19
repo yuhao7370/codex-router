@@ -16,7 +16,9 @@ import {
   readTaskManagerConfig,
   refreshActiveAccount,
   selectTaskManagerAccount,
+  setCapacityRetry,
   setTaskManagerFailover,
+  setFastAccounts,
   setTaskManagerEnabled,
   setTaskManagerIntervals,
   setTaskManagerPort,
@@ -73,6 +75,9 @@ function statusPayload() {
     accountsIntervalMs: config.accountsIntervalMs,
     usageIntervalMs: config.usageIntervalMs,
     showUsagePanel: config.showUsagePanel,
+    fastAccounts: config.fastAccounts,
+    capacityRetry: config.capacityRetry,
+    capacityRetryAttempts: config.capacityRetryAttempts,
     pool: poolStatus(),
     port: config.port,
     token: config.token ? "set" : "auto",
@@ -188,6 +193,19 @@ export function startTaskManagerUi() {
         const body = await readJsonBody(request);
         const config = setUsagePanelVisible(body.visible);
         return sendJson(response, 200, { showUsagePanel: config.showUsagePanel });
+      }
+      if (request.method === "POST" && url.pathname === "/api/fast-accounts") {
+        const body = await readJsonBody(request);
+        const config = setFastAccounts(body.ids || []);
+        return sendJson(response, 200, { fastAccounts: config.fastAccounts });
+      }
+      if (request.method === "POST" && url.pathname === "/api/capacity-retry") {
+        const body = await readJsonBody(request);
+        const config = setCapacityRetry(body.enabled, body.attempts);
+        return sendJson(response, 200, {
+          capacityRetry: config.capacityRetry,
+          capacityRetryAttempts: config.capacityRetryAttempts,
+        });
       }
       if (request.method === "POST" && url.pathname === "/api/enable") {
         setTaskManagerEnabled(true);

@@ -323,7 +323,7 @@
       <p class="hint" id="pool-hint">轮询池：未启用（勾选账号并保存后启用均匀派发）</p>
       <div class="table-wrap">
       <table>
-        <thead><tr><th>池</th><th>邮箱</th><th>ID</th><th>来源</th><th>状态</th><th>额度</th><th></th></tr></thead>
+        <thead><tr><th>池</th><th>邮箱</th><th>ID</th><th>来源</th><th>状态</th><th>额度</th><th>fast</th><th></th></tr></thead>
         <tbody id="accounts-body"></tbody>
       </table>
       </div>
@@ -365,6 +365,11 @@
         </div>
         <div class="field">
           <label class="switch-label"><input type="checkbox" id="usage-toggle" class="switch" checked> 显示用量面板</label>
+        </div>
+        <div class="field">
+          <label class="switch-label"><input type="checkbox" id="capacity-toggle" class="switch" checked> 模型容量满时自动重试</label>
+          <input id="capacity-attempts-input" type="number" min="1" max="20" style="width:64px"> <span class="muted">次</span>
+          <button class="ghost" id="save-capacity">保存</button>
         </div>
         <div class="field">
           <label>轮询</label>
@@ -436,6 +441,7 @@
   let accountIndex = new Map();
   let currentPool = new Set();
   let blockedAccounts = new Set();
+  let fastAccounts = new Set();
 
   function buildAccountIndex(accounts) {
     accountIndex = new Map();
@@ -586,6 +592,7 @@
         const checked = preserveChecks
           ? (pendingChecks.has(id) || currentPool.has(id))
           : currentPool.has(id);
+        const fast = fastAccounts.has(id);
         tr.innerHTML =
           '<td><input type="checkbox" class="pool-check" data-id="' + escapeHtml(id) + '"' +
             (checked ? ' checked' : '') + (blocked ? ' disabled' : '') + '></td>' +
@@ -594,6 +601,8 @@
           '<td>' + source + '</td>' +
           '<td>' + state + '</td>' +
           '<td>' + escapeHtml(quota) + '</td>' +
+          '<td><input type="checkbox" class="fast-check" data-id="' + escapeHtml(id) + '"' +
+            (fast ? ' checked' : '') + '></td>' +
           '<td>' + (blocked
             ? '<button data-id="' + escapeHtml(id) + '" class="ghost unblock-btn">解除</button>'
             : '<button data-id="' + escapeHtml(id) + '" class="ghost select-btn"' +
@@ -601,7 +610,7 @@
         body.appendChild(tr);
       }
       if (accounts.length === 0) {
-        body.innerHTML = '<tr><td colspan="7" class="muted">没有账号</td></tr>';
+        body.innerHTML = '<tr><td colspan="8" class="muted">没有账号</td></tr>';
       }
       for (const btn of document.querySelectorAll('.select-btn')) {
         btn.addEventListener('click', async function () {
@@ -628,6 +637,21 @@
             await Promise.all([loadStatus(), loadAccounts()]);
           } catch (error) {
             setResult('accounts-error', false, '解除失败：' + error.message);
+          }
+        });
+      }
+      for (const input of document.querySelectorAll('.fast-check')) {
+        input.addEventListener('change', async function () {
+          const id = input.getAttribute('data-id');
+          if (input.checked) fastAccounts.add(id);
+          else fastAccounts.delete(id);
+          try {
+            await api('/api/fast-accounts', {
+              method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ ids: [...fastAccounts] }),
+            });
+          } catch (error) {
+            setResult('accounts-error', false, '保存 fast 失败：' + error.message);
           }
         });
       }
@@ -822,6 +846,22 @@
     }
   });
 
+  el('save-capacity').addEventListener('click', async function () {
+    try {
+      const status = await api('/api/capacity-retry', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          enabled: el('capacity-toggle').checked,
+          attempts: Number(el('capacity-attempts-input').value),
+        }),
+      });
+      el('capacity-toggle').checked = Boolean(status.capacityRetry);
+      el('capacity-attempts-input').value = String(status.capacityRetryAttempts);
+    } catch (error) {
+      setResult('test-result', false, '保存容量重试失败：' + error.message);
+    }
+  });
+
   let usagePanel = null;
   function initUsagePanel() {
     if (usagePanel) return;
@@ -862,12 +902,15 @@
       logIntervalMs = status.logIntervalMs || 2000;
       accountsIntervalMs = status.accountsIntervalMs || 15000;
       usageIntervalMs = status.usageIntervalMs || 5000;
+      fastAccounts = new Set(Array.isArray(status.fastAccounts) ? status.fastAccounts : []);
       el('log-interval-input').value = String(Math.round(logIntervalMs / 1000));
       el('accounts-interval-input').value = String(Math.round(accountsIntervalMs / 1000));
       el('usage-interval-input').value = String(Math.round(usageIntervalMs / 1000));
       const showUsagePanel = status.showUsagePanel !== false;
       el('usage-toggle').checked = showUsagePanel;
       applyUsagePanelVisible(showUsagePanel);
+      el('capacity-toggle').checked = status.capacityRetry !== false;
+      el('capacity-attempts-input').value = String(status.capacityRetryAttempts || 5);
     } catch (error) {}
     await loadAccounts();
     await loadStatus();

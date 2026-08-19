@@ -84,6 +84,7 @@ import { VERSION } from "./version.mjs";
 import {
   nextInjectionAccount,
   notifyAccountFailure,
+  readTaskManagerConfig,
   recordInjection,
   startTaskManagerPoller,
 } from "./task-manager-bridge.mjs";
@@ -1678,6 +1679,10 @@ async function handleResponses(request, response, requestUrl) {
     let headers;
     let routedBody;
     let nativeContentEncoding;
+    let capacityAttempts = 5;
+    let nativeFast = false;
+    let nativeBodyFor = null;
+    let nativeInjectAccount = null;
     let namespacesFlattened = false;
     let flattenedNamespaces = new Map();
     if (route) {
@@ -1762,16 +1767,48 @@ async function handleResponses(request, response, requestUrl) {
       delete native.prompt_cache_retention;
       if (!compactV1) delete native.previous_response_id;
       target = nativeTarget(requestUrl.pathname);
-      // Compress the body once: the bytes are account-independent, so a
-      // capacity retry can reuse them under a different account's headers.
-      const compressionProbe = {};
-      routedBody = await compressedNativeBody(
-        Buffer.from(JSON.stringify(native), "utf8"),
-        compressionProbe,
+
+      const taskConfig = readTaskManagerConfig();
+      const fastAccounts = new Set(
+        Array.isArray(taskConfig.fastAccounts) ? taskConfig.fastAccounts : [],
       );
-      nativeContentEncoding = compressionProbe["Content-Encoding"];
-      headers = nativeHeaders(request);
-      nativeAccountId = injectedAccountId(headers);
+      capacityAttempts = taskConfig.capacityRetry === false
+        ? 1
+        : Math.max(1, Number(taskConfig.capacityRetryAttempts) || 5);
+
+      // Fast mode only changes one body field, so cache at most two compressed
+      // variants and pick the right one per injected account. This keeps the
+      // body reusable across account-switch retries without recompressing it.
+      const bodyVariants = new Map();
+      nativeBodyFor = async (fast) => {
+        const key = fast ? "fast" : "normal";
+        let variant = bodyVariants.get(key);
+        if (!variant) {
+          const body = { ...native };
+          if (fast) body.service_tier = "priority";
+          const probe = {};
+          const bytes = await compressedNativeBody(
+            Buffer.from(JSON.stringify(body), "utf8"),
+            probe,
+          );
+          variant = {
+            routedBody: bytes,
+            contentEncoding: probe["Content-Encoding"],
+          };
+          bodyVariants.set(key, variant);
+        }
+        return variant;
+      };
+      nativeInjectAccount = () => {
+        headers = nativeHeaders(request);
+        nativeAccountId = injectedAccountId(headers);
+        return fastAccounts.has(nativeAccountId);
+      };
+
+      nativeFast = nativeInjectAccount();
+      const initialVariant = await nativeBodyFor(nativeFast);
+      routedBody = initialVariant.routedBody;
+      nativeContentEncoding = initialVariant.contentEncoding;
       if (nativeContentEncoding) headers["Content-Encoding"] = nativeContentEncoding;
     }
 
@@ -1808,10 +1845,9 @@ async function handleResponses(request, response, requestUrl) {
       // A native turn that hits "model at capacity" retries on the next pooled
       // account instead of relaying the error, so one saturated account never
       // blocks the whole request.
-      const maxAccountAttempts = 5;
       let result;
       let capacityBackoffMs = 500;
-      for (let attempt = 0; attempt < maxAccountAttempts; attempt += 1) {
+      for (let attempt = 0; attempt < capacityAttempts; attempt += 1) {
         result = await fetchWithRetry(
           target,
           {
@@ -1829,16 +1865,21 @@ async function handleResponses(request, response, requestUrl) {
         upstream = result.response;
         retries += result.retries;
         const capacity = !upstream.ok && (await isAtCapacityResponse(upstream));
-        if (!capacity || attempt === maxAccountAttempts - 1) break;
+        if (!capacity || attempt === capacityAttempts - 1) break;
         notifyAccountFailure(upstream.status, true, false);
         await upstream.body?.cancel().catch(() => {});
         // Let the model shed load before the next account tries again.
         await sleep(capacityBackoffMs, controller.signal);
         capacityBackoffMs = Math.min(capacityBackoffMs * 2, 8_000);
         controller.signal.throwIfAborted();
-        headers = nativeHeaders(request);
-        nativeAccountId = injectedAccountId(headers);
-        if (nativeContentEncoding) headers["Content-Encoding"] = nativeContentEncoding;
+        const nextFast = nativeInjectAccount();
+        if (nextFast !== nativeFast) {
+          nativeFast = nextFast;
+          const nextVariant = await nativeBodyFor(nativeFast);
+          routedBody = nextVariant.routedBody;
+          nativeContentEncoding = nextVariant.contentEncoding;
+          if (nativeContentEncoding) headers["Content-Encoding"] = nativeContentEncoding;
+        }
       }
     }
     upstreamRetries = retries;

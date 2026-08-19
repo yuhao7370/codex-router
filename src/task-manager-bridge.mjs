@@ -23,6 +23,8 @@ const MAX_POLL_MS = 60_000;
 const DEFAULT_LOG_POLL_MS = 2_000;
 const DEFAULT_ACCOUNTS_POLL_MS = 15_000;
 const DEFAULT_USAGE_POLL_MS = 5_000;
+const DEFAULT_CAPACITY_RETRY_ATTEMPTS = 5;
+const MAX_CAPACITY_RETRY_ATTEMPTS = 20;
 const FAILOVER_COOLDOWN_MS = 30_000;
 const FAILURE_MEMORY_MS = 5 * 60 * 1000;
 const FAILOVER_TRIGGER_STATUSES = new Set([401, 402, 403, 429]);
@@ -116,6 +118,9 @@ function defaults() {
     accountsIntervalMs: DEFAULT_ACCOUNTS_POLL_MS,
     usageIntervalMs: DEFAULT_USAGE_POLL_MS,
     showUsagePanel: true,
+    fastAccounts: [],
+    capacityRetry: true,
+    capacityRetryAttempts: DEFAULT_CAPACITY_RETRY_ATTEMPTS,
     port: DEFAULT_PORT,
     token: "",
   };
@@ -142,6 +147,16 @@ export function readTaskManagerConfig() {
     );
     state.usageIntervalMs = clampInterval(state.usageIntervalMs, DEFAULT_USAGE_POLL_MS);
     state.showUsagePanel = state.showUsagePanel !== false;
+    state.fastAccounts = Array.isArray(state.fastAccounts)
+      ? state.fastAccounts.map((id) => String(id)).filter(Boolean)
+      : [];
+    state.capacityRetry = state.capacityRetry !== false;
+    state.capacityRetryAttempts = Math.min(
+      MAX_CAPACITY_RETRY_ATTEMPTS,
+      Math.max(1, Number.isInteger(state.capacityRetryAttempts)
+        ? state.capacityRetryAttempts
+        : DEFAULT_CAPACITY_RETRY_ATTEMPTS),
+    );
     state.port = Number.isInteger(state.port) ? state.port : DEFAULT_PORT;
     if (state.port < 1 || state.port > 65_535) state.port = DEFAULT_PORT;
     state.token = String(state.token || "").trim();
@@ -240,6 +255,24 @@ export function setTaskManagerIntervals(intervals = {}) {
 
 export function setUsagePanelVisible(visible) {
   return writeTaskManagerConfig({ showUsagePanel: Boolean(visible) });
+}
+
+export function setFastAccounts(ids) {
+  const value = (Array.isArray(ids) ? ids : [])
+    .map((id) => String(id))
+    .filter(Boolean);
+  return writeTaskManagerConfig({ fastAccounts: value });
+}
+
+export function setCapacityRetry(enabled, attempts) {
+  const next = { capacityRetry: Boolean(enabled) };
+  if (attempts !== undefined) {
+    next.capacityRetryAttempts = Math.min(
+      MAX_CAPACITY_RETRY_ATTEMPTS,
+      Math.max(1, Number(attempts) || DEFAULT_CAPACITY_RETRY_ATTEMPTS),
+    );
+  }
+  return writeTaskManagerConfig(next);
 }
 
 function defaultTokenPath() {
