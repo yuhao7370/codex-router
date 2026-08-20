@@ -29,6 +29,7 @@ import {
 } from "./task-manager-bridge.mjs";
 import { mergeDeletedAccounts, panelUsageSnapshot } from "./provider-usage.mjs";
 import { pricingSyncState, syncModelsDevPricing } from "./model-pricing.mjs";
+import { rebuildCatalog, syncLocalRouterModels } from "./local-router-sync.mjs";
 
 const HOST = "127.0.0.1";
 const PORT = Number(
@@ -191,6 +192,29 @@ export function startTaskManagerUi() {
       if (request.method === "POST" && url.pathname === "/api/usage/sync") {
         const result = await syncModelsDevPricing();
         return sendJson(response, 200, { ...result, pricing: pricingSyncState() });
+      }
+      if (request.method === "POST" && url.pathname === "/api/local-router/models/sync") {
+        const result = await syncLocalRouterModels();
+        let catalogRebuilt = false;
+        if (result.added.length > 0) {
+          rebuildCatalog();
+          catalogRebuilt = true;
+        }
+        sendJson(response, 200, {
+          ok: true,
+          ...result,
+          catalogRebuilt,
+          message: result.added.length
+            ? `已添加 ${result.added.length} 个模型，正在重启路由以生效；请完全退出并重新打开 Codex。`
+            : "模型列表已是最新，没有新增模型。",
+        });
+        // The registry is loaded once at startup, so a newly added model is
+        // only routable after the process reloads it. Exit after the response
+        // has flushed; the watchdog relaunches the service.
+        if (result.added.length > 0) {
+          setTimeout(() => process.exit(0), 500);
+        }
+        return;
       }
       if (request.method === "POST" && url.pathname === "/api/usage-panel") {
         const body = await readJsonBody(request);

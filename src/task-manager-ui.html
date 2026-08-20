@@ -372,6 +372,11 @@
           <button class="ghost" id="save-capacity">保存</button>
         </div>
         <div class="field">
+          <label>模型列表</label>
+          <button class="ghost" id="sync-models-btn">更新模型列表</button>
+          <span class="result" id="sync-models-result" hidden></span>
+        </div>
+        <div class="field">
           <label>轮询</label>
           <input id="log-interval-input" type="number" min="1" max="60" style="width:72px"> <span class="muted">日志秒</span>
           <input id="accounts-interval-input" type="number" min="1" max="60" style="width:72px"> <span class="muted">账号秒</span>
@@ -862,6 +867,16 @@
       el('capacity-attempts-input').value = String(status.capacityRetryAttempts);
     } catch (error) {
       setResult('test-result', false, '保存容量重试失败：' + error.message);
+    }
+  });
+
+  el('sync-models-btn').addEventListener('click', async function () {
+    setResult('sync-models-result', true, '正在更新…');
+    try {
+      const result = await api('/api/local-router/models/sync', { method: 'POST' });
+      setResult('sync-models-result', Boolean(result.ok), result.message);
+    } catch (error) {
+      setResult('sync-models-result', false, '更新失败：' + error.message);
     }
   });
 
