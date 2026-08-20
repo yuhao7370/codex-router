@@ -58,6 +58,41 @@ export async function syncLocalRouterModels() {
   };
 }
 
+// Remove local-router user models the live service no longer advertises. Only
+// the curated local-router entries are touched; other providers are preserved.
+export function planLocalRouterRemovals({ existing, available }) {
+  const mine = existing.filter((model) => model.provider === "local-router");
+  const others = existing.filter((model) => model.provider !== "local-router");
+  const availableSet = new Set(
+    (Array.isArray(available) ? available : []).map((id) => String(id)),
+  );
+  const removed = mine
+    .map((model) => model.upstreamModel)
+    .filter((id) => !availableSet.has(id));
+  const kept = mine.filter((model) => availableSet.has(model.upstreamModel));
+  return {
+    models: [...others, ...kept],
+    removed,
+    total: kept.length,
+  };
+}
+
+export async function cleanLocalRouterModels() {
+  const discovery = await discoverProviderModels("local-router");
+  const merged = planLocalRouterRemovals({
+    existing: readUserModels(),
+    available: discovery.discovered,
+  });
+  if (merged.removed.length > 0) {
+    writeUserModels(merged.models);
+  }
+  return {
+    removed: merged.removed,
+    total: merged.total,
+    discovered: discovery.discovered.length,
+  };
+}
+
 // Rebuild merged-models.json (what Codex's picker reads) without re-capturing
 // the native catalog. The router reloads the registry on its next start, so a
 // fresh model is both listed in Codex and routable once the process restarts.

@@ -374,6 +374,7 @@
         <div class="field">
           <label>模型列表</label>
           <button class="ghost" id="sync-models-btn">更新模型列表</button>
+          <button class="ghost" id="prune-models-btn">清理下架模型</button>
           <span class="result" id="sync-models-result" hidden></span>
         </div>
         <div class="field">
@@ -877,6 +878,16 @@
       setResult('sync-models-result', Boolean(result.ok), result.message);
     } catch (error) {
       setResult('sync-models-result', false, '更新失败：' + error.message);
+    }
+  });
+
+  el('prune-models-btn').addEventListener('click', async function () {
+    setResult('sync-models-result', true, '正在清理…');
+    try {
+      const result = await api('/api/local-router/models/prune', { method: 'POST' });
+      setResult('sync-models-result', Boolean(result.ok), result.message);
+    } catch (error) {
+      setResult('sync-models-result', false, '清理失败：' + error.message);
     }
   });
 

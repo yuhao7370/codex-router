@@ -29,7 +29,11 @@ import {
 } from "./task-manager-bridge.mjs";
 import { mergeDeletedAccounts, panelUsageSnapshot } from "./provider-usage.mjs";
 import { pricingSyncState, syncModelsDevPricing } from "./model-pricing.mjs";
-import { rebuildCatalog, syncLocalRouterModels } from "./local-router-sync.mjs";
+import {
+  cleanLocalRouterModels,
+  rebuildCatalog,
+  syncLocalRouterModels,
+} from "./local-router-sync.mjs";
 
 const HOST = "127.0.0.1";
 const PORT = Number(
@@ -212,6 +216,26 @@ export function startTaskManagerUi() {
         // only routable after the process reloads it. Exit after the response
         // has flushed; the watchdog relaunches the service.
         if (result.added.length > 0) {
+          setTimeout(() => process.exit(0), 500);
+        }
+        return;
+      }
+      if (request.method === "POST" && url.pathname === "/api/local-router/models/prune") {
+        const result = await cleanLocalRouterModels();
+        let catalogRebuilt = false;
+        if (result.removed.length > 0) {
+          rebuildCatalog();
+          catalogRebuilt = true;
+        }
+        sendJson(response, 200, {
+          ok: true,
+          ...result,
+          catalogRebuilt,
+          message: result.removed.length
+            ? `已清理 ${result.removed.length} 个下架模型：${result.removed.join(", ")}；正在重启路由以生效。`
+            : "没有下架的模型，无需清理。",
+        });
+        if (result.removed.length > 0) {
           setTimeout(() => process.exit(0), 500);
         }
         return;

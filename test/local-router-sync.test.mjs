@@ -7,7 +7,9 @@ import test from "node:test";
 const dir = mkdtempSync(path.join(os.tmpdir(), "cr-local-router-sync-"));
 process.env.CODEX_ROUTER_STATE_DIR = dir;
 
-const { mergeLocalRouterModels } = await import("../src/local-router-sync.mjs");
+const { mergeLocalRouterModels, planLocalRouterRemovals } = await import(
+  "../src/local-router-sync.mjs"
+);
 
 test("folds new local-router models into user models and keeps others", () => {
   const existing = [
@@ -103,4 +105,74 @@ test("no-op when every discovered model is already curated", () => {
 
   assert.deepEqual(result.added, []);
   assert.equal(result.models.length, 1);
+});
+
+test("prunes local-router models the service no longer advertises", () => {
+  const existing = [
+    {
+      slug: "local-router/glm-5.1",
+      upstreamModel: "glm-5.1",
+      provider: "local-router",
+      listed: true,
+      gatewayModel: "local-router-glm-5-1",
+      displayName: "glm-5.1 (curated)",
+      description: "curated",
+      priority: 100,
+      defaultEffort: "high",
+      reasoningLevels: [{ effort: "high", description: "Deep reasoning" }],
+      contextWindow: 1000000,
+      autoCompact: 850000,
+      inputModalities: ["text"],
+      compHash: "local-router-glm-5-1-user-v1",
+    },
+    {
+      slug: "local-router/glm-5.3",
+      upstreamModel: "glm-5.3",
+      provider: "local-router",
+      listed: true,
+      gatewayModel: "local-router-glm-5-3",
+      displayName: "glm-5.3 (curated)",
+      description: "curated",
+      priority: 101,
+      defaultEffort: "high",
+      reasoningLevels: [{ effort: "high", description: "Deep reasoning" }],
+      contextWindow: 1000000,
+      autoCompact: 850000,
+      inputModalities: ["text"],
+      compHash: "local-router-glm-5-3-user-v1",
+    },
+    {
+      slug: "deepseek/deepseek-v4-flash",
+      upstreamModel: "deepseek-v4-flash",
+      provider: "deepseek",
+      listed: true,
+      gatewayModel: "deepseek-deepseek-v4-flash",
+      displayName: "deepseek-v4-flash",
+      description: "deepseek",
+      priority: 50,
+      defaultEffort: "high",
+      reasoningLevels: [{ effort: "high", description: "Deep reasoning" }],
+      contextWindow: 128000,
+      autoCompact: 100000,
+      inputModalities: ["text"],
+      compHash: "deepseek-deepseek-v4-flash-v1",
+    },
+  ];
+
+  const result = planLocalRouterRemovals({
+    existing,
+    available: ["glm-5.3"],
+  });
+
+  assert.deepEqual(result.removed, ["glm-5.1"]);
+  assert.equal(result.total, 1);
+  assert.equal(result.models.length, 2, "glm-5.1 removed, glm-5.3 + deepseek kept");
+  assert.ok(
+    result.models.every((model) => model.upstreamModel !== "glm-5.1"),
+    "delisted model is gone",
+  );
+  assert.ok(
+    result.models.some((model) => model.provider === "deepseek"),
+    "non-local-router models are preserved",
+  );
 });
