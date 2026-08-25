@@ -50,6 +50,7 @@ import {
   fetchWithRetry,
   isAtCapacityResponse,
   isQuotaExhaustedResponse,
+  isTransientRateLimitResponse,
   sleep,
 } from "./upstream-retry.mjs";
 import { nativeProxyFetch } from "./native-proxy.mjs";
@@ -1915,10 +1916,17 @@ async function handleResponses(request, response, requestUrl) {
         upstream = result.response;
         retries += result.retries;
         const capacity = !upstream.ok && (await isAtCapacityResponse(upstream));
+        const transientRateLimit =
+          !upstream.ok && (await isTransientRateLimitResponse(upstream));
         if (capacity) {
           recordRoutedCapacityFailure(requestedModel, upstream.status);
         }
-        if (!capacity || attempt === capacityAttempts - 1) break;
+        if (
+          (!capacity && !transientRateLimit) ||
+          attempt === capacityAttempts - 1
+        ) {
+          break;
+        }
         await upstream.body?.cancel().catch(() => {});
         await sleep(routedBackoffMs, controller.signal);
         routedBackoffMs = Math.min(routedBackoffMs * 2, 8_000);

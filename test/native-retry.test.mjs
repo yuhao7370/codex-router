@@ -21,6 +21,7 @@ import {
   isAtCapacityResponse,
   isQuotaExhaustedResponse,
   isRetryableResponse,
+  isTransientRateLimitResponse,
 } from "../src/upstream-retry.mjs";
 import { openPort } from "./port-pool.mjs";
 
@@ -205,6 +206,27 @@ test("the native server_is_overloaded body is classified as capacity", async () 
     { status: 503, headers: { "Content-Type": "application/json" } },
   );
   assert.equal(await isAtCapacityResponse(overloaded), true);
+});
+
+test("a LiteLLM no-deployments body is a transient rate limit", async () => {
+  const cooldown = new Response(
+    JSON.stringify({
+      error: {
+        message:
+          "No deployments available for selected model, Try again in 5 seconds. Passed model=local-router-deepseek-v4-pro.",
+        type: "rate_limit_error",
+        code: "429",
+      },
+    }),
+    { status: 429, headers: { "Content-Type": "application/json" } },
+  );
+  const quota = new Response(
+    JSON.stringify({ error: { message: "You have reached your weekly usage limit." } }),
+    { status: 429, headers: { "Content-Type": "application/json" } },
+  );
+  assert.equal(await isTransientRateLimitResponse(cooldown), true);
+  assert.equal(await isTransientRateLimitResponse(quota), false);
+  assert.equal(await isAtCapacityResponse(cooldown), false);
 });
 
 test("a quota-exhausted body is classified separately from capacity", async () => {

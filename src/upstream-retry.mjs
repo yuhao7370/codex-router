@@ -145,6 +145,21 @@ export async function isQuotaExhaustedResponse(response) {
   }
 }
 
+// LiteLLM returns a 429 with "No deployments available for selected model,
+// Try again in N seconds" when every deployment for the requested model is in
+// a transient cooldown. It is a short-lived rate-limit rather than a spent
+// quota, so a backoff retry is safe and lets the cooldown expire.
+export async function isTransientRateLimitResponse(response) {
+  if (!response) return false;
+  if (Number(response?.status) !== 429) return false;
+  try {
+    const text = await response.clone().text();
+    return /no deployments available|no healthy deployment available|try again in/i.test(text);
+  } catch {
+    return false;
+  }
+}
+
 export function isRetryableTransportError(error) {
   if (!error) return false;
   // An abort is the caller leaving, and a router-side error (a body that is too
