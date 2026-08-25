@@ -534,6 +534,38 @@ function upstreamHeaders(requestHeaders, body, apiKey, provider, extraHeaders = 
   return headers;
 }
 
+// Some Responses-compatible proxies omit required created_at on completed JSON.
+// LiteLLM rejects the otherwise successful response, so restore it before that hop.
+async function normalizeResponsesApiResponse(upstream, normalized) {
+  if (
+    normalized.provider.protocol !== "openai-responses" ||
+    normalized.payload.stream !== false ||
+    !upstream.ok ||
+    !String(upstream.headers.get("content-type") || "").includes("application/json")
+  ) {
+    return upstream;
+  }
+  let payload;
+  try {
+    payload = await upstream.clone().json();
+  } catch {
+    return upstream;
+  }
+  if (
+    payload?.object !== "response" ||
+    Number.isFinite(payload.created_at) ||
+    !Number.isFinite(payload.completed_at)
+  ) {
+    return upstream;
+  }
+  payload.created_at = payload.completed_at;
+  return new Response(JSON.stringify(payload), {
+    status: upstream.status,
+    statusText: upstream.statusText,
+    headers: upstream.headers,
+  });
+}
+
 async function upstreamSession(provider, credential, payload, options = {}) {
   if (provider.authProfile !== "github-copilot") {
     return { apiKey: credential.value, baseUrl: providerBaseUrl(provider), headers: {} };
@@ -670,6 +702,7 @@ async function handleRequest(request, response) {
       signal: controller.signal,
     });
   }
+  upstream = await normalizeResponsesApiResponse(upstream, normalized);
   await pipeResponse(upstream, response);
   // Harvest the provider's own quota report from the response it just sent.
   // Costs no extra request and works for any provider that emits the standard
