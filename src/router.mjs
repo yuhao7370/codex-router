@@ -1009,6 +1009,10 @@ async function healthPayload() {
     service: "codex-router",
     version: VERSION,
     router: "ready",
+    taskManagerMode:
+      process.env.CODEX_ROUTER_TASK_MANAGER_STANDALONE === "1"
+        ? "standalone"
+        : "embedded",
     degraded,
     activity: activityPayload(),
     oauth,
@@ -4082,7 +4086,9 @@ process.on("unhandledRejection", (reason) => {
 server.requestTimeout = 0;
 applyKeepAliveTimeouts(server);
 startTaskManagerPoller();
-startTaskManagerUi();
+if (process.env.CODEX_ROUTER_TASK_MANAGER_STANDALONE !== "1") {
+  startTaskManagerUi();
+}
 server.listen(LISTEN_PORT, LISTEN_HOST, () => {
   console.error("[codex-router] listening");
 });

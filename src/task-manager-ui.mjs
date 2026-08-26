@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { authenticatedRoute, redactCallerUrl } from "./caller-auth.mjs";
 import {
   activeAccount,
   clearBlockedAccount,
@@ -51,6 +52,12 @@ const USAGE_PANEL_JS_PATH = path.join(
   path.dirname(fileURLToPath(import.meta.url)),
   "usage-panel.js",
 );
+const STANDALONE_HEADERS = Object.freeze({
+  "cache-control": "no-store",
+  "content-security-policy": "default-src 'self'; connect-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; frame-ancestors 'none'",
+  "referrer-policy": "no-referrer",
+  "x-content-type-options": "nosniff",
+});
 
 function readPage() {
   return readFileSync(PAGE_PATH, "utf8");
@@ -69,13 +76,9 @@ function readUsagePanelJs() {
 }
 
 
-function statusPayload() {
-  const config = readTaskManagerConfig();
-  const account = activeAccount();
+function durableStatusPayload(config) {
   return {
     enabled: config.enabled,
-    errors: errorLog(),
-    failover: failoverStatus(),
     logIntervalMs: config.logIntervalMs,
     accountsIntervalMs: config.accountsIntervalMs,
     usageIntervalMs: config.usageIntervalMs,
@@ -83,9 +86,44 @@ function statusPayload() {
     fastAccounts: config.fastAccounts,
     capacityRetry: config.capacityRetry,
     capacityRetryAttempts: config.capacityRetryAttempts,
-    pool: poolStatus(),
     port: config.port,
     token: config.token ? "set" : "auto",
+  };
+}
+
+async function statusPayload({ standalone, runtimeClient }) {
+  const config = readTaskManagerConfig();
+  const durable = durableStatusPayload(config);
+  if (standalone) {
+    try {
+      return {
+        ...durable,
+        ...(await runtimeClient.snapshot()),
+        routerRuntime: { available: true },
+      };
+    } catch {
+      return {
+        ...durable,
+        routerRuntime: { available: false },
+        account: null,
+        pool: { ids: config.pool, accounts: [], blocked: config.blocked },
+        failover: {
+          enabled: config.failover,
+          lastFailoverAt: null,
+          lastFailover: null,
+        },
+        errors: [],
+        injections: { count: 0, recent: [] },
+      };
+    }
+  }
+
+  const account = activeAccount();
+  return {
+    ...durable,
+    errors: errorLog(),
+    failover: failoverStatus(),
+    pool: poolStatus(),
     account: account
       ? {
           accountId: account.accountId,
@@ -98,6 +136,10 @@ function statusPayload() {
       : null,
     injections: injectionStats(),
   };
+}
+
+function safeError(error) {
+  return redactCallerUrl(error instanceof Error ? error.message : String(error)).slice(0, 500);
 }
 
 function sendJson(response, status, body) {
@@ -132,26 +174,115 @@ async function readJsonBody(request) {
   return text ? JSON.parse(text) : {};
 }
 
-export function startTaskManagerUi() {
+export function startTaskManagerUi({
+  mode = "embedded",
+  port = PORT,
+  callerSecret,
+  runtimeClient,
+  serviceController,
+  restartRouter,
+} = {}) {
+  const standalone = mode === "standalone";
+  const performRouterRestart =
+    restartRouter ||
+    (standalone
+      ? () => serviceController.perform("restart")
+      : () => process.exit(0));
+  const readStatus = () => statusPayload({ standalone, runtimeClient });
+  const refreshRuntime = async () => {
+    if (!standalone) return undefined;
+    try {
+      await runtimeClient.reload();
+      return { ok: true };
+    } catch (error) {
+      return { ok: false, error: safeError(error) };
+    }
+  };
+  const refreshedStatus = async () => {
+    const runtimeRefresh = await refreshRuntime();
+    const status = await readStatus();
+    return runtimeRefresh ? { ...status, runtimeRefresh } : status;
+  };
+  const scheduleRouterRestart = () => {
+    const timer = setTimeout(() => {
+      Promise.resolve()
+        .then(performRouterRestart)
+        .catch((error) => {
+          console.error(`[codex-router] task-manager restart failed: ${safeError(error)}`);
+        });
+    }, 500);
+    timer.unref();
+  };
+
   const server = http.createServer(async (request, response) => {
     try {
-      const url = new URL(request.url, `http://${HOST}:${PORT}`);
-      if (request.method === "GET" && (url.pathname === "/" || url.pathname === "/index.html")) {
+      if (standalone) {
+        for (const [name, value] of Object.entries(STANDALONE_HEADERS)) {
+          response.setHeader(name, value);
+        }
+      }
+      const url = new URL(request.url, `http://${request.headers.host || `${HOST}:${port}`}`);
+      if (standalone && request.method === "GET" && url.pathname === "/health") {
+        return sendJson(response, 200, {
+          ok: true,
+          service: "codex-router-task-manager",
+          mode,
+          pid: process.pid,
+        });
+      }
+      const authenticated = standalone
+        ? authenticatedRoute(url.pathname, callerSecret)
+        : url.pathname;
+      const route = standalone
+        ? authenticated?.startsWith("/task-manager")
+          ? authenticated.slice("/task-manager".length) || "/"
+          : undefined
+        : authenticated;
+      if (route === undefined) {
+        return sendJson(response, 401, { error: "caller capability required" });
+      }
+      if (standalone && request.method === "POST") {
+        const expectedOrigin = `http://${request.headers.host}`;
+        if (request.headers.origin && request.headers.origin !== expectedOrigin) {
+          return sendJson(response, 403, { error: "cross-origin mutation refused" });
+        }
+        if (request.headers["sec-fetch-site"] === "cross-site") {
+          return sendJson(response, 403, { error: "cross-site mutation refused" });
+        }
+        if (
+          !String(request.headers["content-type"] || "")
+            .toLowerCase()
+            .startsWith("application/json")
+        ) {
+          return sendJson(response, 415, { error: "application/json required" });
+        }
+      }
+      if (standalone && request.method === "GET" && route === "/api/router/status") {
+        return sendJson(response, 200, await serviceController.snapshot());
+      }
+      if (standalone) {
+        for (const action of ["start", "stop", "restart"]) {
+          if (request.method === "POST" && route === `/api/router/${action}`) {
+            return sendJson(response, 200, await serviceController.perform(action));
+          }
+        }
+      }
+      if (request.method === "GET" && (route === "/" || route === "/index.html")) {
         return sendHtml(response, readPage());
       }
-      if (request.method === "GET" && url.pathname === "/converter") {
+      if (request.method === "GET" && route === "/converter") {
         return sendHtml(response, readConverter());
       }
-      if (request.method === "GET" && url.pathname === "/usage") {
+      if (request.method === "GET" && route === "/usage") {
         return sendHtml(response, readUsagePage());
       }
-      if (request.method === "GET" && url.pathname === "/usage-panel.js") {
+      if (request.method === "GET" && route === "/usage-panel.js") {
         return sendJs(response, readUsagePanelJs());
       }
-      if (request.method === "GET" && url.pathname === "/api/status") {
-        return sendJson(response, 200, statusPayload());
+      if (request.method === "GET" && route === "/api/status") {
+        return sendJson(response, 200, await readStatus());
       }
-      if (request.method === "GET" && url.pathname === "/api/usage") {
+      if (request.method === "GET" && route === "/api/usage") {
         const range = url.searchParams.get("range") || "90d";
         const snapshot = panelUsageSnapshot({ range });
         const accountMeta = new Map();
@@ -193,11 +324,11 @@ export function startTaskManagerUi() {
             });
         return sendJson(response, 200, { ...snapshot, accounts });
       }
-      if (request.method === "POST" && url.pathname === "/api/usage/sync") {
+      if (request.method === "POST" && route === "/api/usage/sync") {
         const result = await syncModelsDevPricing();
         return sendJson(response, 200, { ...result, pricing: pricingSyncState() });
       }
-      if (request.method === "POST" && url.pathname === "/api/local-router/models/sync") {
+      if (request.method === "POST" && route === "/api/local-router/models/sync") {
         const result = await syncLocalRouterModels();
         let catalogRebuilt = false;
         if (result.added.length > 0) {
@@ -212,15 +343,12 @@ export function startTaskManagerUi() {
             ? `已添加 ${result.added.length} 个模型，正在重启路由以生效；请完全退出并重新打开 Codex。`
             : "模型列表已是最新，没有新增模型。",
         });
-        // The registry is loaded once at startup, so a newly added model is
-        // only routable after the process reloads it. Exit after the response
-        // has flushed; the watchdog relaunches the service.
         if (result.added.length > 0) {
-          setTimeout(() => process.exit(0), 500);
+          scheduleRouterRestart();
         }
         return;
       }
-      if (request.method === "POST" && url.pathname === "/api/local-router/models/prune") {
+      if (request.method === "POST" && route === "/api/local-router/models/prune") {
         const result = await cleanLocalRouterModels();
         let catalogRebuilt = false;
         if (result.removed.length > 0) {
@@ -236,21 +364,21 @@ export function startTaskManagerUi() {
             : "没有下架的模型，无需清理。",
         });
         if (result.removed.length > 0) {
-          setTimeout(() => process.exit(0), 500);
+          scheduleRouterRestart();
         }
         return;
       }
-      if (request.method === "POST" && url.pathname === "/api/usage-panel") {
+      if (request.method === "POST" && route === "/api/usage-panel") {
         const body = await readJsonBody(request);
         const config = setUsagePanelVisible(body.visible);
         return sendJson(response, 200, { showUsagePanel: config.showUsagePanel });
       }
-      if (request.method === "POST" && url.pathname === "/api/fast-accounts") {
+      if (request.method === "POST" && route === "/api/fast-accounts") {
         const body = await readJsonBody(request);
         const config = setFastAccounts(body.ids || []);
         return sendJson(response, 200, { fastAccounts: config.fastAccounts });
       }
-      if (request.method === "POST" && url.pathname === "/api/capacity-retry") {
+      if (request.method === "POST" && route === "/api/capacity-retry") {
         const body = await readJsonBody(request);
         const config = setCapacityRetry(body.enabled, body.attempts);
         return sendJson(response, 200, {
@@ -258,82 +386,89 @@ export function startTaskManagerUi() {
           capacityRetryAttempts: config.capacityRetryAttempts,
         });
       }
-      if (request.method === "POST" && url.pathname === "/api/enable") {
+      if (request.method === "POST" && route === "/api/enable") {
         setTaskManagerEnabled(true);
         await refreshActiveAccount();
-        return sendJson(response, 200, statusPayload());
+        return sendJson(response, 200, await refreshedStatus());
       }
-      if (request.method === "POST" && url.pathname === "/api/disable") {
+      if (request.method === "POST" && route === "/api/disable") {
         setTaskManagerEnabled(false);
-        return sendJson(response, 200, statusPayload());
+        return sendJson(response, 200, await refreshedStatus());
       }
-      if (request.method === "POST" && url.pathname === "/api/failover") {
+      if (request.method === "POST" && route === "/api/failover") {
         const body = await readJsonBody(request);
         setTaskManagerFailover(Boolean(body.enabled));
-        return sendJson(response, 200, statusPayload());
+        return sendJson(response, 200, await readStatus());
       }
-      if (request.method === "POST" && url.pathname === "/api/pool") {
+      if (request.method === "POST" && route === "/api/pool") {
         const body = await readJsonBody(request);
         setTaskManagerPool(body.ids || []);
-        return sendJson(response, 200, statusPayload());
+        return sendJson(response, 200, await refreshedStatus());
       }
-      if (request.method === "POST" && url.pathname === "/api/unblock") {
+      if (request.method === "POST" && route === "/api/unblock") {
         const body = await readJsonBody(request);
         clearBlockedAccount(body.id);
-        return sendJson(response, 200, statusPayload());
+        return sendJson(response, 200, await readStatus());
       }
-      if (request.method === "POST" && url.pathname === "/api/errors/clear") {
+      if (request.method === "POST" && route === "/api/errors/clear") {
         clearErrorLog();
-        return sendJson(response, 200, statusPayload());
+        return sendJson(response, 200, await readStatus());
       }
-      if (request.method === "POST" && url.pathname === "/api/intervals") {
+      if (request.method === "POST" && route === "/api/intervals") {
         const body = await readJsonBody(request);
         setTaskManagerIntervals(body);
-        return sendJson(response, 200, statusPayload());
+        return sendJson(response, 200, await readStatus());
       }
-      if (request.method === "POST" && url.pathname === "/api/test") {
+      if (request.method === "POST" && route === "/api/test") {
         return sendJson(response, 200, await testTaskManagerConnection());
       }
-      if (request.method === "GET" && url.pathname === "/api/accounts") {
+      if (request.method === "GET" && route === "/api/accounts") {
         return sendJson(response, 200, await listTaskManagerAccounts());
       }
-      if (request.method === "POST" && url.pathname === "/api/select") {
+      if (request.method === "POST" && route === "/api/select") {
         const body = await readJsonBody(request);
         await selectTaskManagerAccount(body.id);
-        return sendJson(response, 200, statusPayload());
+        return sendJson(response, 200, await refreshedStatus());
       }
-      if (request.method === "POST" && url.pathname === "/api/import") {
+      if (request.method === "POST" && route === "/api/import") {
         const body = await readJsonBody(request);
         const account = await importTaskManagerAccount(body);
-        return sendJson(response, 200, account);
+        const runtimeRefresh = await refreshRuntime();
+        return sendJson(
+          response,
+          200,
+          runtimeRefresh ? { ...account, runtimeRefresh } : account,
+        );
       }
-      if (request.method === "POST" && url.pathname === "/api/port") {
+      if (request.method === "POST" && route === "/api/port") {
         const body = await readJsonBody(request);
         setTaskManagerPort(body.port);
         await refreshActiveAccount();
-        return sendJson(response, 200, statusPayload());
+        return sendJson(response, 200, await refreshedStatus());
       }
-      if (request.method === "POST" && url.pathname === "/api/token") {
+      if (request.method === "POST" && route === "/api/token") {
         const body = await readJsonBody(request);
         setTaskManagerToken(body.token || "");
         await refreshActiveAccount();
-        return sendJson(response, 200, statusPayload());
+        return sendJson(response, 200, await refreshedStatus());
       }
       sendJson(response, 404, { error: "not found" });
     } catch (error) {
       sendJson(response, 500, {
-        error: error instanceof Error ? error.message : String(error),
+        error: safeError(error),
       });
     }
   });
 
-  server.listen(PORT, HOST, () => {
-    console.error(`[codex-router] task-manager UI at http://127.0.0.1:${PORT}`);
+  server.listen(port, HOST, () => {
+    const address = server.address();
+    const boundPort = typeof address === "object" && address ? address.port : port;
+    console.error(`[codex-router] task-manager UI at http://127.0.0.1:${boundPort}`);
   });
 
   // Refresh the models.dev price snapshot in the background without delaying
   // startup. The panel keeps working on seed prices while this is in flight.
-  setTimeout(() => {
+  const pricingTimer = setTimeout(() => {
     syncModelsDevPricing()
       .then((result) => {
         if (result.ok) {
@@ -344,6 +479,8 @@ export function startTaskManagerUi() {
       })
       .catch(() => {});
   }, 5_000);
+  pricingTimer.unref();
+  server.once("close", () => clearTimeout(pricingTimer));
 
   return server;
 }

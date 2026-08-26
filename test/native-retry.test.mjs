@@ -74,6 +74,7 @@ function run(env) {
       KIMI_INTERNAL_KEY: INTERNAL_KEY,
       CODEX_ROUTER_SHOW_ALL_MODELS: "1",
       CODEX_ROUTER_QUIET: "1",
+      CODEX_ROUTER_TASK_MANAGER_STANDALONE: "1",
       ...env,
     },
     stdio: ["ignore", "ignore", "pipe"],
