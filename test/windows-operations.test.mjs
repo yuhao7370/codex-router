@@ -122,3 +122,16 @@ test("Windows refreshes managed Codex skills as a best-effort post-install step"
   assert.match(install, /\$SkillsExitCode\s*=\s*\$LASTEXITCODE/);
   assert.match(install, /Managed Codex skills could not be refreshed[\s\S]*the router is installed/);
 });
+
+test("full Windows disable and uninstall purge only Task Manager artifacts before Router removal", () => {
+  const source = readScript("codex-router.ps1");
+  for (const command of ["disable", "uninstall"]) {
+    const start = source.indexOf(`  "${command}" {`);
+    const end = source.indexOf("\n  }", start);
+    const branch = source.slice(start, end);
+    const purge = branch.indexOf('src\\task-manager-install.mjs" @("purge")');
+    const service = branch.indexOf('src\\service.mjs" @("uninstall")');
+    assert.ok(purge >= 0 && service > purge, `${command} must purge the manager before Router uninstall`);
+    assert.doesNotMatch(branch, /tray-service|win-unpacked|control-center/i);
+  }
+});

@@ -133,6 +133,26 @@ test("the Windows service preserves an explicit credential-free native proxy", (
   }
 });
 
+test("the Windows service persists standalone Task Manager mode only while its private marker is enabled", () => {
+  const testRoot = mkdtempSync(path.join(os.tmpdir(), "codex-router-manager-service-mode-"));
+  try {
+    const disabled = render("service-windows.mjs", "win32", testRoot);
+    assert.doesNotMatch(disabled, /CODEX_ROUTER_TASK_MANAGER_STANDALONE/);
+
+    const stateDir = windowsStateDir(testRoot);
+    mkdirSync(stateDir, { recursive: true });
+    writeFileSync(
+      path.join(stateDir, "task-manager-standalone.json"),
+      `${JSON.stringify({ version: 1, enabled: true })}\n`,
+      "utf8",
+    );
+    const enabled = render("service-windows.mjs", "win32", testRoot);
+    assert.match(enabled, /set "CODEX_ROUTER_TASK_MANAGER_STANDALONE=1"/);
+  } finally {
+    rmSync(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("background services preserve the Antigravity client secret", () => {
   const testRoot = mkdtempSync(path.join(os.tmpdir(), "codex-router-antigravity-service-"));
   const secret = "test-antigravity-client-secret";

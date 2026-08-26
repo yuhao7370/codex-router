@@ -245,6 +245,8 @@ $ServiceInstalled = $false
 $AdoptionPending = $false
 $ConfigWasEnabled = $false
 $ServiceWasInstalled = $false
+$TaskManagerInstalled = $false
+$TaskManagerWasInstalled = $false
 $TrayWasInstalled = $false
 Push-Location $ScriptDirectory
 
@@ -272,6 +274,10 @@ try {
     default { (Get-InstallerStateField @($ConfigManager, "status") "mode") -eq "router" }
   }
   $ServiceWasInstalled = (Get-InstallerStateField @("src\service.mjs", "status") "installed") -eq $true
+  if ($Target -eq "codex") {
+    $TaskManagerStatus = Get-InstallerStateField @("src\task-manager-install.mjs", "status") "manager"
+    $TaskManagerWasInstalled = $null -ne $TaskManagerStatus -and $TaskManagerStatus.installed -eq $true
+  }
   $TrayWasInstalled = (Get-InstallerStateField @("src\tray-service.mjs", "status") "installed") -eq $true
   if ($Target -eq "codex") {
     $CodexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME ".codex" }
@@ -453,7 +459,12 @@ try {
   if ($LASTEXITCODE -ne 0) { throw "$Target configuration update failed." }
   $AdoptionPending = $false
   $ServiceInstalled = $true
-  & node src/service.mjs install
+  if ($Target -eq "codex") {
+    & node src/task-manager-install.mjs install
+    if ($LASTEXITCODE -eq 0) { $TaskManagerInstalled = $true }
+  } else {
+    & node src/service.mjs install
+  }
   if ($LASTEXITCODE -ne 0) { throw "Background-service installation failed." }
   # Record before the health wait, not after. The manifest is provenance for
   # the install that just happened -- which checkout owns the state, and the
@@ -522,12 +533,36 @@ try {
     Write-Host "Installed the selected external model routes. Fully quit and reopen Codex."
   }
 } catch {
+  $InstallFailure = $_
+  $RollbackErrors = @()
   # Undo only what this run created. The router health wait can time out on a
   # cold-starting gateway with a large model set -- retryable, not broken -- and
   # tearing out a service and disabling a client config that were both working
   # before the run turns that into an unrouted machine.
+  if ($TaskManagerInstalled -and -not $TaskManagerWasInstalled) {
+    & node src/task-manager-install.mjs purge 2>$null | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+      $RollbackErrors += "the Task Manager artifacts created by this run could not be purged"
+    } else {
+      # Purge deliberately never restarts Router. Re-render without the marker
+      # and prove the embedded port plus Router health before any fresh Router
+      # service is removed below.
+      & node src/service.mjs install 2>$null | Out-Null
+      if ($LASTEXITCODE -ne 0) {
+        $RollbackErrors += "the embedded Router service could not be restored"
+      } else {
+        & node src/wait-health.mjs 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+          $RollbackErrors += "the restored embedded Router did not become healthy"
+        }
+      }
+    }
+  }
   if ($ServiceInstalled -and -not $ServiceWasInstalled) {
     & node src/service.mjs uninstall 2>$null | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+      $RollbackErrors += "the Router service created by this run could not be removed"
+    }
   }
   if ($ConfigEnabled) {
     if (-not $ConfigWasEnabled) {
@@ -536,7 +571,10 @@ try {
   } elseif ($AdoptionPending) {
     & node src/native-catalog-source.mjs clear-pending 2>$null | Out-Null
   }
-  throw
+  if ($RollbackErrors.Count) {
+    throw "Installation failed ($($InstallFailure.Exception.Message)) and rollback failed: $($RollbackErrors -join '; ')."
+  }
+  throw $InstallFailure
 } finally {
   Pop-Location
 }

@@ -867,10 +867,12 @@ switch ($Command) {
   "enable" { & (Join-Path $Root "install.ps1") -CheckoutInstall -Target $Target @Arguments }
   "disable" {
     Invoke-RouterNode "src\config-manager.mjs" @("disable")
+    Invoke-RouterNode "src\task-manager-install.mjs" @("purge")
     Invoke-RouterNode "src\service.mjs" @("uninstall")
   }
   "uninstall" {
     Invoke-RouterNode "src\config-manager.mjs" @("disable")
+    Invoke-RouterNode "src\task-manager-install.mjs" @("purge")
     Invoke-RouterNode "src\service.mjs" @("uninstall")
   }
   "update" {

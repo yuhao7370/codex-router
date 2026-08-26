@@ -555,12 +555,21 @@ test("task-manager preserves bridge status and exposes capability-safe nested co
   assert.match(handler, /action === "service"[\s\S]*?runTaskManagerService/);
   assert.match(handler, /action === "open"[\s\S]*?runTaskManagerOpen/);
   assert.match(source, /task-manager-service\.mjs/);
+  assert.match(source, /install:\s*"task-manager-install\.mjs"/);
+  assert.match(source, /uninstall:\s*"task-manager-install\.mjs"/);
+  for (const action of ["status", "start", "stop", "restart"]) {
+    assert.match(source, new RegExp(`${action}:\\s*"task-manager-service\\.mjs"`));
+  }
   assert.match(source, /handleTaskManager\(args\[1\], args\[2\], args\.slice\(3\)\)/);
 });
 
 test("task-manager service rejects unsupported actions and surplus arguments", () => {
   for (const childArgs of [
-    ["task-manager", "service", "install"],
+    ["task-manager", "service", "purge"],
+    ["task-manager", "service", "render"],
+    ["task-manager", "service", "remove"],
+    ["task-manager", "service", "install", "unexpected"],
+    ["task-manager", "service", "uninstall", "unexpected"],
     ["task-manager", "service", "status", "unexpected"],
   ]) {
     const result = spawnSync(process.execPath, [path.join(root, "src", "control.mjs"), ...childArgs], {
@@ -573,7 +582,7 @@ test("task-manager service rejects unsupported actions and surplus arguments", (
       },
     });
     assert.notEqual(result.status, 0, childArgs.join(" "));
-    assert.match(result.stderr, /task-manager service status\|start\|stop\|restart/);
+    assert.match(result.stderr, /task-manager service install\|uninstall\|status\|start\|stop\|restart/);
   }
 });
 

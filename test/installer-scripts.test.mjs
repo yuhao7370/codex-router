@@ -646,6 +646,7 @@ test("installer rollback undoes only what the run created", () => {
   );
   assert.match(windows, /\$ConfigWasEnabled\s*=/);
   assert.match(windows, /\$ServiceWasInstalled\s*=/);
+  assert.match(windows, /\$TaskManagerWasInstalled\s*=/);
 
   // ...and both teardowns must be gated on it.
   assert.match(
@@ -654,7 +655,34 @@ test("installer rollback undoes only what the run created", () => {
   );
   assert.match(posix, /\[ "\$config_was_enabled" != true \]/);
   assert.match(windows, /\$ServiceInstalled -and -not \$ServiceWasInstalled/);
+  assert.match(windows, /\$TaskManagerInstalled -and -not \$TaskManagerWasInstalled/);
   assert.match(windows, /-not \$ConfigWasEnabled/);
+});
+
+test("the Windows Codex installer commits the Task Manager transaction and restores embedded health on rollback", () => {
+  const windows = readScript("install.ps1");
+  const transaction = windows.indexOf("src/task-manager-install.mjs install");
+  const legacyServiceInstall = windows.indexOf("src/service.mjs install", transaction);
+  const success = windows.indexOf("Installed the selected external model routes.");
+  assert.ok(transaction >= 0, "the Windows Codex path must call the manager transaction");
+  assert.ok(legacyServiceInstall > transaction, "other targets must retain the low-level Router install arm");
+  assert.ok(success > transaction, "success output must follow the committed manager transaction");
+  assert.match(
+    windows,
+    /if \(\$Target -eq "codex"\) \{\s*& node src\/task-manager-install\.mjs install[\s\S]*?\} else \{\s*& node src\/service\.mjs install/,
+  );
+
+  const rollbackStart = windows.indexOf("# Undo only what this run created");
+  const rollbackEnd = windows.indexOf("} finally {", rollbackStart);
+  const rollback = windows.slice(rollbackStart, rollbackEnd);
+  const purge = rollback.indexOf("src/task-manager-install.mjs purge");
+  const embeddedInstall = rollback.indexOf("src/service.mjs install", purge);
+  const embeddedHealth = rollback.indexOf("src/wait-health.mjs", embeddedInstall);
+  assert.match(rollback, /\$TaskManagerInstalled -and -not \$TaskManagerWasInstalled/);
+  assert.ok(purge >= 0, "rollback must purge only a manager created by this run");
+  assert.ok(embeddedInstall > purge, "purge must be followed by an embedded Router reinstall");
+  assert.ok(embeddedHealth > embeddedInstall, "rollback must prove the restored embedded Router healthy");
+  assert.match(rollback, /Installation failed[\s\S]*rollback failed/);
 });
 
 // The manifest names the checkout that owns the generated state, and the

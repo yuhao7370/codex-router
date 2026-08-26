@@ -2737,12 +2737,26 @@ function runTaskManagerChild(script, childArgs) {
   }
 }
 
+const TASK_MANAGER_SERVICE_COMMANDS = Object.freeze({
+  install: "task-manager-install.mjs",
+  uninstall: "task-manager-install.mjs",
+  status: "task-manager-service.mjs",
+  start: "task-manager-service.mjs",
+  stop: "task-manager-service.mjs",
+  restart: "task-manager-service.mjs",
+});
+
 function runTaskManagerService(action) {
   const serviceAction = action || "status";
-  if (!SERVICE_COMMANDS.includes(serviceAction)) {
-    throw new Error(`Usage: control task-manager service ${SERVICE_COMMANDS.join("|")}`);
+  const script = Object.hasOwn(TASK_MANAGER_SERVICE_COMMANDS, serviceAction)
+    ? TASK_MANAGER_SERVICE_COMMANDS[serviceAction]
+    : undefined;
+  if (!script) {
+    throw new Error(
+      `Usage: control task-manager service ${Object.keys(TASK_MANAGER_SERVICE_COMMANDS).join("|")}`,
+    );
   }
-  runTaskManagerChild("task-manager-service.mjs", [serviceAction]);
+  runTaskManagerChild(script, [serviceAction]);
 }
 
 function runTaskManagerOpen(openArgs) {
@@ -2752,7 +2766,9 @@ function runTaskManagerOpen(openArgs) {
 async function handleTaskManager(action, value, rest = []) {
   if (action === "service") {
     if (rest.length) {
-      throw new Error(`Usage: control task-manager service ${SERVICE_COMMANDS.join("|")}`);
+      throw new Error(
+        `Usage: control task-manager service ${Object.keys(TASK_MANAGER_SERVICE_COMMANDS).join("|")}`,
+      );
     }
     runTaskManagerService(value || "status");
     return;
@@ -2807,7 +2823,7 @@ async function handleTaskManager(action, value, rest = []) {
     return;
   }
   throw new Error(
-    "Usage: control task-manager status|enable|disable|port <1-65535>|token <value|clear>|test|accounts|select <id>|service status|start|stop|restart|open [--print]",
+    "Usage: control task-manager status|enable|disable|port <1-65535>|token <value|clear>|test|accounts|select <id>|service install|uninstall|status|start|stop|restart|open [--print]",
   );
 }
 
