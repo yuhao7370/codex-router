@@ -1,5 +1,5 @@
-import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, statSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { existsSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
@@ -8,12 +8,18 @@ import {
   grokCliPath,
   grokCliPreflight,
 } from "./grok-cli.mjs";
-import { cliSessionPath, cliSessionStatus } from "./cli-session-credential.mjs";
+import { devinCliStatus } from "./devin-cli-status.mjs";
 import { grokOAuthStatus } from "./grok-oauth-status.mjs";
+import { antigravityOAuthStatus } from "./antigravity-oauth-status.mjs";
+import { removeAntigravityToken } from "./antigravity-oauth-session.mjs";
 import { KIMI_CLI_NPM_PACKAGE } from "./kimi-oauth-onboarding.mjs";
-import { MODELS, PROVIDERS } from "./model-registry.mjs";
+import { MODELS, PROVIDERS, providerNeedsNoKey } from "./model-registry.mjs";
+import {
+  forgetProviderCatalogFamilyCache,
+  providerCatalogSources,
+} from "./provider-catalogs.mjs";
+import { curationProviderIds } from "./opencode-curation.mjs";
 import { kimiOAuthStatus } from "./oauth-status.mjs";
-import { STATE_DIR } from "./paths.mjs";
 import {
   apiProvider,
   credentialLabel,
@@ -22,6 +28,12 @@ import {
   writeProviderCredential,
 } from "./provider-credentials.mjs";
 import { disableProvider } from "./provider-selection.mjs";
+import {
+  npmGlobalBinary,
+  npmInstallGlobal,
+  spawnEnvironment,
+} from "./npm-global-install.mjs";
+import { commandOnPath, spawnableCommand } from "./spawnable-command.mjs";
 
 const SIGN_IN_CLIS = Object.freeze({
   "kimi-oauth": {
@@ -35,73 +47,24 @@ const SIGN_IN_CLIS = Object.freeze({
     npmPackage: "@xai-official/grok",
     loginArgs: ["login", "--oauth"],
   },
-  // Command Code ships `cmd`, `cmdc`, `commandcode`, and `command-code` from
-  // one package. Only `command-code` is unambiguous everywhere — `cmd` is the
-  // Windows shell — so the tray always drives that name.
-  commandcode: {
-    executable: "command-code",
-    npmPackage: "command-code",
-    loginArgs: ["login"],
-    candidates: [path.join(os.homedir(), ".npm-global", "bin", "command-code")],
-    // `command-code login` draws an Ink interface and puts stdin in raw mode,
-    // which a piped stdio pair cannot provide: spawned from the tray it dies
-    // on "Raw mode is not supported" before it ever opens the browser. It has
-    // to be handed a real terminal.
+  // Devin ships no npm package: it is a Rust binary installed by Cognition's
+  // own script or Homebrew cask. `installCommand` is what the tray offers
+  // instead of an npm install it cannot perform.
+  "devin-cli": {
+    executable: "devin",
+    loginArgs: ["auth", "login"],
+    candidates: [path.join(os.homedir(), ".local", "bin", "devin")],
+    installCommand: "curl -fsSL https://cli.devin.ai/install.sh | bash",
+    // `devin auth login` draws a full-screen terminal interface, so a piped
+    // stdio pair kills it before it opens the browser.
     needsTerminal: true,
   },
 });
 
-// Resolved at most once per process: the tray refreshes its provider snapshot
-// on a timer, and an npm spawn per unconfigured provider per refresh would be
-// felt. `undefined` is a real answer here, so the miss is cached too.
-let npmGlobalBinDir;
-function npmGlobalBinary(executable) {
-  if (npmGlobalBinDir === undefined) {
-    npmGlobalBinDir = readNpmGlobalBinDir() ?? "";
-  }
-  if (!npmGlobalBinDir) return undefined;
-  const candidate = path.join(npmGlobalBinDir, executable);
-  return existsSync(candidate) ? candidate : undefined;
-}
-
-function readNpmGlobalBinDir() {
-  const npm = npmPath();
-  if (!npm) return undefined;
-  try {
-    const prefix = execFileSync(npm, ["prefix", "-g"], {
-      encoding: "utf8",
-      env: spawnEnvironment(),
-      timeout: 15_000,
-      stdio: ["ignore", "pipe", "ignore"],
-    }).trim();
-    if (!prefix) return undefined;
-    // npm drops binaries straight into the prefix on Windows and into
-    // prefix/bin everywhere else.
-    return process.platform === "win32" ? prefix : path.join(prefix, "bin");
-  } catch {
-    return undefined;
-  }
-}
-
 function commandPath(name) {
-  const finder = process.platform === "win32" ? "where.exe" : "which";
-  try {
-    return execFileSync(finder, [name], {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-    })
-      .trim()
-      .split(/\r?\n/)[0];
-  } catch {
-    return undefined;
-  }
-}
-
-// A registry entry can declare a CLI session before anyone teaches this module
-// how to install and run that CLI. Callers check first so the missing half
-// degrades to "key only" instead of throwing mid-install.
-export function hasSignInCli(providerId) {
-  return Object.hasOwn(SIGN_IN_CLIS, providerId);
+  // Not the finder's first line: on Windows that is the extensionless npm
+  // shim, and every caller here goes on to spawn what it gets back.
+  return commandOnPath(name);
 }
 
 export function oauthCliPath(providerId) {
@@ -127,8 +90,9 @@ export function oauthLoginArgs(providerId) {
 function oauthConfigured(providerId) {
   if (providerId === "kimi-oauth") return kimiOAuthStatus().configured;
   if (providerId === "grok-oauth") return grokOAuthStatus().configured;
-  const provider = PROVIDERS.get(providerId);
-  return provider ? cliSessionStatus(provider).configured : false;
+  if (providerId === "antigravity-oauth") return antigravityOAuthStatus().configured;
+  if (providerId === "devin-cli") return devinCliStatus().configured;
+  return false;
 }
 
 export function providerOnboardingSnapshot() {
@@ -137,7 +101,28 @@ export function providerOnboardingSnapshot() {
   const selectable = [...PROVIDERS.values()].filter((provider) => !provider.variantOf);
   return {
     providers: selectable.map((provider) => {
+      const catalogSources = providerCatalogSources(provider.id);
       if (provider.kind === "oauth") {
+        // Antigravity has no vendor CLI to install or reuse: its sign-in is
+        // this router's own browser OAuth flow.
+        if (provider.id === "antigravity-oauth") {
+          const status = antigravityOAuthStatus();
+          const configured = status.configured;
+          return {
+            id: provider.id,
+            displayName: provider.displayName,
+            kind: "oauth",
+            credentialLabel: "OAuth session",
+            configured,
+            // A rejected or damaged session is not configured, but its
+            // router-managed file must remain removable from every UI.
+            disconnectable: status.credentialPresent,
+            cliInstalled: true,
+            cliRunnable: true,
+            action: configured ? "ready" : "login",
+            ...(catalogSources.length ? { catalogSources } : {}),
+          };
+        }
         const cliPath = oauthCliPath(provider.id);
         const cli = provider.id === "grok-oauth"
           ? grokCliPreflight({ executable: cliPath })
@@ -158,9 +143,12 @@ export function providerOnboardingSnapshot() {
               : configured
                 ? "ready"
                 : "login",
+          ...(catalogSources.length ? { catalogSources } : {}),
         };
       }
-      const configured = credentialStatus(provider, { persistent: true }).configured;
+      const configured = providerNeedsNoKey(provider)
+        ? true
+        : credentialStatus(provider, { persistent: true }).configured;
       const entry = {
         id: provider.id,
         displayName: provider.displayName,
@@ -168,24 +156,31 @@ export function providerOnboardingSnapshot() {
         ...(provider.credential?.label ? { credentialLabel: credentialLabel(provider) } : {}),
         configured,
         action: configured ? "ready" : "add-key",
+        ...(catalogSources.length ? { catalogSources } : {}),
         // Carried to the tray so the plan requirement is visible at the
         // moment someone decides to connect, not after Codex 403s.
         ...(provider.planNote ? { planNote: provider.planNote } : {}),
       };
-      // A provider whose CLI mints its key through a browser sign-in keeps the
-      // key field (people with a Studio key still paste it) and gains a second
-      // route. The tray needs both states to label the row honestly: whether
-      // the CLI is present, and whether the key in play came from the session.
-      const session = cliSessionStatus(provider);
-      if (!session.supported || !hasSignInCli(provider.id)) return entry;
-      const cliInstalled = Boolean(oauthCliPath(provider.id));
-      return {
-        ...entry,
-        signIn: true,
-        signedIn: session.configured,
-        cliInstalled,
-        signInAction: !cliInstalled ? "install" : session.configured ? "ready" : "login",
-      };
+      // A container has no key field of its own. Saying so is the whole card:
+      // an "Add Key" button here would store a secret nothing ever reads.
+      if (provider.authMode === "per-model") {
+        entry.kind = "per-model";
+        entry.action = "per-model";
+        entry.credentialLabel = "Per-model endpoints";
+        entry.perModelNote =
+          "Each model here names its own endpoint and its own auth. Enabling this provider costs nothing.";
+        return entry;
+      }
+      if (provider.authMode === "anonymous") {
+        entry.kind = "anonymous";
+        // Guided setup pre-checks every `ready` row. An off-box endpoint must
+        // be chosen explicitly even though it needs no API key.
+        entry.action = "anonymous";
+        entry.credentialLabel = "No API key";
+        entry.anonymousNote = provider.anonymousNote;
+        return entry;
+      }
+      return entry;
     }),
   };
 }
@@ -196,37 +191,6 @@ export function providerOnboardingSnapshot() {
 // `env: node: No such file or directory` behind a generic "could not install".
 // Whatever node is running this file is by definition a working one, so put
 // its directory in front for the child.
-function spawnEnvironment() {
-  const nodeDir = path.dirname(process.execPath);
-  const existing = process.env.PATH || "";
-  if (existing.split(path.delimiter).includes(nodeDir)) return process.env;
-  return { ...process.env, PATH: existing ? `${nodeDir}${path.delimiter}${existing}` : nodeDir };
-}
-
-function npmPath() {
-  const discovered = commandPath("npm");
-  if (discovered) return discovered;
-  const candidates = [
-    path.join(os.homedir(), ".npm-global", "bin", "npm"),
-    path.join(os.homedir(), ".local", "bin", "npm"),
-    "/opt/homebrew/bin/npm",
-    "/usr/local/bin/npm",
-  ];
-  return candidates.find((candidate) => existsSync(candidate));
-}
-
-// npm prints its diagnosis over several lines and ends with log-file paths
-// that mean nothing in a tray dialog; the last real line is the useful one.
-function installFailureDetail(result) {
-  if (result.error) return result.error.message;
-  const lines = `${result.stderr || ""}`
-    .split(/\r?\n/)
-    .map((line) => line.replace(/^npm (error|ERR!)\s*/i, "").trim())
-    .filter((line) => line && !/^[A-Za-z]?:?[\\/].*\.log$/.test(line));
-  const detail = lines[lines.length - 1];
-  return detail ? `npm said: ${detail}` : `npm exited with status ${result.status}.`;
-}
-
 export function installOauthCli(providerId) {
   const cli = SIGN_IN_CLIS[providerId];
   if (!cli) throw new Error(`Unknown OAuth provider: ${providerId}`);
@@ -239,20 +203,15 @@ export function installOauthCli(providerId) {
   } else if (oauthCliPath(providerId)) {
     return;
   }
-  const npm = npmPath();
-  if (!npm) throw new Error("Node.js and npm are required to install this provider CLI.");
-  const result = spawnSync(npm, ["install", "-g", cli.npmPackage], {
-    encoding: "utf8",
-    env: spawnEnvironment(),
-  });
-  if (result.error || result.status !== 0) {
-    // The reason matters more than the fact: "EACCES on /usr/local/lib" and
-    // "network unreachable" need opposite fixes, and a bare "could not
-    // install" sent the last one of these into a debugging session.
+  // Not every official CLI is an npm package. Naming the vendor's own
+  // installer is honest; running it unattended from the tray would fetch and
+  // execute a remote script the operator never saw.
+  if (!cli.npmPackage) {
     throw new Error(
-      `Could not install the official ${cli.executable} CLI. ${installFailureDetail(result)}`.trim(),
+      `The ${cli.executable} CLI is not installed and is not distributed through npm. Install it with: ${cli.installCommand}`,
     );
   }
+  npmInstallGlobal(cli.npmPackage, { label: `the official ${cli.executable} CLI` });
   if (providerId === "grok-oauth") {
     const preflight = grokCliPreflight();
     if (!preflight.runnable) throw new Error(grokCliFailureMessage(preflight));
@@ -269,87 +228,30 @@ export function installOauthCli(providerId) {
 // in, and authorize — but it must not be able to wedge the tray forever if the
 // CLI waits on a terminal it will never get.
 const LOGIN_TIMEOUT_MS = 10 * 60_000;
-const TERMINAL_LOGIN_TIMEOUT_MS = 3 * 60_000;
-const POLL_INTERVAL_MS = 1_500;
-const WAIT_HANDLE = new Int32Array(new SharedArrayBuffer(4));
 
-// Hands the CLI a real terminal window and waits for the credential it writes.
-// The tray has no terminal to lend, and a login this router cannot see the end
-// of is a login the operator would have to come back and repeat.
-// Reconnecting starts from an already-valid session, so "is it configured?"
-// is true before the operator has done anything. Waiting for the CLI to
-// rewrite the file is what actually distinguishes a finished sign-in.
-function sessionWrittenAt(providerId) {
-  const file = cliSessionPath(PROVIDERS.get(providerId));
-  if (!file || !existsSync(file)) return 0;
-  try {
-    return statSync(file).mtimeMs;
-  } catch {
-    return 0;
+export async function loginOauthProvider(providerId) {
+  if (providerId === "antigravity-oauth") {
+    const { signInAntigravity } = await import("./antigravity-oauth-onboarding.mjs");
+    await signInAntigravity();
+    if (!oauthConfigured(providerId)) {
+      throw new Error("Sign-in finished without a usable Antigravity OAuth session. Please try again.");
+    }
+    if (providerCatalogSources(providerId).length) {
+      await forgetProviderCatalogFamilyCache(providerId);
+    }
+    return;
   }
-}
-
-function signedInSince(providerId, before) {
-  return sessionWrittenAt(providerId) > before && oauthConfigured(providerId);
-}
-
-function signInThroughTerminal(providerId, executable) {
-  const cli = SIGN_IN_CLIS[providerId];
-  const before = sessionWrittenAt(providerId);
-  // Terminal.app rather than the operator's preferred terminal: it is always
-  // present, and `open -a` needs no Automation consent the way driving a
-  // specific app with AppleScript would. The override exists so tests (and
-  // anyone whose environment cannot use `open`) can point at another launcher —
-  // which is also the only way this route works off macOS, where there is no
-  // `open -a Terminal` to fall back to.
-  const launcher = process.env.MODEL_ROUTER_TERMINAL_LAUNCHER;
-  if (process.platform !== "darwin" && !launcher) {
-    throw new Error(
-      `${cli.executable} signs in through an interactive terminal. Run \`${cli.executable} ${cli.loginArgs.join(" ")}\` in one, then reopen this.`,
-    );
-  }
-  mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
-  const script = path.join(STATE_DIR, `sign-in-${providerId}.command`);
-  const quoted = [executable, ...cli.loginArgs]
-    .map((part) => `'${part.replaceAll("'", "'\\''")}'`)
-    .join(" ");
-  writeFileSync(script, `#!/bin/sh\nexec ${quoted}\n`, { encoding: "utf8", mode: 0o700 });
-  const opened = launcher
-    ? spawnSync(launcher, [script], { encoding: "utf8", env: spawnEnvironment() })
-    : spawnSync("/usr/bin/open", ["-a", "Terminal", script], {
-        encoding: "utf8",
-        env: spawnEnvironment(),
-      });
-  if (opened.error || opened.status !== 0) {
-    throw new Error(`Could not open Terminal to run ${cli.executable}.`);
-  }
-  const deadline = Date.now() + TERMINAL_LOGIN_TIMEOUT_MS;
-  while (Date.now() < deadline) {
-    if (signedInSince(providerId, before)) return;
-    // A short blocking sleep: this runs in the one-shot control process the
-    // tray spawned, which has nothing else to do while the operator signs in.
-    Atomics.wait(WAIT_HANDLE, 0, 0, POLL_INTERVAL_MS);
-  }
-  throw new Error(
-    `Still waiting on ${cli.executable} in the Terminal window. Finish signing in there — the tray picks it up on its own.`,
-  );
-}
-
-export function loginOauthProvider(providerId) {
   const executable = oauthCliPath(providerId);
   if (!executable) throw new Error("Install the provider CLI before signing in.");
   if (providerId === "grok-oauth") {
     const preflight = grokCliPreflight({ executable });
     if (!preflight.runnable) throw new Error(grokCliFailureMessage(preflight));
   }
-  // With a terminal of our own (guided setup) the CLI can simply inherit it.
-  if (SIGN_IN_CLIS[providerId].needsTerminal && !process.stdin.isTTY) {
-    signInThroughTerminal(providerId, executable);
-    return;
-  }
   // The CLI itself is another `#!/usr/bin/env node` script, so signing in needs
   // the same PATH repair the install did.
-  const result = spawnSync(executable, oauthLoginArgs(providerId), {
+  const login = spawnableCommand(executable, oauthLoginArgs(providerId));
+  const result = spawnSync(login.command, login.args, {
+    ...login.options,
     encoding: "utf8",
     env: spawnEnvironment(),
     timeout: LOGIN_TIMEOUT_MS,
@@ -371,6 +273,9 @@ export function loginOauthProvider(providerId) {
   if (!oauthConfigured(providerId)) {
     throw new Error("Sign-in finished without a usable OAuth session. Please try again.");
   }
+  if (providerCatalogSources(providerId).length) {
+    await forgetProviderCatalogFamilyCache(providerId);
+  }
 }
 
 export function saveApiCredential(providerId, value) {
@@ -379,8 +284,23 @@ export function saveApiCredential(providerId, value) {
 
 // Deleting the managed key files cannot reach a key that also lives in the
 // macOS Keychain or the environment, so report what still resolves afterwards
-// instead of claiming the provider is disconnected.
-export function removeApiCredential(providerId) {
+// instead of claiming the credential itself is gone.
+export async function removeApiCredential(providerId) {
+  if (providerId === "antigravity-oauth") {
+    const provider = PROVIDERS.get(providerId);
+    const removedFiles = (await removeAntigravityToken()) ? 1 : 0;
+    // Disconnect is also a routing decision. Withdraw the provider even when
+    // the credential vanished between the snapshot and this action.
+    disableProvider(providerId);
+    const remaining = antigravityOAuthStatus();
+    return {
+      provider: providerId,
+      displayName: provider?.displayName || "Google Antigravity OAuth",
+      removedFiles,
+      stillConfigured: remaining.configured === true,
+      remainingSource: remaining.configured ? remaining.source : undefined,
+    };
+  }
   const provider = apiProvider(providerId);
   const removedFiles = removeProviderCredential(provider);
   if (removedFiles) disableProvider(provider.id);
@@ -399,5 +319,6 @@ export function removeApiCredential(providerId) {
 // use this to name the curation step instead of reporting a provider that
 // looks enabled but shows nothing.
 export function providerNeedsCuration(providerId, models = MODELS) {
-  return !models.some((model) => model.provider === providerId);
+  const providers = new Set(curationProviderIds(providerId));
+  return !models.some((model) => providers.has(model.provider));
 }

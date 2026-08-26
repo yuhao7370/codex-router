@@ -20,6 +20,24 @@ import {
   STATE_DIR,
   TARGET,
 } from "./paths.mjs";
+import { antigravityClientSecretEnvironment } from "./antigravity-oauth-constants.mjs";
+import { serviceProxyEnvironment } from "./proxy-environment.mjs";
+import {
+  skipServiceManagerCall,
+  assertServiceWriteIsolated,
+} from "./service-write-guard.mjs";
+
+// Only this platform's own module can reach this machine's service manager.
+// Run anywhere else -- the cross-platform render tests drive all three modules
+// on one host -- launchctl is absent or a test's own stub.
+const HOST_MANAGED = process.platform === "darwin";
+
+// Reads stay live. Skipping `print` as well made `loaded()` answer "nothing is
+// there" for every caller, which changed what the doctor reports about the
+// service and, through it, what else the doctor goes on to do -- CI caught
+// that as two unrelated Windows tests failing on their own cleanup. Only the
+// verbs that change launchd's registration are skipped.
+const MUTATING_VERBS = new Set(["bootout", "bootstrap", "disable", "enable", "kickstart"]);
 
 const command = process.argv[2] || "status";
 const effectivePlatform = process.env.CODEX_ROUTER_SERVICE_PLATFORM || process.platform;
@@ -55,6 +73,9 @@ function environmentEntries() {
     MODEL_ROUTER_OAUTH_PORT: String(PORTS.oauth),
     MODEL_ROUTER_PORT: String(PORTS.router),
     MODEL_ROUTER_API_PORT: String(PORTS.api),
+    MODEL_ROUTER_GROK_OAUTH_PORT: String(PORTS.grokOauth),
+    MODEL_ROUTER_DEVIN_CLI_PORT: String(PORTS.devinCli),
+    MODEL_ROUTER_ANTIGRAVITY_OAUTH_PORT: String(PORTS.antigravityOauth),
     CODEX_HOME,
     CODEX_ROUTER_STATE_DIR: STATE_DIR,
     KIMI_CODEX_STATE_DIR: STATE_DIR,
@@ -64,6 +85,8 @@ function environmentEntries() {
     CODEX_ROUTER_OAUTH_PORT: String(PORTS.oauth),
     CODEX_ROUTER_PORT: String(PORTS.router),
     CODEX_ROUTER_API_PORT: String(PORTS.api),
+    ...serviceProxyEnvironment(),
+    ...antigravityClientSecretEnvironment(),
     ...(process.env.CODEX_ROUTER_SOURCE_ROOT
       ? { CODEX_ROUTER_SOURCE_ROOT: SOURCE_ROOT }
       : {}),
@@ -116,7 +139,11 @@ ${environmentEntries()}
 `;
 }
 
+
 function run(args, options = {}) {
+  if (MUTATING_VERBS.has(args[0]) && skipServiceManagerCall({ hostManaged: HOST_MANAGED })) {
+    return "";
+  }
   return execFileSync(launchctl, args, {
     encoding: "utf8",
     timeout: 15_000,
@@ -136,6 +163,9 @@ function loaded(targetService = service) {
 }
 
 function bootout(targetService = service) {
+  // Before `loaded`, not after: the loop below polls until the job is gone,
+  // and the job it would see is this machine's own.
+  if (skipServiceManagerCall({ hostManaged: HOST_MANAGED })) return;
   const description = loaded(targetService);
   if (!description) return;
   try {
@@ -153,16 +183,28 @@ function bootout(targetService = service) {
   }
 }
 
+const guardPlistWrite = () => assertServiceWriteIsolated(LAUNCH_AGENT_PATH, {
+  redirected: Boolean(
+    process.env.MODEL_ROUTER_LAUNCH_AGENTS_DIR || process.env.CODEX_ROUTER_LAUNCH_AGENTS_DIR,
+  ),
+  label: "LaunchAgent",
+  override: "MODEL_ROUTER_LAUNCH_AGENTS_DIR",
+});
+
 function writePlist() {
+  guardPlistWrite();
   mkdirSync(path.dirname(LAUNCH_AGENT_PATH), { recursive: true });
   mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
   const temporary = `${LAUNCH_AGENT_PATH}.tmp.${process.pid}`;
-  writeFileSync(temporary, plist(), { encoding: "utf8", mode: 0o644 });
-  chmodSync(temporary, 0o644);
+  // Proxy URLs may carry credentials, so the generated plist is private just
+  // like the state it launches with.
+  writeFileSync(temporary, plist(), { encoding: "utf8", mode: 0o600 });
+  chmodSync(temporary, 0o600);
   renameSync(temporary, LAUNCH_AGENT_PATH);
 }
 
 function bootstrap() {
+  if (skipServiceManagerCall({ hostManaged: HOST_MANAGED })) return;
   if (!existsSync(LAUNCH_AGENT_PATH)) {
     throw new Error(`LaunchAgent is not installed at ${LAUNCH_AGENT_PATH}.`);
   }
@@ -202,6 +244,11 @@ if (command === "render") {
     })}\n`,
   );
 } else if (command === "install") {
+  // Before anything, including the bootout below: an install that is going to
+  // be refused for writing outside its fixture must not first unload the
+  // machine's running service. writePlist re-checks; the guard is a pure
+  // predicate.
+  guardPlistWrite();
   bootout();
   // Only safe here. launchd opens StandardOutPath before it execs the service,
   // so a rotation performed by the started process renames a file the process
@@ -220,6 +267,9 @@ if (command === "render") {
   } catch {
     // Best effort.
   }
+  // Removal damages the machine exactly as a write does: the observed failure
+  // included a test deleting the real LaunchAgent outright.
+  guardPlistWrite();
   if (existsSync(LAUNCH_AGENT_PATH)) unlinkSync(LAUNCH_AGENT_PATH);
   process.stdout.write(`${JSON.stringify({ installed: false })}\n`);
 } else if (command === "stop") {

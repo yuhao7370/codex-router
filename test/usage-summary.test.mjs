@@ -28,6 +28,8 @@ const events = [
     inputTokens: 300,
     outputTokens: 50,
     totalTokens: 350,
+    billedInputTokens: 450,
+    billedOutputTokens: 90,
   },
   {
     meteringVersion: 1,
@@ -59,6 +61,16 @@ const events = [
     inputTokens: 80,
     outputTokens: 20,
     totalTokens: 100,
+  },
+  {
+    meteringVersion: 1,
+    at: "2026-07-19T13:00:00Z",
+    provider: "retired-provider",
+    model: "retired/model",
+    status: 200,
+    inputTokens: 12,
+    outputTokens: 3,
+    totalTokens: 15,
   },
 ];
 
@@ -120,7 +132,7 @@ test("summary rebuilds from the raw event log", async () => {
   );
   assert.equal(
     snapshot.providers.find((provider) => provider.id === "openai").totalTokens,
-    2518,
+    2708,
   );
 });
 

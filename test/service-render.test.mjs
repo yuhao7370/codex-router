@@ -7,6 +7,7 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
+  statSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -92,14 +93,15 @@ test("background service definitions render for macOS, Linux, and Windows", () =
     assert.match(systemd, /ExecStart=/);
     assert.match(systemd, /Environment="PATH=/);
     assert.match(systemd, /Environment="CODEX_ROUTER_STATE_DIR=/);
+    assert.match(systemd, /MODEL_ROUTER_GATEWAY_PORT=4200/);
+    assert.match(systemd, /MODEL_ROUTER_OAUTH_PORT=4201/);
+    assert.match(systemd, /MODEL_ROUTER_PORT=4202/);
+    assert.match(systemd, /MODEL_ROUTER_API_PORT=4203/);
 
     const windows = render("service-windows.mjs", "win32", testRoot);
     assert.match(windows, /@echo off\r?\n/);
     assert.match(windows, /set "CODEX_ROUTER_STATE_DIR=/);
-    assert.match(
-      windows,
-      /set "CODEX_ROUTER_NATIVE_PROXY_URL=http:\/\/127\.0\.0\.1:7897"/,
-    );
+    assert.match(windows, /set "CODEX_ROUTER_NATIVE_PROXY_URL=http:\/\/127\.0\.0\.1:7897"/);
     assert.match(windows, /set "CODEX_ROUTER_NATIVE_RETRIES=20"/);
     assert.match(windows, /set "CODEX_ROUTER_NATIVE_RETRY_BACKOFF_MS=100"/);
     assert.match(windows, /set "CODEX_ROUTER_NATIVE_RETRY_BUDGET_MS=60000"/);
@@ -125,10 +127,92 @@ test("the Windows service preserves an explicit credential-free native proxy", (
       root,
       { CODEX_ROUTER_NATIVE_PROXY_URL: "http://proxy.internal:7897" },
     );
-    assert.match(
-      windows,
-      /set "CODEX_ROUTER_NATIVE_PROXY_URL=http:\/\/proxy\.internal:7897"/,
+    assert.match(windows, /set "CODEX_ROUTER_NATIVE_PROXY_URL=http:\/\/proxy\.internal:7897"/);
+  } finally {
+    rmSync(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("background services preserve the Antigravity client secret", () => {
+  const testRoot = mkdtempSync(path.join(os.tmpdir(), "codex-router-antigravity-service-"));
+  const secret = "test-antigravity-client-secret";
+  try {
+    const launchd = serviceCommand(
+      "service-macos.mjs", "darwin", testRoot, "render", "codex", root,
+      { ANTIGRAVITY_CLIENT_SECRET: secret },
     );
+    assert.match(launchd, new RegExp(`<key>ANTIGRAVITY_CLIENT_SECRET</key>\\s*<string>${secret}</string>`));
+
+    const systemd = serviceCommand(
+      "service-linux.mjs", "linux", testRoot, "render", "codex", root,
+      { ANTIGRAVITY_CLIENT_SECRET: secret },
+    );
+    assert.match(systemd, new RegExp(`Environment="ANTIGRAVITY_CLIENT_SECRET=${secret}"`));
+
+    const windows = serviceCommand(
+      "service-windows.mjs", "win32", testRoot, "render", "codex", root,
+      { ANTIGRAVITY_CLIENT_SECRET: secret },
+    );
+    assert.match(windows, new RegExp(`set "ANTIGRAVITY_CLIENT_SECRET=${secret}"`));
+  } finally {
+    rmSync(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("background services preserve the installer's proxy environment", () => {
+  const testRoot = mkdtempSync(path.join(os.tmpdir(), "codex-router-service-proxy-"));
+  const proxyEnvironment = {
+    http_proxy: "http://proxy.example:8080",
+    HTTPS_PROXY: "http://secure-proxy.example:8443",
+    all_proxy: "socks5://proxy.example:1080",
+    NO_PROXY: "localhost,127.0.0.1,::1",
+    NODE_USE_ENV_PROXY: "1",
+  };
+  try {
+    const launchd = serviceCommand(
+      "service-macos.mjs",
+      "darwin",
+      testRoot,
+      "render",
+      "codex",
+      root,
+      proxyEnvironment,
+    );
+    const systemd = serviceCommand(
+      "service-linux.mjs",
+      "linux",
+      testRoot,
+      "render",
+      "codex",
+      root,
+      proxyEnvironment,
+    );
+    const windows = serviceCommand(
+      "service-windows.mjs",
+      "win32",
+      testRoot,
+      "render",
+      "codex",
+      root,
+      proxyEnvironment,
+    );
+
+    for (const [name, value] of Object.entries(proxyEnvironment)) {
+      assert.ok(
+        launchd.includes(
+          `<key>${launchdXml(name)}</key>\n    <string>${launchdXml(value)}</string>`,
+        ),
+        `launchd did not preserve ${name}`,
+      );
+      assert.ok(
+        systemd.includes(`Environment=${systemdQuoted(`${name}=${value}`)}`),
+        `systemd did not preserve ${name}`,
+      );
+      assert.ok(
+        windows.includes(`set "${name}=${value}"`),
+        `Task Scheduler wrapper did not preserve ${name}`,
+      );
+    }
   } finally {
     rmSync(testRoot, { recursive: true, force: true });
   }
@@ -167,45 +251,81 @@ test("the Windows service refuses to persist native proxy credentials", () => {
   }
 });
 
-test(
-  "an invalid native proxy fails Windows install before scheduler recovery",
-  () => {
-    const testRoot = mkdtempSync(path.join(os.tmpdir(), "codex-router-invalid-proxy-install-"));
-    try {
-      const stateDir = windowsStateDir(testRoot);
-      mkdirSync(stateDir, { recursive: true });
-      const wrapperPath = path.join(stateDir, "start-codex-router.cmd");
-      writeFileSync(wrapperPath, "stale wrapper");
-      const stubs = schedulerStubs(path.join(testRoot, "scheduler"));
-      const preloader = path.join(testRoot, "pretend-non-windows.mjs");
-      writeFileSync(
-        preloader,
-        'Object.defineProperty(process, "platform", { value: "linux" });\n',
-      );
-      const result = spawnSync(process.execPath, [
-        "--import",
-        pathToFileURL(preloader).href,
-        path.join(root, "src", "service-windows.mjs"),
-        "install",
-      ], {
-        cwd: root,
-        encoding: "utf8",
-        env: {
-          ...serviceEnv("win32", testRoot),
-          PATH: stubs.path,
-          CODEX_ROUTER_NATIVE_PROXY_URL: "http://%ZZ@proxy.internal:7897",
-        },
-      });
+test("an invalid native proxy fails Windows install before scheduler recovery", () => {
+  const testRoot = mkdtempSync(path.join(os.tmpdir(), "codex-router-invalid-proxy-install-"));
+  try {
+    const stateDir = windowsStateDir(testRoot);
+    mkdirSync(stateDir, { recursive: true });
+    const wrapperPath = path.join(stateDir, "start-codex-router.cmd");
+    writeFileSync(wrapperPath, "stale wrapper");
+    const stubs = schedulerStubs(path.join(testRoot, "scheduler"));
+    const preloader = path.join(testRoot, "pretend-non-windows.mjs");
+    writeFileSync(
+      preloader,
+      'Object.defineProperty(process, "platform", { value: "linux" });\n',
+    );
+    const result = spawnSync(process.execPath, [
+      "--import",
+      pathToFileURL(preloader).href,
+      path.join(root, "src", "service-windows.mjs"),
+      "install",
+    ], {
+      cwd: root,
+      encoding: "utf8",
+      env: {
+        ...serviceEnv("win32", testRoot),
+        PATH: stubs.path,
+        CODEX_ROUTER_NATIVE_PROXY_URL: "http://%ZZ@proxy.internal:7897",
+      },
+    });
 
-      assert.notEqual(result.status, 0);
-      assert.equal(result.stdout, "");
-      assert.match(
-        result.stderr,
-        /CODEX_ROUTER_NATIVE_PROXY_URL must be a valid credential-free HTTP or HTTPS proxy URL/,
+    assert.notEqual(result.status, 0);
+    assert.equal(result.stdout, "");
+    assert.match(
+      result.stderr,
+      /CODEX_ROUTER_NATIVE_PROXY_URL must be a valid credential-free HTTP or HTTPS proxy URL/,
+    );
+    assert.doesNotMatch(result.stderr, /%ZZ/);
+    assert.equal(readFileSync(wrapperPath, "utf8"), "stale wrapper");
+    assert.deepEqual(stubs.calls(), []);
+  } finally {
+    rmSync(testRoot, { recursive: true, force: true });
+  }
+});
+
+test(
+  "the generated systemd unit stays owner-only when it stores proxy settings",
+  { skip: process.platform === "win32" },
+  () => {
+    const testRoot = mkdtempSync(path.join(os.tmpdir(), "codex-router-service-mode-"));
+    const stubDir = path.join(testRoot, "bin");
+    mkdirSync(stubDir, { recursive: true });
+    const systemctl = path.join(stubDir, "systemctl");
+    writeFileSync(systemctl, "#!/bin/sh\nexit 0\n", "utf8");
+    chmodSync(systemctl, 0o755);
+    try {
+      serviceCommand(
+        "service-linux.mjs",
+        "linux",
+        testRoot,
+        "install",
+        "codex",
+        root,
+        {
+          PATH: `${stubDir}${path.delimiter}${process.env.PATH || ""}`,
+          HTTPS_PROXY: "http://user:secret@proxy.example:8443",
+        },
       );
-      assert.doesNotMatch(result.stderr, /%ZZ/);
-      assert.equal(readFileSync(wrapperPath, "utf8"), "stale wrapper");
-      assert.deepEqual(stubs.calls(), []);
+
+      const unitPath = path.join(
+        testRoot,
+        "xdg config",
+        "systemd",
+        "user",
+        "codex-router.service",
+      );
+      assert.equal(statSync(unitPath).mode & 0o777, 0o600);
+      assert.match(readFileSync(unitPath, "utf8"), /HTTPS_PROXY=/);
     } finally {
       rmSync(testRoot, { recursive: true, force: true });
     }
@@ -455,11 +575,14 @@ test(
       const run = (command) =>
         JSON.parse(serviceCommand("service-windows.mjs", "win32", testRoot, command));
 
-      // schtasks.exe and powershell.exe are absent off Windows, and every call
-      // to them is best effort, so only the generated files are exercised here.
-      assert.equal(run("install").installed, true);
+      // schtasks.exe and powershell.exe are absent off Windows. The launchers
+      // are still generated, but the service is not truthfully reported as
+      // installed when no Task Scheduler definition exists.
+      assert.equal(run("install").installed, false);
       assert.equal(existsSync(wrapperPath), true);
       assert.equal(existsSync(launcherPath), true);
+      assert.equal(statSync(wrapperPath).mode & 0o777, 0o600);
+      assert.equal(statSync(launcherPath).mode & 0o777, 0o600);
 
       const bytes = readFileSync(launcherPath);
       // wscript.exe falls back to the ANSI code page without this byte order
@@ -468,7 +591,7 @@ test(
       assert.match(bytes.toString("utf16le").slice(1), /^Option Explicit\r\n/);
 
       // Reinstalling over an existing pair overwrites instead of failing.
-      assert.equal(run("install").installed, true);
+      assert.equal(run("install").installed, false);
       assert.equal(readFileSync(launcherPath).equals(bytes), true);
 
       assert.equal(run("uninstall").installed, false);
@@ -491,7 +614,13 @@ test(
 // They can never shadow the real executables, because the tests that use them
 // are skipped on win32.
 function schedulerStubs(directory, options = {}) {
-  const { schtasksFail = "", powershellFail = "", runningQueries = 0 } = options;
+  const {
+    schtasksFail = "",
+    powershellFail = "",
+    runningQueries = 0,
+    authoritativeState = "0|0|0",
+    authoritativeFail = false,
+  } = options;
   mkdirSync(directory, { recursive: true });
   const logPath = path.join(directory, "calls.log");
   const counterPath = path.join(directory, "state-queries");
@@ -513,6 +642,11 @@ function schedulerStubs(directory, options = {}) {
     [
       preamble(powershellFail),
       'case "$*" in',
+      "  *Schedule.Service*)",
+      authoritativeFail
+        ? "    exit 1"
+        : `    printf '%s' ${JSON.stringify(authoritativeState)}`,
+      "    ;;",
       "  *Get-ScheduledTask*)",
       "    count=0",
       `    if [ -f "${counterPath}" ]; then count=$(cat "${counterPath}"); fi`,
@@ -550,6 +684,146 @@ function runWindowsService(testRoot, command, extraEnv = {}) {
     },
   );
 }
+
+test(
+  "Windows status trusts a live launcher when Task Scheduler reports Ready",
+  { skip: process.platform === "win32" },
+  () => {
+    const testRoot = mkdtempSync(path.join(os.tmpdir(), "codex-router-win-status-live-"));
+    try {
+      const stubs = schedulerStubs(path.join(testRoot, "scheduler"), {
+        authoritativeState: "1|267009|1",
+      });
+      const result = runWindowsService(testRoot, "status", { PATH: stubs.path });
+      assert.equal(result.status, 0, result.stderr);
+      assert.deepEqual(JSON.parse(result.stdout), {
+        installed: true,
+        loaded: true,
+        state: "running",
+      });
+      assert.equal(stubs.calls().some((line) => line.includes("Schedule.Service")), true);
+    } finally {
+      rmSync(testRoot, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "Windows status keeps Ready when the authoritative launcher is dead",
+  { skip: process.platform === "win32" },
+  () => {
+    const testRoot = mkdtempSync(path.join(os.tmpdir(), "codex-router-win-status-dead-"));
+    try {
+      const stubs = schedulerStubs(path.join(testRoot, "scheduler"), {
+        authoritativeState: "1|267014|0",
+      });
+      const result = runWindowsService(testRoot, "status", { PATH: stubs.path });
+      assert.equal(result.status, 0, result.stderr);
+      assert.deepEqual(JSON.parse(result.stdout), {
+        installed: true,
+        loaded: false,
+        state: "ready",
+      });
+    } finally {
+      rmSync(testRoot, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "Windows status does not claim an idle task from an external launcher",
+  { skip: process.platform === "win32" },
+  () => {
+    const testRoot = mkdtempSync(path.join(os.tmpdir(), "codex-router-win-status-external-"));
+    try {
+      const stubs = schedulerStubs(path.join(testRoot, "scheduler"), {
+        authoritativeState: "0|267009|1",
+      });
+      const result = runWindowsService(testRoot, "status", { PATH: stubs.path });
+      assert.equal(result.status, 0, result.stderr);
+      assert.deepEqual(JSON.parse(result.stdout), {
+        installed: true,
+        loaded: false,
+        state: "ready",
+      });
+    } finally {
+      rmSync(testRoot, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "Windows status keeps Ready when launcher evidence is incomplete",
+  { skip: process.platform === "win32" },
+  () => {
+    const testRoot = mkdtempSync(path.join(os.tmpdir(), "codex-router-win-status-partial-"));
+    try {
+      const stubs = schedulerStubs(path.join(testRoot, "scheduler"), {
+        authoritativeState: "1|267009",
+      });
+      const result = runWindowsService(testRoot, "status", { PATH: stubs.path });
+      assert.equal(result.status, 0, result.stderr);
+      assert.deepEqual(JSON.parse(result.stdout), {
+        installed: true,
+        loaded: false,
+        state: "ready",
+      });
+    } finally {
+      rmSync(testRoot, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "Windows status keeps Ready when authoritative launcher state is inconclusive",
+  { skip: process.platform === "win32" },
+  async (context) => {
+    for (const [name, options] of [
+      ["malformed", { authoritativeState: "not-task-state" }],
+      ["failed", { authoritativeFail: true }],
+    ]) {
+      await context.test(name, () => {
+        const testRoot = mkdtempSync(path.join(os.tmpdir(), `codex-router-win-status-${name}-`));
+        try {
+          const stubs = schedulerStubs(path.join(testRoot, "scheduler"), options);
+          const result = runWindowsService(testRoot, "status", { PATH: stubs.path });
+          assert.equal(result.status, 0, result.stderr);
+          assert.deepEqual(JSON.parse(result.stdout), {
+            installed: true,
+            loaded: false,
+            state: "ready",
+          });
+        } finally {
+          rmSync(testRoot, { recursive: true, force: true });
+        }
+      });
+    }
+  },
+);
+
+test(
+  "Windows status accepts Running without an authoritative fallback query",
+  { skip: process.platform === "win32" },
+  () => {
+    const testRoot = mkdtempSync(path.join(os.tmpdir(), "codex-router-win-status-running-"));
+    try {
+      const stubs = schedulerStubs(path.join(testRoot, "scheduler"), {
+        runningQueries: 1,
+        authoritativeFail: true,
+      });
+      const result = runWindowsService(testRoot, "status", { PATH: stubs.path });
+      assert.equal(result.status, 0, result.stderr);
+      assert.deepEqual(JSON.parse(result.stdout), {
+        installed: true,
+        loaded: true,
+        state: "running",
+      });
+      assert.equal(stubs.calls().some((line) => line.includes("Schedule.Service")), false);
+    } finally {
+      rmSync(testRoot, { recursive: true, force: true });
+    }
+  },
+);
 
 test(
   "a blocked registration restarts whichever task definition survived",
@@ -601,9 +875,10 @@ test(
         powershellFail: "Register-ScheduledTask",
       });
       const result = runWindowsService(testRoot, "install", { PATH: stubs.path });
-      // Still best effort: the launchers are written and the caller retries.
+      // Still best effort: the launchers are written and the caller retries,
+      // but no surviving task must be reported as installed.
       assert.equal(result.status, 0, result.stderr);
-      assert.equal(JSON.parse(result.stdout).installed, true);
+      assert.equal(JSON.parse(result.stdout).installed, false);
 
       const calls = stubs.calls();
       assert.ok(calls.some((line) => line.includes("/Query")));

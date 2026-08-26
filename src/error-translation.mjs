@@ -104,10 +104,81 @@ function isPlanEntitlement(detail) {
 }
 
 function isOutOfUsage(detail, errorType) {
-  if (typeof errorType === "string" && /quota|billing|resource_exhausted/i.test(errorType)) {
+  if (
+    typeof errorType === "string" &&
+    /quota|billing|resource_exhausted|freeusagelimiterror/i.test(errorType)
+  ) {
     return true;
   }
   return QUOTA_PATTERNS.some((pattern) => pattern.test(detail));
+}
+
+// Ollama's MLX runner returns this deterministic request-size failure as an
+// HTTP 500, and LiteLLM currently wraps it as APIConnectionError. Left as a
+// server error, Codex retries for minutes and eventually replaces the useful
+// cause with its generic high-demand message. The wording is emitted by
+// Ollama's runner after it has rendered and tokenized the complete chat
+// template, so it is authoritative context evidence even though the status is
+// not.
+const CONTEXT_LENGTH_PATTERNS = [
+  /input length \((\d+) tokens\) exceeds the model's maximum context length \((\d+) tokens\)/i,
+  /input after truncation exceeds (?:the )?maximum context length/i,
+  /maximum context length (?:is|of) (\d+)(?: tokens?)?.{0,80}(?:input|request).{0,40}(\d+)/i,
+  /context[_\s-]length[_\s-]exceeded/i,
+];
+
+export function contextLengthFailure(bodyText) {
+  const detail = extractUpstreamDetail(bodyText);
+  if (!detail) return undefined;
+  for (const pattern of CONTEXT_LENGTH_PATTERNS) {
+    const match = detail.match(pattern);
+    if (!match) continue;
+    if (pattern === CONTEXT_LENGTH_PATTERNS[0]) {
+      return {
+        detail,
+        inputTokens: Number(match[1]),
+        maximumTokens: Number(match[2]),
+      };
+    }
+    if (pattern === CONTEXT_LENGTH_PATTERNS[2]) {
+      return {
+        detail,
+        inputTokens: Number(match[2]),
+        maximumTokens: Number(match[1]),
+      };
+    }
+    return { detail };
+  }
+  return undefined;
+}
+
+// Status is kept separate from the translated body because callers also relay
+// ordinary gateway statuses byte-for-status. Only this deterministic request
+// rejection is corrected from the gateway's 5xx wrapper to the OpenAI-shaped
+// 400 that tells Codex not to retry.
+export function gatewayErrorStatus({ status, bodyText }) {
+  return contextLengthFailure(bodyText) ? 400 : Number(status);
+}
+
+// The same two questions `describeFailure` asks, in the same order, answered for
+// a caller that needs to *act* on the distinction rather than word it. Exported
+// as one function rather than as the two predicates, because the order is the
+// load-bearing part: "upgrade your plan" appears in both pattern sets, so a
+// caller that asked about quota first would read a permanent entitlement failure
+// as an exhausted balance. Keeping the ordering here means there is one place it
+// can be got right.
+//
+// Returns "entitlement" (a plan that never included this API -- nothing the
+// operator does with keys or top-ups changes it), "out_of_usage" (an exhausted
+// balance or plan limit, which time or a top-up fixes), or undefined for
+// everything else, including every 5xx: the origin ran, and what it said about
+// quota is not evidence about the caller's.
+export function upstreamFailureKind({ status, bodyText }) {
+  if (!(Number(status) < 500)) return undefined;
+  const detail = extractUpstreamDetail(bodyText);
+  if (isPlanEntitlement(detail)) return "entitlement";
+  if (isOutOfUsage(detail, parseUpstreamError(bodyText).type)) return "out_of_usage";
+  return undefined;
 }
 
 function describeFailure({
@@ -117,6 +188,7 @@ function describeFailure({
   modelName,
   providerName,
   providerKind,
+  providerAuthMode,
   retryAfterSeconds,
 }) {
   // Ahead of both the quota and the credential branches: an entitlement
@@ -141,6 +213,15 @@ function describeFailure({
       return {
         type: "authentication_error",
         message: `${providerName} rejected the OAuth session while serving ${modelName}. Sign in to ${providerName} again.`,
+      };
+    }
+    // An anonymous provider holds no credential at all, so there is nothing
+    // to refresh and no setup to re-run. Its refusal is about the request or
+    // its free-route policy, both of which change without notice.
+    if (providerAuthMode === "anonymous") {
+      return {
+        type: "authentication_error",
+        message: `${providerName} serves ${modelName} anonymously, so there is no stored credential to refresh. ${providerName} rejected this request on its free route; the free catalog and limits change without notice, so retry later or switch models.`,
       };
     }
     return {
@@ -187,9 +268,28 @@ export function translateGatewayError({
   modelName,
   providerName,
   providerKind,
+  providerAuthMode,
   retryAfterSeconds,
 }) {
   const detail = extractUpstreamDetail(bodyText);
+  const context = contextLengthFailure(bodyText);
+  if (context) {
+    const measured =
+      Number.isFinite(context.inputTokens) && Number.isFinite(context.maximumTokens)
+        ? `The rendered prompt is ${context.inputTokens.toLocaleString("en-US")} tokens, exceeding the model's ${context.maximumTokens.toLocaleString("en-US")}-token context window.`
+        : "The rendered prompt exceeds the model's context window.";
+    return {
+      error: {
+        message:
+          `${providerName} could not run ${modelName}. ${measured} ` +
+          "This is a context-window or tokenizer/template mismatch, not high demand. " +
+          "Start a shorter task or choose a different model tag.",
+        type: "invalid_request_error",
+        param: "input",
+        code: "context_length_exceeded",
+      },
+    };
+  }
   const failure = describeFailure({
     status,
     detail,
@@ -197,6 +297,7 @@ export function translateGatewayError({
     modelName,
     providerName,
     providerKind,
+    providerAuthMode,
     retryAfterSeconds,
   });
   const suffix = detail ? ` (HTTP ${status}: ${detail})` : ` (HTTP ${status})`;

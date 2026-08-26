@@ -3,36 +3,47 @@ import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import {
+  ollamaCommand,
+  ollamaAvailable as runtimeOllamaAvailable,
+  ollamaInstallHint,
+} from "./ollama-runtime.mjs";
 import { STATE_DIR } from "./paths.mjs";
 import {
   DEFAULT_LOCAL_VISION_BASE_URL,
   DEFAULT_LOCAL_VISION_MODEL,
 } from "./vision-bridge.mjs";
 
-export const OLLAMA_INSTALL_HINT =
-  process.platform === "win32"
-    ? "Install Ollama from https://ollama.com/download, then re-run this."
-    : process.platform === "darwin"
-      ? "Install Ollama from https://ollama.com/download (or `brew install ollama`), then re-run this."
-      : "Install Ollama: `curl -fsSL https://ollama.com/install.sh | sh`, then re-run this.";
+// Deliberately a function, not a top-level constant. Building the hint asks
+// `ollamaInstallPlan` which package manager is present, and that is a
+// synchronous `brew --version` (~200 ms here). As a constant it ran on every
+// import of this module -- including the static start.mjs -> local-models.mjs
+// chain -- so every router start paid for a string almost nobody reads.
+let cachedInstallHint;
+export function ollamaInstallMessage() {
+  cachedInstallHint ??= `Install Ollama (${ollamaInstallHint()}), then retry.`;
+  return cachedInstallHint;
+}
 
-// A runtime is the operator's own software; the installer never installs it
-// silently. This only reports whether the `ollama` CLI is already on PATH so
-// the setup flow can pull a model with it or, when it is absent, print the one
-// install command and stop.
+// A runtime is the operator's own software. This helper only reports whether
+// the CLI is present; the local-model install flow may install it after the
+// operator explicitly clicks/approves a model download.
 export function ollamaAvailable({ spawn = spawnSync } = {}) {
-  try {
-    const result = spawn("ollama", ["--version"], { stdio: "ignore" });
-    return result.status === 0;
-  } catch {
-    return false;
-  }
+  return runtimeOllamaAvailable({ spawn });
 }
 
 // A model download is gigabytes, so it is never silent: the caller passes an
 // explicit consent flag (a --yes on the CLI, or a confirmed installer prompt).
+//
+// The runtime resolver, not the bare name: `ollamaAvailable()` above finds
+// Ollama through its known install locations, which on Windows is a
+// %LOCALAPPDATA% path the router's own PATH may never have seen. Probing with
+// one resolver and running with another reported an installed Ollama and then
+// failed to spawn it.
 export function pullOllamaModel(model, { spawn = spawnSync } = {}) {
-  const result = spawn("ollama", ["pull", model], { stdio: "inherit" });
+  const command = ollamaCommand({ spawn });
+  if (!command) throw new Error(`\`ollama pull ${model}\` failed: ${ollamaInstallMessage()}`);
+  const result = spawn(command, ["pull", model], { stdio: "inherit" });
   if (result.status !== 0) {
     throw new Error(`\`ollama pull ${model}\` failed (exit ${result.status ?? "unknown"}).`);
   }
@@ -44,7 +55,9 @@ export function pullOllamaModel(model, { spawn = spawnSync } = {}) {
 // as Ollama reports them (e.g. "qwen2.5vl:3b", "moondream:latest").
 export function ollamaInstalledModels({ spawn = spawnSync } = {}) {
   try {
-    const result = spawn("ollama", ["list"], { encoding: "utf8" });
+    const command = ollamaCommand({ spawn });
+    if (!command) return [];
+    const result = spawn(command, ["list"], { encoding: "utf8", windowsHide: true });
     if (result.status !== 0 || typeof result.stdout !== "string") return [];
     return result.stdout
       .split("\n")

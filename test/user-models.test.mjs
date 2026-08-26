@@ -7,9 +7,13 @@ import { test } from "node:test";
 const stateDir = mkdtempSync(path.join(os.tmpdir(), "user-models-test-"));
 process.env.CODEX_ROUTER_STATE_DIR = stateDir;
 
-const { userModelEntry, readUserModels, writeUserModels, USER_MODELS_PATH } = await import(
-  "../src/user-models.mjs"
-);
+const {
+  userModelEntry,
+  readUserModels,
+  writeUserModels,
+  hasDefaultUserModelReasoning,
+  USER_MODELS_PATH,
+} = await import("../src/user-models.mjs");
 
 test("userModelEntry fills conservative picker metadata", () => {
   const entry = userModelEntry({
@@ -31,8 +35,20 @@ test("userModelEntry fills conservative picker metadata", () => {
   assert.ok(entry.autoCompact >= 1 && entry.autoCompact <= entry.contextWindow);
   assert.deepEqual(entry.inputModalities, ["text"]);
   assert.equal(entry.compHash, "ollama-cloud-gpt-oss-120b-user-v1");
+  assert.equal(entry.requiresTrailingUserTurn, undefined);
   assert.ok(entry.displayName.includes("gpt-oss:120b"));
   assert.ok(entry.description.length > 0);
+});
+
+test("OpenCode's opaque free preview id is presented as Ox Alpha Free", () => {
+  const entry = userModelEntry({
+    providerId: "opencode-free",
+    upstreamId: "x-preview-f-free",
+    priority: 100,
+  });
+  assert.equal(entry.slug, "opencode-free/x-preview-f-free");
+  assert.equal(entry.upstreamModel, "x-preview-f-free");
+  assert.equal(entry.displayName, "Ox Alpha Free");
 });
 
 test("curation metadata can set sizing and the effort ladder", () => {
@@ -51,6 +67,8 @@ test("curation metadata can set sizing and the effort ladder", () => {
       ],
       defaultEffort: "medium",
       serviceTiers: [{ id: "priority", name: "Fast" }],
+      requiresTrailingUserTurn: true,
+      isFree: true,
     },
   });
   assert.equal(entry.contextWindow, 262144);
@@ -58,6 +76,8 @@ test("curation metadata can set sizing and the effort ladder", () => {
   assert.equal(entry.reasoningLevels.length, 3);
   assert.equal(entry.defaultEffort, "medium");
   assert.deepEqual(entry.serviceTiers, [{ id: "priority", name: "Fast" }]);
+  assert.equal(entry.requiresTrailingUserTurn, true);
+  assert.equal(entry.isFree, true);
 });
 
 test("curation metadata can expose provider-verified reasoning summaries", () => {
@@ -129,6 +149,35 @@ test("registry merges valid user models and skips collisions", async () => {
     }),
     // Collides with a built-in slug and must be skipped, not fatal.
     { ...userModelEntry({ providerId: "deepseek", upstreamId: "deepseek-v4-pro", priority: 101 }) },
+    // The old OpenCode curation slug differs from the checked-in public slug,
+    // but provider + upstream id identify the same physical route. It must be
+    // suppressed and exposed as a visibility migration, not rendered twice.
+    userModelEntry({
+      providerId: "opencode-free",
+      upstreamId: "x-preview-f-free",
+      priority: 113,
+    }),
+    // A duplicate route must not be able to turn somebody else's checked-in
+    // slug into its own alias. MODEL_BY_SLUG applies aliases after real models,
+    // so accepting this would silently reroute DeepSeek traffic to OpenCode.
+    {
+      ...userModelEntry({
+        providerId: "opencode-free",
+        upstreamId: "x-preview-f-free",
+        priority: 114,
+      }),
+      slug: "deepseek/deepseek-v4-pro",
+    },
+    // Repository migration aliases are reserved too. A mutable overlay must
+    // not replace the old Grok route's checked-in Responses migration.
+    {
+      ...userModelEntry({
+        providerId: "opencode-free",
+        upstreamId: "x-preview-f-free",
+        priority: 115,
+      }),
+      slug: "opencode-go/grok-4.5",
+    },
     // Unknown provider must be skipped, not fatal.
     userModelEntry({ providerId: "no-such-provider", upstreamId: "x-model", priority: 102 }),
     // Announcement copy must be a non-empty string; a blank one is skipped.
@@ -136,16 +185,33 @@ test("registry merges valid user models and skips collisions", async () => {
       ...userModelEntry({ providerId: "deepseek", upstreamId: "deepseek-blank-nux", priority: 103 }),
       availabilityNux: "   ",
     },
-    // Only the implemented "hosted" search mode may be declared; anything
-    // else would advertise a search the request path cannot serve.
+    // Search modes are a closed set. Unknown modes must not advertise a
+    // search path the request path cannot serve.
     {
       ...userModelEntry({ providerId: "deepseek", upstreamId: "deepseek-bad-search", priority: 106 }),
       searchTool: { mode: "emulated" },
+    },
+    // Standalone search is Codex-side execution; it remains an explicit
+    // per-model opt-in rather than a provider-wide default.
+    {
+      ...userModelEntry({ providerId: "deepseek", upstreamId: "deepseek-standalone-search", priority: 110 }),
+      searchTool: { mode: "standalone" },
     },
     // Capability toggles are booleans; a truthy string must not slip through.
     {
       ...userModelEntry({ providerId: "deepseek", upstreamId: "deepseek-bad-detail", priority: 107 }),
       supportsImageDetailOriginal: "yes",
+    },
+    // Destructive trailing-turn handling is an explicit boolean capability.
+    {
+      ...userModelEntry({ providerId: "deepseek", upstreamId: "deepseek-bad-trailing-turn", priority: 111 }),
+      requiresTrailingUserTurn: "yes",
+    },
+    // Local state is not a repository certificate. A hand-edited overlay must
+    // never make its own route appear as a native v2 subagent.
+    {
+      ...userModelEntry({ providerId: "deepseek", upstreamId: "deepseek-self-certified", priority: 112 }),
+      multiAgentVersion: "v2",
     },
     // Reasoning-summary capability fields must agree. A valid enum on its own
     // must not make the catalog claim summaries for a model that does not
@@ -176,10 +242,29 @@ test("registry merges valid user models and skips collisions", async () => {
   const slugs = registry.MODELS.map((model) => model.slug);
   assert.ok(slugs.includes("deepseek/deepseek-user-test"));
   assert.equal(slugs.filter((slug) => slug === "deepseek/deepseek-v4-pro").length, 1);
+  assert.equal(slugs.filter((slug) => slug === "opencode-free/ox-alpha").length, 1);
+  assert.ok(!slugs.includes("opencode-free/x-preview-f-free"));
+  assert.equal(
+    registry.MODEL_SLUG_ALIASES.get("opencode-free/x-preview-f-free"),
+    "opencode-free/ox-alpha",
+  );
+  assert.equal(registry.MODEL_SLUG_ALIASES.has("deepseek/deepseek-v4-pro"), false);
+  assert.equal(registry.MODEL_BY_SLUG.get("deepseek/deepseek-v4-pro").provider, "deepseek");
+  assert.equal(
+    registry.MODEL_SLUG_ALIASES.get("opencode-go/grok-4.5"),
+    "opencode-go-responses/grok-4.5",
+  );
+  assert.equal(
+    registry.MODEL_BY_SLUG.get("opencode-go/grok-4.5").provider,
+    "opencode-go-responses",
+  );
   assert.ok(!slugs.includes("no-such-provider/x-model"));
   assert.ok(!slugs.includes("deepseek/deepseek-blank-nux"));
   assert.ok(!slugs.includes("deepseek/deepseek-bad-search"));
+  assert.ok(slugs.includes("deepseek/deepseek-standalone-search"));
   assert.ok(!slugs.includes("deepseek/deepseek-bad-detail"));
+  assert.ok(!slugs.includes("deepseek/deepseek-bad-trailing-turn"));
+  assert.ok(!slugs.includes("deepseek/deepseek-self-certified"));
   assert.ok(!slugs.includes("deepseek/deepseek-summary-without-support"));
   assert.ok(!slugs.includes("deepseek/deepseek-invalid-summary-support"));
   assert.ok(!slugs.includes("deepseek/deepseek-bad-upgrade"));
@@ -189,7 +274,59 @@ test("registry merges valid user models and skips collisions", async () => {
   );
   assert.ok(registry.MODEL_BY_GATEWAY_ID.has("deepseek-deepseek-user-test"));
   assert.ok(registry.USER_MODEL_WARNINGS.length >= 4);
+  assert.ok(registry.USER_MODEL_WARNINGS.some((warning) => /may not declare multiAgentVersion v2/.test(warning)));
+  assert.ok(registry.USER_MODEL_WARNINGS.some((warning) => (
+    /alias deepseek\/deepseek-v4-pro/.test(warning) && /collides with an existing model or alias/.test(warning)
+  )));
+  assert.ok(registry.USER_MODEL_WARNINGS.some((warning) => (
+    /alias opencode-go\/grok-4\.5/.test(warning) && /collides with an existing model or alias/.test(warning)
+  )));
   const merged = registry.MODEL_BY_SLUG.get("deepseek/deepseek-user-test");
   assert.equal(merged.listed, true);
   assert.equal(merged.availabilityNux, "Now available through your DeepSeek key.");
+  assert.deepEqual(
+    registry.MODEL_BY_SLUG.get("deepseek/deepseek-standalone-search").searchTool,
+    { mode: "standalone" },
+  );
+});
+
+
+// Curation has to be able to tell "nobody documented this model's efforts"
+// apart from a ladder somebody chose, the same way the untouched
+// 131072/110000 pair marks untuned sizing. Without that distinction an upgrade
+// path cannot add a published ladder without risking an operator's own (#352).
+test("a defaulted effort ladder is distinguishable from a chosen one", () => {
+  const stock = userModelEntry({
+    providerId: "ollama-cloud",
+    upstreamId: "gpt-oss:120b",
+    priority: 101,
+  });
+  assert.equal(hasDefaultUserModelReasoning(stock), true);
+  assert.equal(stock.defaultEffort, "high");
+  assert.deepEqual(stock.reasoningLevels, [{ effort: "high", description: "Adaptive reasoning" }]);
+
+  const chosen = userModelEntry({
+    providerId: "ollama-cloud",
+    upstreamId: "gpt-oss:120b",
+    priority: 101,
+    metadata: {
+      defaultEffort: "high",
+      reasoningLevels: [
+        { effort: "low", description: "Quick reasoning" },
+        { effort: "high", description: "Deep reasoning" },
+      ],
+    },
+  });
+  assert.equal(hasDefaultUserModelReasoning(chosen), false);
+
+  // A single high level someone worded differently is still theirs.
+  assert.equal(
+    hasDefaultUserModelReasoning({
+      defaultEffort: "high",
+      reasoningLevels: [{ effort: "high", description: "My own wording" }],
+    }),
+    false,
+  );
+  assert.equal(hasDefaultUserModelReasoning({}), false);
+  assert.equal(hasDefaultUserModelReasoning(undefined), false);
 });

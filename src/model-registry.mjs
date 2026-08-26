@@ -1,8 +1,9 @@
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 
+import { instructionOverlayExists } from "./instruction-overlays.mjs";
 import { SOURCE_ROOT } from "./paths.mjs";
-import { readUserModels } from "./user-models.mjs";
+import { officialModelDisplayName, readUserModels } from "./user-models.mjs";
 
 export const REGISTRY_PATH =
   process.env.MODEL_ROUTER_REGISTRY ||
@@ -11,6 +12,92 @@ export const REGISTRY_PATH =
 
 function fail(message) {
   throw new Error(`Invalid provider registry ${REGISTRY_PATH}: ${message}`);
+}
+
+// Remote providers that intentionally accept anonymous traffic are a much
+// narrower class than local `keyless` providers. Keep the allowlist here so a
+// future registry entry cannot turn an arbitrary HTTPS endpoint into a
+// credential-free exfiltration path.
+const ANONYMOUS_ENDPOINTS = Object.freeze({
+  "opencode-free": "https://opencode.ai/zen/v1",
+  "opencode-free-responses": "https://opencode.ai/zen/v1",
+  "kilo-free": "https://api.kilo.ai/api/gateway",
+});
+
+// The same guarantee, one level down. A per-model endpoint moves the address
+// out of the provider and into the model, so the allowlist has to follow it or
+// it stops being an allowlist at all: without this, adding a JSON fragment
+// under `config/custom/` would be enough to make the router send an operator's
+// prompts to any HTTPS host on earth with no credential and no review. Keyed
+// on the slug, which is what a fragment cannot forge without colliding.
+const ANONYMOUS_MODEL_ENDPOINTS = Object.freeze({
+  "custom/qwen3.8-27b":
+    "https://g9hnto0u7lvbu837.us-east-2.aws.endpoints.huggingface.cloud/v1",
+});
+
+export function anonymousModelAllowed(provider, modelId) {
+  const id = typeof modelId === "string" ? modelId.trim() : "";
+  if (provider?.authMode !== "anonymous" || !id) return false;
+  if (provider.anonymousModelPolicy === "opencode-console") {
+    return id === "big-pickle" || id.endsWith("-free");
+  }
+  if (provider.anonymousModelPolicy === "suffix-free") return id.endsWith(":free");
+  if (provider.anonymousModelPolicy === "explicit-models") {
+    return Array.isArray(provider.anonymousModels) && provider.anonymousModels.includes(id);
+  }
+  return false;
+}
+
+// A provider that defers its address to its models has no endpoint of its own,
+// so every consumer that used to read `provider.baseUrl` has to ask this
+// instead. The descriptor is deliberately provider-shaped: `baseUrl`,
+// `authMode`, `keyless`, and `credential` mean exactly what they mean on a
+// provider, so `resolveProviderBaseUrl` and the whole credential resolution
+// chain accept one unchanged rather than growing a parallel implementation.
+// Its `id` is the model slug, which is what makes a per-model credential file
+// and Keychain entry distinct from every other endpoint's.
+export function endpointForModel(model, providers = PROVIDERS) {
+  const provider = providers.get(model?.provider);
+  return provider?.perModelEndpoint ? model.endpoint : provider;
+}
+
+// "Nothing for the operator to supply to *this provider*" — three different
+// reasons, one consequence, and every surface that offers to take a key has to
+// agree on it. Named once because the list grew a third member and the four
+// call sites that spelled it inline would each have had to be found.
+export function providerNeedsNoKey(provider) {
+  return Boolean(provider?.keyless) || ["anonymous", "per-model"].includes(provider?.authMode);
+}
+
+function normalizedBaseUrl(value) {
+  return String(value || "").replace(/\/+$/, "");
+}
+
+function loopbackBaseUrl(value) {
+  try {
+    const url = new URL(value);
+    return ["http:", "https:"].includes(url.protocol) &&
+      ["127.0.0.1", "localhost", "[::1]"].includes(url.hostname);
+  } catch {
+    return false;
+  }
+}
+
+// The loader proves a keyless provider's checked-in baseUrl is loopback, but
+// an environment override arrives at request time and skips that proof. A
+// keyless request carries no credential, so a non-loopback override would send
+// unauthenticated traffic off-box. Resolve overrides through this guard: the
+// override is refused — not the request — because the registry URL is always
+// safe to fall back to. Anonymous providers never allow an override at all
+// (the loader rejects baseUrlEnv on them), so they resolve to their fixed
+// endpoint here by construction.
+export function resolveProviderBaseUrl(provider, env = process.env) {
+  const override = provider.baseUrlEnv ? env[provider.baseUrlEnv] : undefined;
+  const raw = normalizedBaseUrl(override || provider.baseUrl);
+  if (provider.keyless && !loopbackBaseUrl(raw)) {
+    return { baseUrl: normalizedBaseUrl(provider.baseUrl), refusedOverride: raw };
+  }
+  return { baseUrl: raw };
 }
 
 // Byte-order comparison keeps the walk identical on every machine; a
@@ -81,34 +168,6 @@ export function readRegistryDocument(root = REGISTRY_PATH) {
   return { version: 1, providers, models };
 }
 
-// An optional `credential.cliSession` lets a provider reuse the API key its
-// own CLI stores after a browser sign-in. The descriptor names one file inside
-// one directory of the user's home, so a stray separator or `..` would let the
-// registry point the reader at an arbitrary path; reject those at load time.
-function cliSessionProblem(provider) {
-  // A keyless provider has no credential block at all, so there is no CLI
-  // session descriptor to validate.
-  const session = provider.credential?.cliSession;
-  if (session === undefined) return undefined;
-  if (!session || typeof session !== "object" || Array.isArray(session)) {
-    return `provider ${provider.id} has an invalid credential.cliSession`;
-  }
-  for (const field of ["directory", "file", "field", "label", "loginCommand"]) {
-    if (typeof session[field] !== "string" || !session[field].trim()) {
-      return `provider ${provider.id} cliSession requires ${field}`;
-    }
-  }
-  for (const field of ["directory", "file"]) {
-    if (session[field].includes("/") || session[field].includes("\\") || session[field] === "..") {
-      return `provider ${provider.id} cliSession ${field} must be a single path segment`;
-    }
-  }
-  if (session.homeEnv !== undefined && (typeof session.homeEnv !== "string" || !session.homeEnv)) {
-    return `provider ${provider.id} cliSession has an invalid homeEnv`;
-  }
-  return undefined;
-}
-
 function loadRegistry() {
   const parsed = readRegistryDocument();
   if (!Array.isArray(parsed.providers) || !Array.isArray(parsed.models)) {
@@ -152,7 +211,25 @@ function loadRegistry() {
       fail(`OAuth provider ${provider.id} requires proxyBaseEnv`);
     }
     if (provider.kind === "openai-compatible") {
-      if (!/^https?:\/\//.test(provider.baseUrl || "")) {
+      // A per-model-endpoint provider is a container, not a destination: it
+      // has no address, no credential, and nothing to authenticate, because
+      // each of its models carries all three. Letting it also declare them
+      // would create two answers to "where does this go" and a silent winner.
+      if (provider.perModelEndpoint !== undefined) {
+        if (provider.perModelEndpoint !== true) {
+          fail(`provider ${provider.id} has an invalid perModelEndpoint flag`);
+        }
+        if (provider.authMode !== "per-model") {
+          fail(`provider ${provider.id} must declare authMode per-model`);
+        }
+        for (const field of ["baseUrl", "baseUrlEnv", "credential", "keyless", "protocol"]) {
+          if (provider[field] !== undefined) {
+            fail(`per-model-endpoint provider ${provider.id} must not declare ${field}`);
+          }
+        }
+      } else if (provider.authMode === "per-model") {
+        fail(`provider ${provider.id} declares authMode per-model without perModelEndpoint`);
+      } else if (!/^https?:\/\//.test(provider.baseUrl || "")) {
         fail(`provider ${provider.id} requires an HTTP(S) baseUrl`);
       }
       // A keyless provider serves from this machine (a local Ollama or
@@ -167,11 +244,61 @@ function loadRegistry() {
       }
       // Only a loopback endpoint may skip authentication: a keyless provider
       // pointed at the internet would send unauthenticated traffic off-box.
-      if (provider.keyless && !/^https?:\/\/(127\.0\.0\.1|\[::1\]|localhost)([:/]|$)/.test(provider.baseUrl)) {
+      if (provider.keyless && !loopbackBaseUrl(provider.baseUrl)) {
         fail(`keyless provider ${provider.id} must use a loopback baseUrl`);
       }
       if (
+        provider.authMode !== undefined &&
+        !["anonymous", "per-model"].includes(provider.authMode)
+      ) {
+        fail(`provider ${provider.id} has an unsupported authMode`);
+      }
+      if (provider.authMode === "anonymous") {
+        const expected = ANONYMOUS_ENDPOINTS[provider.id];
+        if (!expected || normalizedBaseUrl(provider.baseUrl) !== expected) {
+          fail(`anonymous provider ${provider.id} must use its fixed official endpoint`);
+        }
+        if (provider.baseUrlEnv !== undefined) {
+          fail(`anonymous provider ${provider.id} must not allow a baseUrl override`);
+        }
+        if (provider.keyless || provider.credential !== undefined) {
+          fail(`anonymous provider ${provider.id} must not declare keyless or credential metadata`);
+        }
+        if (![
+          "explicit-models",
+          "opencode-console",
+          "suffix-free",
+        ].includes(provider.anonymousModelPolicy)) {
+          fail(`anonymous provider ${provider.id} requires a supported anonymousModelPolicy`);
+        }
+        if (provider.anonymousModelPolicy === "explicit-models") {
+          const models = provider.anonymousModels;
+          if (
+            !Array.isArray(models) ||
+            models.length === 0 ||
+            models.some((model) =>
+              typeof model !== "string" || !model.trim() || model !== model.trim()
+            ) ||
+            new Set(models).size !== models.length
+          ) {
+            fail(`anonymous provider ${provider.id} requires a valid anonymousModels allowlist`);
+          }
+        } else if (provider.anonymousModels !== undefined) {
+          fail(`anonymous provider ${provider.id} may declare anonymousModels only with explicit-models policy`);
+        }
+        if (typeof provider.anonymousNote !== "string" || !provider.anonymousNote.trim()) {
+          fail(`anonymous provider ${provider.id} requires an anonymousNote`);
+        }
+      } else if (
+        provider.anonymousModelPolicy !== undefined ||
+        provider.anonymousModels !== undefined ||
+        provider.anonymousNote !== undefined
+      ) {
+        fail(`provider ${provider.id} has anonymous metadata without authMode anonymous`);
+      }
+      if (
         !provider.keyless &&
+        !["anonymous", "per-model"].includes(provider.authMode) &&
         (!provider.credential?.file || !Array.isArray(provider.credential.environment))
       ) {
         fail(`provider ${provider.id} requires credential metadata`);
@@ -182,8 +309,9 @@ function loadRegistry() {
       ) {
         fail(`provider ${provider.id} has an invalid credential label`);
       }
-      const sessionProblem = cliSessionProblem(provider);
-      if (sessionProblem) fail(sessionProblem);
+      if (provider.credential?.cliSession !== undefined) {
+        fail(`provider ${provider.id} does not support CLI sessions; use an API key`);
+      }
       // Some providers authenticate a credential their plan may still not
       // entitle to the API. The note says so everywhere a user connects, so
       // the first sign of it is not a 403 inside Codex.
@@ -198,6 +326,12 @@ function loadRegistry() {
         !["openai", "anthropic", "openai-responses"].includes(provider.protocol)
       ) {
         fail(`provider ${provider.id} has an unsupported API protocol`);
+      }
+      if (provider.transport !== undefined && provider.transport !== "ollama") {
+        fail(`provider ${provider.id} has an unsupported transport`);
+      }
+      if (provider.transport === "ollama" && !provider.keyless) {
+        fail(`provider ${provider.id} Ollama transport must be keyless`);
       }
     }
     providers.set(provider.id, Object.freeze(provider));
@@ -224,15 +358,6 @@ function loadRegistry() {
     if (provider.authProfile !== parent.authProfile) {
       fail(`variant provider ${provider.id} must share ${parent.id}'s auth profile`);
     }
-    // A variant that resolved a different CLI sign-in than its parent would
-    // authenticate one protocol surface and not the other from the same
-    // "connected" state, so the descriptors must match exactly.
-    if (
-      JSON.stringify(provider.credential?.cliSession ?? null) !==
-      JSON.stringify(parent.credential?.cliSession ?? null)
-    ) {
-      fail(`variant provider ${provider.id} must share ${parent.id}'s credential CLI session`);
-    }
   }
 
   const slugs = new Set();
@@ -242,7 +367,7 @@ function loadRegistry() {
     if (problem) fail(problem);
     slugs.add(model.slug);
     gatewayModels.add(model.gatewayModel);
-    return Object.freeze(model);
+    return normalizedModel(model, providers.get(model.provider));
   });
 
   const modelBySlug = new Map(models.map((model) => [model.slug, model]));
@@ -273,6 +398,106 @@ function upgradeTargetProblem(model, modelBySlug) {
   return undefined;
 }
 
+// A model's own endpoint answers the three questions a provider normally
+// answers -- where the request goes, whether it carries a credential, and
+// which one -- so it is validated to the same standard, in the same order, and
+// with the same refusals. Everything an operator can add to `config/custom/`
+// or to their user-model overlay lands here.
+function endpointProblem(model, provider) {
+  if (!provider.perModelEndpoint) {
+    return model.endpoint === undefined
+      ? undefined
+      : `model ${model.slug} declares an endpoint but ${provider.id} is not a per-model-endpoint provider`;
+  }
+  const endpoint = model.endpoint;
+  if (!endpoint || typeof endpoint !== "object" || Array.isArray(endpoint)) {
+    return `model ${model.slug} requires an endpoint under per-model-endpoint provider ${provider.id}`;
+  }
+  if (endpoint.id !== undefined || endpoint.kind !== undefined) {
+    // Both are derived from the model, and a fragment that set them could
+    // point one model's credential file at another model's secret.
+    return `model ${model.slug} endpoint must not declare id or kind`;
+  }
+  if (!/^https?:\/\//.test(endpoint.baseUrl || "")) {
+    return `model ${model.slug} endpoint requires an HTTP(S) baseUrl`;
+  }
+  if (endpoint.authMode !== undefined && endpoint.authMode !== "anonymous") {
+    return `model ${model.slug} endpoint has an unsupported authMode`;
+  }
+  if (endpoint.keyless !== undefined && typeof endpoint.keyless !== "boolean") {
+    return `model ${model.slug} endpoint has an invalid keyless flag`;
+  }
+  // Exactly one auth story per endpoint. Two would leave a silent winner, and
+  // none would send an unauthenticated request to an address nobody vetted.
+  const declared = [
+    endpoint.authMode === "anonymous",
+    Boolean(endpoint.keyless),
+    endpoint.credential !== undefined,
+  ].filter(Boolean).length;
+  if (declared !== 1) {
+    return `model ${model.slug} endpoint must declare exactly one of anonymous, keyless, or credential`;
+  }
+  // The keyless rule is about the address, not the flag: an endpoint that
+  // sends no credential may only talk to this machine.
+  if (endpoint.keyless && !loopbackBaseUrl(endpoint.baseUrl)) {
+    return `model ${model.slug} keyless endpoint must use a loopback baseUrl`;
+  }
+  // An anonymous endpoint reaches a third party with no credential at all, so
+  // the address itself is the security boundary and it lives in code.
+  if (endpoint.authMode === "anonymous") {
+    const expected = ANONYMOUS_MODEL_ENDPOINTS[model.slug];
+    if (!expected || normalizedBaseUrl(endpoint.baseUrl) !== expected) {
+      return `model ${model.slug} anonymous endpoint must use its allowlisted address`;
+    }
+    if (typeof endpoint.note !== "string" || !endpoint.note.trim()) {
+      return `model ${model.slug} anonymous endpoint requires a note`;
+    }
+  }
+  if (
+    endpoint.credential !== undefined &&
+    (!endpoint.credential.file || !Array.isArray(endpoint.credential.environment))
+  ) {
+    return `model ${model.slug} endpoint requires credential metadata`;
+  }
+  if (endpoint.baseUrlEnv !== undefined && typeof endpoint.baseUrlEnv !== "string") {
+    return `model ${model.slug} endpoint has an invalid baseUrlEnv`;
+  }
+  // An override on an endpoint that carries no key would walk straight around
+  // the allowlist the anonymous case just enforced.
+  if (endpoint.baseUrlEnv && (endpoint.authMode === "anonymous" || endpoint.keyless)) {
+    return `model ${model.slug} endpoint must not allow a baseUrl override without a credential`;
+  }
+  return undefined;
+}
+
+// The endpoint the registry declares is data; the endpoint the router resolves
+// has to be provider-shaped so the existing base-URL and credential chains
+// accept it. Identity is derived here rather than read from the fragment.
+//
+// The official-name table fills in a name curation could not know -- it reads
+// an opaque id off a provider's catalog and has nothing better to show. A
+// checked-in fragment always knows, and more than one route can carry the same
+// upstream id, so the table must not overwrite a name the repository chose:
+// `opencode-free/ox-alpha` says which of the six Ox Alpha routes it is, and the
+// table would flatten that back to the curated label.
+function normalizedModel(model, provider, { curated = false } = {}) {
+  const officialDisplayName = curated
+    ? officialModelDisplayName(model.provider, model.upstreamModel)
+    : undefined;
+  const presented = officialDisplayName && model.displayName !== officialDisplayName
+    ? { ...model, displayName: officialDisplayName }
+    : model;
+  if (!provider?.perModelEndpoint) return Object.freeze(presented);
+  return Object.freeze({
+    ...presented,
+    endpoint: Object.freeze({
+      ...presented.endpoint,
+      id: presented.slug,
+      kind: "openai-compatible",
+    }),
+  });
+}
+
 // Returns a problem description instead of throwing so the strict registry
 // loader can fail hard while the user-model overlay skips with a warning.
 function modelProblem(model, providers, slugs, gatewayModels) {
@@ -284,14 +509,35 @@ function modelProblem(model, providers, slugs, gatewayModels) {
       return `model is missing ${field}`;
     }
   }
-  if (!providers.has(model.provider)) {
+  const provider = providers.get(model.provider);
+  if (!provider) {
     return `model ${model.slug} references unknown provider ${model.provider}`;
   }
   if (!model.slug.startsWith(`${model.provider}/`)) {
     return `model ${model.slug} must be namespaced under ${model.provider}/`;
   }
+  if (provider.authMode === "anonymous" && !anonymousModelAllowed(provider, model.upstreamModel)) {
+    return `anonymous provider ${provider.id} only accepts its documented free-model ids`;
+  }
+  const endpoint = endpointProblem(model, provider);
+  if (endpoint) return endpoint;
+  if (
+    model.behaviorTemplate !== undefined &&
+    (typeof model.behaviorTemplate !== "string" || !model.behaviorTemplate.trim())
+  ) {
+    return `model ${model.slug} has an invalid behaviorTemplate`;
+  }
+  if (model.instructionOverlay !== undefined && !instructionOverlayExists(model.instructionOverlay)) {
+    return `model ${model.slug} has an invalid instructionOverlay`;
+  }
   if (model.requestProfile !== undefined && typeof model.requestProfile !== "string") {
     return `model ${model.slug} has an invalid requestProfile`;
+  }
+  if (
+    model.requiresTrailingUserTurn !== undefined &&
+    typeof model.requiresTrailingUserTurn !== "boolean"
+  ) {
+    return `model ${model.slug} has an invalid requiresTrailingUserTurn flag`;
   }
   if (
     model.multiAgentVersion !== undefined &&
@@ -312,6 +558,21 @@ function modelProblem(model, providers, slugs, gatewayModels) {
     return `model ${model.slug} has an invalid supportsApplyPatchTool`;
   }
   if (
+    model.supportsParallelToolCalls !== undefined &&
+    typeof model.supportsParallelToolCalls !== "boolean"
+  ) {
+    return `model ${model.slug} has an invalid supportsParallelToolCalls`;
+  }
+  if (
+    model.experimentalSupportedTools !== undefined &&
+    (!Array.isArray(model.experimentalSupportedTools) ||
+      model.experimentalSupportedTools.some(
+        (tool) => typeof tool !== "string" || !tool.trim(),
+      ))
+  ) {
+    return `model ${model.slug} has invalid experimentalSupportedTools`;
+  }
+  if (
     model.supportsImageDetailOriginal !== undefined &&
     typeof model.supportsImageDetailOriginal !== "boolean"
   ) {
@@ -325,17 +586,22 @@ function modelProblem(model, providers, slugs, gatewayModels) {
   if (model.visionBridge !== undefined && model.visionBridge !== false) {
     return `model ${model.slug} may only set visionBridge to false`;
   }
+  if (model.isFree !== undefined && typeof model.isFree !== "boolean") {
+    return `model ${model.slug} has an invalid isFree flag`;
+  }
   // "hosted" means the provider's own backend executes web searches
-  // server-side (xAI's Responses proxy today). No other mode may be declared
-  // yet: an unimplemented mode would make the catalog advertise a search
-  // toggle the request path cannot serve, so the router-side "emulated"
-  // executor must ship before this enum grows.
+  // server-side (xAI's Responses proxy today). "standalone" means Codex
+  // executes the search client-side and returns the result in the routed
+  // conversation; it is still opt-in per model because not every upstream
+  // accepts the resulting web-search items. Keep the enum closed so an
+  // unimplemented mode cannot make the catalog advertise an unsupported
+  // search path.
   if (
     model.searchTool !== undefined &&
     (!model.searchTool ||
       typeof model.searchTool !== "object" ||
       Array.isArray(model.searchTool) ||
-      model.searchTool.mode !== "hosted")
+      !["hosted", "standalone"].includes(model.searchTool.mode))
   ) {
     return `model ${model.slug} has an invalid searchTool`;
   }
@@ -450,16 +716,99 @@ function modelProblem(model, providers, slugs, gatewayModels) {
   return undefined;
 }
 
+const STATIC_MODEL_SLUG_ALIASES = new Map([
+  // OpenCode moved Grok 4.5 from Chat Completions to Responses. Keep the old
+  // public slug routable while catalog publication carries picker state to
+  // the protocol-namespaced replacement.
+  ["opencode-go/grok-4.5", "opencode-go-responses/grok-4.5"],
+]);
+
+function validatedStaticModelSlugAliases({ models, providers }) {
+  const modelBySlug = new Map(models.map((model) => [model.slug, model]));
+  const aliases = new Map();
+  for (const [from, to] of STATIC_MODEL_SLUG_ALIASES) {
+    if (modelBySlug.has(from)) {
+      fail(`static model slug alias ${from} collides with a checked-in model`);
+    }
+    const replacement = modelBySlug.get(to);
+    if (!replacement) {
+      // A registry override may intentionally omit this whole provider family;
+      // in that case the repository-specific compatibility alias is irrelevant.
+      // Once the target provider is present, though, a missing target is a typo
+      // or incomplete protocol migration and must stop the load before picker
+      // state or MODEL_BY_SLUG can be rewritten around it.
+      const targetProvider = String(to).split("/", 1)[0];
+      if (providers.has(targetProvider)) {
+        fail(`static model slug alias ${from} points to unknown model ${to}`);
+      }
+      continue;
+    }
+    aliases.set(from, to);
+  }
+  return aliases;
+}
+
 // User-curated models extend the checked-in registry. A broken entry (or a
 // collision after an upstream update ships the same model) must never take
 // the whole router down, so problems skip the entry and surface as warnings.
-function mergeUserModels(base) {
+function mergeUserModels(base, staticAliases) {
   const warnings = [];
   const models = [...base.models];
   const slugs = new Set(models.map((model) => model.slug));
   const gatewayModels = new Set(models.map((model) => model.gatewayModel));
+  // Curation used to publish opaque provider ids before a checked-in entry
+  // gave the same route a stable public slug. Treat provider + upstream id as
+  // routing identity too, not only the public slug: otherwise both names reach
+  // the exact same endpoint and the picker shows a duplicate model. Keep the
+  // replacement so persisted visibility can follow the canonical slug.
+  const checkedInRoutes = new Map(
+    models.map((model) => [`${model.provider}\0${model.upstreamModel}`, model]),
+  );
+  const aliases = new Map();
   const userModels = new Set();
   for (const model of readUserModels()) {
+    // A mutable local overlay may describe routing and presentation, but it
+    // cannot grant itself the repository's native-collaboration certificate.
+    // Local Ollama/LM Studio entries intentionally declare conservative v1 so
+    // they are settled and never spend a cloud compatibility probe. Preserve
+    // that denial, but refuse the positive certificate.
+    if (model?.multiAgentVersion === "v2") {
+      warnings.push(
+        `Skipped user model: model ${model?.slug || "<unknown>"} may not declare multiAgentVersion v2`,
+      );
+      continue;
+    }
+    const checkedIn = checkedInRoutes.get(`${model?.provider}\0${model?.upstreamModel}`);
+    if (checkedIn) {
+      if (typeof model?.slug === "string" && model.slug && model.slug !== checkedIn.slug) {
+        // An old curation slug is safe as an alias only while nothing else
+        // owns that public name. Otherwise the alias loop below would replace
+        // a real checked-in/user model (or a repository migration alias) in
+        // MODEL_BY_SLUG, changing which upstream a trusted slug reaches.
+        if (
+          slugs.has(model.slug)
+          || staticAliases.has(model.slug)
+          || aliases.has(model.slug)
+        ) {
+          warnings.push(
+            `Skipped user model: alias ${model.slug} for checked-in route ${checkedIn.slug} collides with an existing model or alias`,
+          );
+          continue;
+        }
+        aliases.set(model.slug, checkedIn.slug);
+      }
+      warnings.push(
+        `Skipped user model: ${model?.slug || "<unknown>"} duplicates checked-in route ${checkedIn.slug}`,
+      );
+      continue;
+    }
+    if (
+      typeof model?.slug === "string"
+      && (staticAliases.has(model.slug) || aliases.has(model.slug))
+    ) {
+      warnings.push(`Skipped user model: model slug ${model.slug} collides with an existing model alias`);
+      continue;
+    }
     const problem = modelProblem(model, base.providers, slugs, gatewayModels);
     if (problem) {
       warnings.push(`Skipped user model: ${problem}`);
@@ -467,7 +816,7 @@ function mergeUserModels(base) {
     }
     slugs.add(model.slug);
     gatewayModels.add(model.gatewayModel);
-    const frozen = Object.freeze(model);
+    const frozen = normalizedModel(model, base.providers.get(model.provider), { curated: true });
     userModels.add(frozen);
     models.push(frozen);
   }
@@ -483,20 +832,41 @@ function mergeUserModels(base) {
     }
     return true;
   });
-  return { models: Object.freeze(kept), warnings: Object.freeze(warnings) };
+  return {
+    models: Object.freeze(kept),
+    warnings: Object.freeze(warnings),
+    aliases: new Map(aliases),
+  };
 }
 
 const registry = loadRegistry();
-const merged = mergeUserModels(registry);
+const staticAliases = validatedStaticModelSlugAliases(registry);
+const merged = mergeUserModels(registry, staticAliases);
 
 export const PROVIDERS = registry.providers;
+// The immutable registry shipped by this checkout, before the operator's
+// mutable user-model overlay is merged. Repository certification gates must
+// bind to this set: a local overlay is useful routing configuration, but it
+// cannot certify itself for every installer.
+export const CHECKED_IN_MODELS = registry.models;
 export const MODELS = merged.models;
 export const USER_MODEL_WARNINGS = merged.warnings;
+// Old curated public slugs that now resolve to a checked-in route. Catalog
+// publication migrates picker decisions through these aliases before applying
+// defaults, so an update removes the duplicate without hiding the model.
+export const MODEL_SLUG_ALIASES = new Map([
+  ...staticAliases,
+  ...merged.aliases,
+]);
 export const LISTED_MODELS = Object.freeze(MODELS.filter((model) => model.listed));
 export const API_MODELS = Object.freeze(
   MODELS.filter((model) => PROVIDERS.get(model.provider)?.kind === "openai-compatible"),
 );
 export const MODEL_BY_SLUG = new Map(MODELS.map((model) => [model.slug, model]));
+for (const [from, to] of MODEL_SLUG_ALIASES) {
+  const replacement = MODEL_BY_SLUG.get(to);
+  if (replacement) MODEL_BY_SLUG.set(from, replacement);
+}
 export const MODEL_BY_GATEWAY_ID = new Map(
   MODELS.map((model) => [model.gatewayModel, model]),
 );

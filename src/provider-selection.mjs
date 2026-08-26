@@ -9,12 +9,15 @@ import {
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { discoveryDisabled } from "./discovery-mode.mjs";
 import { protectPrivateFile } from "./file-security.mjs";
 import { PROVIDER_SELECTION_PATH, STATE_DIR, TARGET } from "./paths.mjs";
-import { LISTED_MODELS, PROVIDERS } from "./model-registry.mjs";
+import { LISTED_MODELS, PROVIDERS, providerNeedsNoKey } from "./model-registry.mjs";
 import { targetCli } from "./target-integration.mjs";
 import { kimiOAuthStatus } from "./oauth-status.mjs";
 import { grokOAuthStatus } from "./grok-oauth-status.mjs";
+import { antigravityOAuthStatus } from "./antigravity-oauth-status.mjs";
+import { devinCliStatus } from "./devin-cli-status.mjs";
 import { credentialStatus } from "./provider-credentials.mjs";
 
 const RETIRED_PROVIDER_ALIASES = new Map([["chatgpt-oauth", "grok-oauth"]]);
@@ -79,6 +82,11 @@ function filterKnownProviderIds(values) {
 }
 
 export function configuredProviderIds() {
+  // Under --no-discovery nothing counts as configured, not even keyless local
+  // backends that read no credential: "configured" feeds the default
+  // selection, the catalog, and the enable gate, and an idle install promises
+  // all of those stay empty until the operator re-runs setup.
+  if (discoveryDisabled()) return [];
   const configured = [];
   for (const provider of PROVIDERS.values()) {
     if (provider.kind === "oauth") {
@@ -86,17 +94,38 @@ export function configuredProviderIds() {
         configured.push(provider.id);
       } else if (provider.id === "grok-oauth" && grokOAuthStatus().configured) {
         configured.push(provider.id);
+      } else if (provider.id === "antigravity-oauth" && antigravityOAuthStatus().configured) {
+        configured.push(provider.id);
+      } else if (provider.id === "devin-cli" && devinCliStatus().configured) {
+        configured.push(provider.id);
       }
-    } else if (provider.keyless) {
-      // Nothing to configure: the endpoint is on this machine. Whether it is
-      // actually running is a health question, reported by doctor, not a
-      // reason to hide the provider.
+    } else if (providerNeedsNoKey(provider)) {
+      // Nothing to configure: local providers run on this machine, while
+      // anonymous providers authenticate by the provider's free-model policy.
+      // Reachability and rate limits remain health questions, not reasons to
+      // hide a provider from the picker.
       configured.push(provider.id);
     } else if (credentialStatus(provider, { persistent: true }).configured) {
       configured.push(provider.id);
     }
   }
   return configured;
+}
+
+// `configuredProviderIds()` answers whether a provider can authenticate. The
+// installer also needs a narrower answer: which configured providers may be
+// enabled when the operator did not name any. Anonymous providers can
+// authenticate without a key, but enabling one sends future prompts to a
+// third-party endpoint, so it must be an explicit choice. Loopback keyless
+// providers remain safe to include in the default.
+export function defaultProviderIds() {
+  // A per-model-endpoint container is excluded on the same reasoning: it holds
+  // whatever endpoints someone put in it, and at least one of them today is a
+  // third-party address reached with no credential. "Enabling this sends
+  // prompts off-box" has to stay a choice somebody made.
+  return configuredProviderIds().filter(
+    (id) => !["anonymous", "per-model"].includes(PROVIDERS.get(id)?.authMode),
+  );
 }
 
 // Never throws. Returns the providers to expose plus what had to be ignored, so
@@ -184,7 +213,7 @@ export function writeProviderSelection(values) {
 export function enableProvider(providerId) {
   const current = existsSync(PROVIDER_SELECTION_PATH)
     ? readProviderSelection()
-    : configuredProviderIds();
+    : defaultProviderIds();
   return writeProviderSelection([...current, providerId]);
 }
 
@@ -192,7 +221,7 @@ export function disableProvider(providerId) {
   const target = canonicalProviderId(providerId);
   const current = existsSync(PROVIDER_SELECTION_PATH)
     ? readProviderSelection()
-    : configuredProviderIds();
+    : defaultProviderIds();
   return writeProviderSelection(
     current.filter((id) => canonicalProviderId(id) !== target),
   );
@@ -233,9 +262,19 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
         `${JSON.stringify({ providers: writeProviderSelection(values) }, null, 2)}\n`,
       );
     } else if (command === "ensure-configured") {
-      const providers = existsSync(PROVIDER_SELECTION_PATH)
+      const explicit = existsSync(PROVIDER_SELECTION_PATH);
+      const providers = explicit
         ? readProviderSelection()
-        : writeProviderSelection(configuredProviderIds());
+        : writeProviderSelection(defaultProviderIds());
+      // An explicitly written empty selection is a deliberate state -- an
+      // idle --no-provider install, or an operator who hid the last provider
+      // -- and installing on top of it must keep working, or `bin/update`
+      // would strand exactly those installs. Only a *discovered* empty set
+      // still means "nothing can authenticate yet".
+      if (providers.length === 0 && explicit) {
+        process.stdout.write(`${JSON.stringify({ providers: [], idle: true }, null, 2)}\n`);
+        process.exit(0);
+      }
       if (providers.length === 0) {
         throw new Error(
           `No provider credential is configured. Run ${

@@ -6,6 +6,11 @@ import { fileURLToPath } from "node:url";
 
 import { readInstallManifest } from "./install-manifest.mjs";
 import { SOURCE_ROOT, TARGET } from "./paths.mjs";
+import {
+  automaticTraySupervisionAllowed,
+  readTraySupervisionPreference,
+  traySupervisionPreferencePath,
+} from "./tray-supervision-preference.mjs";
 
 function git(args, options = {}) {
   const output = execFileSync("git", ["-C", SOURCE_ROOT, ...args], {
@@ -83,7 +88,16 @@ function requireReplaceableCheckout(force) {
   git(["reset", "--hard", "HEAD"], { inherit: true });
 }
 
-export function currentCheckoutInstaller(platform = process.platform, target = TARGET) {
+// `posixScript` picks which bin/ entry point the POSIX branch runs. Windows
+// has only the one installer -- codex-router.ps1 maps both `install` and
+// `enable` onto `install.ps1 -CheckoutInstall` -- so the Windows half is
+// identical either way, which is exactly why control.mjs reuses this instead
+// of hand-rolling a second PowerShell argument list that nothing tested.
+export function currentCheckoutInstaller(
+  platform = process.platform,
+  target = TARGET,
+  { posixScript = "install" } = {},
+) {
   return platform === "win32"
     ? {
         command: "powershell.exe",
@@ -99,7 +113,7 @@ export function currentCheckoutInstaller(platform = process.platform, target = T
           target,
         ],
       }
-    : { command: path.join(SOURCE_ROOT, "bin", "install"), args: [] };
+    : { command: path.join(SOURCE_ROOT, "bin", posixScript), args: [] };
 }
 
 function installCurrentCheckout() {
@@ -137,12 +151,19 @@ export function trayRefreshRequired({
   home = os.homedir(),
   sourceRoot = SOURCE_ROOT,
   registeredPath,
+  supervisionPreference,
 } = {}) {
   if (platform !== "darwin") return false;
+  const preference = supervisionPreference ?? readTraySupervisionPreference({
+    file: traySupervisionPreferencePath({ home }),
+  });
+  if (!automaticTraySupervisionAllowed(preference)) return false;
   const registered = registeredPath ?? registeredTrayBundlePath();
   const candidates = [
     path.join(sourceRoot, "dist", "Model Router.app"),
+    path.join(sourceRoot, "dist", "Codex Router.app"),
     path.join(home, "Applications", "Model Router.app"),
+    path.join(home, "Applications", "Codex Router.app"),
   ];
   return (
     candidates.some((candidate) => existsSync(candidate)) ||
@@ -154,9 +175,16 @@ export function trayRefreshRequired({
 // update never leaves a stale companion binary behind. Best-effort: the router
 // update itself succeeded, and a failed tray refresh must not roll it back.
 function refreshTrayCompanion() {
+  // A desktop app can be this update's parent. Replacing it synchronously
+  // would deadlock against the parent's active-mutation drain; the caller
+  // starts `control tray refresh` detached after this transaction returns.
+  if (process.env.CODEX_ROUTER_DEFER_TRAY_REBUILD === "1") return;
   if (!trayRefreshRequired()) return;
   const launcher = path.join(SOURCE_ROOT, "bin", "model-router-tray");
-  const result = spawnSync(launcher, [], { cwd: SOURCE_ROOT, stdio: "inherit" });
+  const result = spawnSync(launcher, ["--preserve-window"], {
+    cwd: SOURCE_ROOT,
+    stdio: "inherit",
+  });
   if (result.error) {
     process.stderr.write(`Menu-bar companion refresh did not finish: ${result.error.message}\n`);
   } else if (result.status !== 0) {

@@ -20,6 +20,12 @@ import {
   TARGET,
   TARGET_DISPLAY_NAME,
 } from "./paths.mjs";
+import { antigravityClientSecretEnvironment } from "./antigravity-oauth-constants.mjs";
+import { serviceProxyEnvironment } from "./proxy-environment.mjs";
+import {
+  skipServiceManagerCall,
+  assertServiceWriteIsolated,
+} from "./service-write-guard.mjs";
 
 const effectivePlatform = process.env.CODEX_ROUTER_SERVICE_PLATFORM || process.platform;
 const command = process.argv[2] || "status";
@@ -34,6 +40,12 @@ const unitPath = path.join(
   "user",
   unitName,
 );
+
+const guardUnitWrite = () => assertServiceWriteIsolated(unitPath, {
+  redirected: Boolean(process.env.XDG_CONFIG_HOME),
+  label: "systemd unit",
+  override: "XDG_CONFIG_HOME",
+});
 
 if (effectivePlatform !== "linux" && command !== "render") {
   throw new Error("The systemd service manager runs on Linux only.");
@@ -57,6 +69,9 @@ function unit() {
     MODEL_ROUTER_OAUTH_PORT: String(PORTS.oauth),
     MODEL_ROUTER_PORT: String(PORTS.router),
     MODEL_ROUTER_API_PORT: String(PORTS.api),
+    MODEL_ROUTER_GROK_OAUTH_PORT: String(PORTS.grokOauth),
+    MODEL_ROUTER_DEVIN_CLI_PORT: String(PORTS.devinCli),
+    MODEL_ROUTER_ANTIGRAVITY_OAUTH_PORT: String(PORTS.antigravityOauth),
     CODEX_HOME,
     CODEX_ROUTER_STATE_DIR: STATE_DIR,
     CODEX_ROUTER_QUIET: "1",
@@ -64,6 +79,8 @@ function unit() {
     CODEX_ROUTER_OAUTH_PORT: String(PORTS.oauth),
     CODEX_ROUTER_PORT: String(PORTS.router),
     CODEX_ROUTER_API_PORT: String(PORTS.api),
+    ...serviceProxyEnvironment(),
+    ...antigravityClientSecretEnvironment(),
     ...(process.env.KIMI_CODE_HOME ? { KIMI_CODE_HOME: process.env.KIMI_CODE_HOME } : {}),
     ...(process.env.CODEX_ROUTER_SOURCE_ROOT
       ? { CODEX_ROUTER_SOURCE_ROOT: SOURCE_ROOT }
@@ -97,7 +114,32 @@ WantedBy=default.target
 `;
 }
 
+// Only this platform's own module can reach this machine's service manager.
+// Run anywhere else -- the cross-platform render tests drive all three modules
+// on one host -- systemctl is absent or a test's own stub.
+const HOST_MANAGED = process.platform === "linux";
+
+// The write guard covers the unit file, but a test cannot redirect systemd:
+// XDG_CONFIG_HOME moves where the unit is written, not where the running
+// systemd looks for it, so `enable --now codex-router.service` from an
+// otherwise isolated test acts on the developer's own unit. Same failure the
+// launchd module already skips, same shape.
+//
+// Reads stay live. `status` has to keep answering whether the unit is really
+// active, or the doctor reasons from a state the skip invented.
+const MUTATING_VERBS = new Set([
+  "daemon-reload",
+  "disable",
+  "enable",
+  "restart",
+  "start",
+  "stop",
+]);
+
 function systemctl(args, options = {}) {
+  if (MUTATING_VERBS.has(args[0]) && skipServiceManagerCall({ hostManaged: HOST_MANAGED })) {
+    return "";
+  }
   return execFileSync("systemctl", ["--user", ...args], {
     encoding: "utf8",
     stdio: options.quiet ? ["ignore", "ignore", "ignore"] : ["ignore", "pipe", "pipe"],
@@ -108,8 +150,11 @@ function writeUnit() {
   mkdirSync(path.dirname(unitPath), { recursive: true, mode: 0o700 });
   mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
   const temporary = `${unitPath}.tmp.${process.pid}`;
-  writeFileSync(temporary, unit(), { encoding: "utf8", mode: 0o644 });
-  chmodSync(temporary, 0o644);
+  // Proxy URLs may carry credentials, so the generated unit is private just
+  // like the state it launches with.
+  guardUnitWrite();
+  writeFileSync(temporary, unit(), { encoding: "utf8", mode: 0o600 });
+  chmodSync(temporary, 0o600);
   renameSync(temporary, unitPath);
 }
 
@@ -137,6 +182,7 @@ if (command === "render") {
   } catch {
     // The service may not be installed or running.
   }
+  guardUnitWrite();
   if (existsSync(unitPath)) unlinkSync(unitPath);
   try {
     systemctl(["daemon-reload"], { quiet: true });

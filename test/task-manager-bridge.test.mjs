@@ -73,6 +73,14 @@ test("error log defaults empty and clears", () => {
   assert.deepEqual(bridge.errorLog(), []);
 });
 
+test("failure attribution accepts the request's injected account", () => {
+  bridge.setTaskManagerEnabled(true);
+  bridge.notifyAccountFailure(429, false, false, "seat-from-request");
+  assert.equal(bridge.errorLog()[0].accountId, "seat-from-request");
+  bridge.clearErrorLog();
+  bridge.setTaskManagerEnabled(false);
+});
+
 test("poll intervals default, persist, and clamp", () => {
   assert.equal(bridge.readTaskManagerConfig().logIntervalMs, 2000);
   assert.equal(bridge.readTaskManagerConfig().accountsIntervalMs, 15000);

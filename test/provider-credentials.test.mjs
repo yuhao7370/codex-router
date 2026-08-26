@@ -30,6 +30,14 @@ const { privateFileIsProtected } = await import("../src/file-security.mjs");
 
 test("provider credentials use protected files and remove legacy managed keys", () => {
   try {
+    const anonymous = resolveProviderCredential("opencode-free");
+    assert.deepEqual(anonymous, {
+      value: undefined,
+      source: "official anonymous endpoint",
+      persistent: true,
+    });
+    assert.throws(() => writeProviderCredential("opencode-free", "SHOULD_NOT_BE_STORED"), /Unknown API-key provider/);
+
     const deepSeekPath = writeProviderCredential("deepseek", "TEST_DEEPSEEK_FILE_KEY");
     assert.equal(privateFileIsProtected(deepSeekPath), true);
     if (process.platform !== "win32") {
@@ -103,6 +111,36 @@ test("provider credentials use protected files and remove legacy managed keys", 
     assert.equal(existsSync(chutesPath), false);
   } finally {
     rmSync(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("--no-discovery blinds the resolver to stored keys without a single keychain spawn", () => {
+  try {
+    // A credential really is on disk; the kill-switch must refuse to see it.
+    writeProviderCredential("deepseek", "TEST_DEEPSEEK_HIDDEN_KEY");
+    process.env.DEEPSEEK_API_KEY = "TEST_DEEPSEEK_ENVIRONMENT_KEY";
+    process.env.CODEX_ROUTER_NO_DISCOVERY = "1";
+    resetKeychainCache();
+
+    const before = keychainProbeCount();
+    assert.equal(resolveProviderCredential("deepseek"), undefined);
+    assert.equal(resolveProviderCredential("openrouter", { persistent: true }), undefined);
+    assert.equal(keychainProbeCount(), before, "the kill-switch still spawned /usr/bin/security");
+
+    // Sources that read nothing keep answering: anonymous and keyless
+    // providers carry no secret, so they are not discovery.
+    assert.equal(resolveProviderCredential("opencode-free")?.persistent, true);
+
+    delete process.env.CODEX_ROUTER_NO_DISCOVERY;
+    assert.equal(
+      resolveProviderCredential("deepseek", { persistent: true })?.value,
+      "TEST_DEEPSEEK_HIDDEN_KEY",
+      "lifting the switch must reveal the stored key again",
+    );
+  } finally {
+    delete process.env.CODEX_ROUTER_NO_DISCOVERY;
+    delete process.env.DEEPSEEK_API_KEY;
+    removeProviderCredential("deepseek");
   }
 });
 

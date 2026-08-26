@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
+import path from "node:path";
 import { test } from "node:test";
 
-import { trayBundleDir, trayDecision } from "../src/tray-install.mjs";
+import { desktopTrayBinary, trayBundleDir, trayDecision } from "../src/tray-install.mjs";
 
 test("trayDecision skips when --no-tray is passed", () => {
   assert.equal(
@@ -10,9 +11,27 @@ test("trayDecision skips when --no-tray is passed", () => {
   );
 });
 
-test("trayDecision skips on Windows where no launcher exists yet", () => {
+// Windows used to be excluded here because it had no launcher. It has one
+// now, and the exclusion was the reason the installer silently skipped the one
+// platform whose tray never got built by anything else.
+test("trayDecision offers the tray on Windows", () => {
   assert.equal(
     trayDecision({ platform: "win32", withTray: true, noTray: false, guided: true }),
+    "install",
+  );
+  assert.equal(
+    trayDecision({ platform: "win32", withTray: false, noTray: false, guided: true }),
+    "ask",
+  );
+  assert.equal(
+    trayDecision({ platform: "win32", withTray: false, noTray: true, guided: true }),
+    "skip",
+  );
+});
+
+test("trayDecision still skips a platform with no companion at all", () => {
+  assert.equal(
+    trayDecision({ platform: "aix", withTray: true, noTray: false, guided: true }),
     "skip",
   );
 });
@@ -45,7 +64,7 @@ test("trayDecision skips silently in automatic mode", () => {
 test("trayBundleDir places the macOS bundle in the user's Applications folder", () => {
   assert.equal(
     trayBundleDir("darwin", "/Users/example"),
-    "/Users/example/Applications/Model Router.app",
+    "/Users/example/Applications/Codex Router.app",
   );
 });
 
@@ -58,4 +77,16 @@ test("trayBundleDir uses forward slashes regardless of the host OS", () => {
 
 test("trayBundleDir is undefined on other platforms", () => {
   assert.equal(trayBundleDir("linux", "/home/example"), undefined);
+});
+
+test("desktopTrayBinary preserves the legacy Tauri identity per platform", () => {
+  assert.equal(
+    desktopTrayBinary("win32", "C:\\repo"),
+    ["C:\\repo", "apps", "desktop", "src-tauri", "target", "release", "codex-router-desktop.exe"].join(
+      path.sep,
+    ),
+  );
+  assert.ok(desktopTrayBinary("linux", "/repo").endsWith("codex-router-desktop"));
+  // macOS builds a Swift app bundle instead, served by TRAY_APP_BINARY.
+  assert.equal(desktopTrayBinary("darwin", "/repo"), undefined);
 });

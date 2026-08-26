@@ -30,7 +30,11 @@
       "inputModalities": [
         "text"
       ],
-      "compHash": "opencode-go-deepseek-v4-flash-v1"
+      "searchTool": {
+        "mode": "standalone"
+      },
+      "requestProfile": "auto-tool-choice",
+      "compHash": "opencode-go-deepseek-v4-flash-v3"
     }
   ]
 }

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -52,7 +52,27 @@ function isolatedEnvironment(testRoot) {
     GITHUB_TOKEN: "",
     CLINE_API_KEY: "",
     CHUTES_API_KEY: "",
+    OPENCODE_API_KEY: "",
+    OPENCODE_GO_API_KEY: "",
   };
+}
+
+function seedCatalogCache(stateDir) {
+  mkdirSync(stateDir, { recursive: true });
+  writeFileSync(path.join(stateDir, "provider-catalog-cache.json"), JSON.stringify({
+    version: 1,
+    providers: {
+      "opencode-go": { discovered: ["go-old-account"], fetchedAt: new Date().toISOString() },
+      "opencode-zen": { discovered: ["zen-old-account"], fetchedAt: new Date().toISOString() },
+      deepseek: { discovered: ["keep-me"], fetchedAt: new Date().toISOString() },
+    },
+  }));
+}
+
+function cachedProviders(stateDir) {
+  return JSON.parse(
+    readFileSync(path.join(stateDir, "provider-catalog-cache.json"), "utf8"),
+  ).providers;
 }
 
 test("provider onboarding reports install, login, and API key actions without secrets", () => {
@@ -72,11 +92,27 @@ test("provider onboarding reports install, login, and API key actions without se
     assert.equal(byId["grok-api"].action, "add-key");
     assert.equal(byId["anthropic-api"].action, "add-key");
     assert.equal(byId["minimax-token-plan"].action, "add-key");
+    assert.equal(byId.commandcode.action, "add-key");
+    assert.equal("signIn" in byId.commandcode, false);
     assert.equal(byId["github-copilot"].action, "add-key");
     assert.equal(byId["github-copilot"].credentialLabel, "GitHub token");
     assert.equal("credentialLabel" in byId["deepseek"], false);
     assert.equal(byId.clinepass.action, "add-key");
     assert.equal(byId.chutes.action, "add-key");
+    for (const id of ["opencode-free", "kilo-free"]) {
+      assert.equal(byId[id].kind, "anonymous");
+      assert.equal(byId[id].configured, true);
+      assert.equal(byId[id].action, "anonymous");
+      assert.equal(byId[id].credentialLabel, "No API key");
+      assert.match(byId[id].anonymousNote, /No API key/);
+    }
+    // A per-model-endpoint container must never offer a key field: a secret
+    // stored against it would be read by nothing.
+    assert.equal(byId.custom.kind, "per-model");
+    assert.equal(byId.custom.configured, true);
+    assert.equal(byId.custom.action, "per-model");
+    assert.equal(byId.custom.credentialLabel, "Per-model endpoints");
+    assert.match(byId.custom.perModelNote, /own endpoint/);
     assert.equal("source" in byId["kimi-api"], false);
   } finally {
     rmSync(testRoot, { recursive: true, force: true });
@@ -103,6 +139,37 @@ test("control accepts an API key only through stdin and stores it privately", ()
       readFileSync(path.join(testRoot, "state", "xai-api-key.secret"), "utf8").trim(),
       testKey,
     );
+  } finally {
+    rmSync(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("control clears every catalog source when a shared credential changes", () => {
+  const testRoot = mkdtempSync(path.join(os.tmpdir(), "provider-family-cache-control-"));
+  const environment = isolatedEnvironment(testRoot);
+  const stateDir = environment.MODEL_ROUTER_STATE_DIR;
+  try {
+    seedCatalogCache(stateDir);
+    const saved = spawnSync(
+      process.execPath,
+      [path.join(root, "src", "control.mjs"), "credential", "opencode-go"],
+      { cwd: root, encoding: "utf8", env: environment, input: "TEST_OPENCODE_KEY\n" },
+    );
+    assert.equal(saved.status, 0, saved.stderr);
+    assert.equal(cachedProviders(stateDir)["opencode-go"], undefined);
+    assert.equal(cachedProviders(stateDir)["opencode-zen"], undefined);
+    assert.deepEqual(cachedProviders(stateDir).deepseek.discovered, ["keep-me"]);
+
+    seedCatalogCache(stateDir);
+    const removed = spawnSync(
+      process.execPath,
+      [path.join(root, "src", "control.mjs"), "credential", "opencode-go", "--remove"],
+      { cwd: root, encoding: "utf8", env: environment },
+    );
+    assert.equal(removed.status, 0, removed.stderr);
+    assert.equal(cachedProviders(stateDir)["opencode-go"], undefined);
+    assert.equal(cachedProviders(stateDir)["opencode-zen"], undefined);
+    assert.deepEqual(cachedProviders(stateDir).deepseek.discovered, ["keep-me"]);
   } finally {
     rmSync(testRoot, { recursive: true, force: true });
   }
@@ -154,6 +221,50 @@ test("removing an absent API key reports no change instead of failing", () => {
     );
     assert.equal(result.status, 0, result.stderr);
     assert.equal(JSON.parse(result.stdout).removal.removedFiles, 0);
+  } finally {
+    rmSync(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("provider-key remove awaits removal and reports the deleted credential", () => {
+  const testRoot = mkdtempSync(path.join(os.tmpdir(), "provider-key-await-remove-"));
+  const stateDir = path.join(testRoot, "state");
+  const keyPath = path.join(stateDir, "deepseek-api-key.secret");
+  try {
+    mkdirSync(stateDir, { recursive: true });
+    writeFileSync(keyPath, "test-provider-key\n", { mode: 0o600 });
+    const result = spawnSync(
+      process.execPath,
+      [path.join(root, "src", "provider-key.mjs"), "deepseek", "remove"],
+      { cwd: root, encoding: "utf8", env: isolatedEnvironment(testRoot) },
+    );
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(existsSync(keyPath), false);
+    assert.match(result.stdout, /Removed 1 managed DeepSeek API key file/);
+    assert.doesNotMatch(result.stdout, /No managed DeepSeek API key file exists/);
+  } finally {
+    rmSync(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("provider-key remove clears every catalog source sharing the credential", () => {
+  const testRoot = mkdtempSync(path.join(os.tmpdir(), "provider-family-cache-cli-"));
+  const environment = isolatedEnvironment(testRoot);
+  const stateDir = environment.MODEL_ROUTER_STATE_DIR;
+  const keyPath = path.join(stateDir, "opencode-go-api-key.secret");
+  try {
+    seedCatalogCache(stateDir);
+    writeFileSync(keyPath, "test-provider-key\n", { mode: 0o600 });
+    const result = spawnSync(
+      process.execPath,
+      [path.join(root, "src", "provider-key.mjs"), "opencode-go", "remove"],
+      { cwd: root, encoding: "utf8", env: environment },
+    );
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(existsSync(keyPath), false);
+    assert.equal(cachedProviders(stateDir)["opencode-go"], undefined);
+    assert.equal(cachedProviders(stateDir)["opencode-zen"], undefined);
+    assert.deepEqual(cachedProviders(stateDir).deepseek.discovered, ["keep-me"]);
   } finally {
     rmSync(testRoot, { recursive: true, force: true });
   }

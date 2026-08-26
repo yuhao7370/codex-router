@@ -14,7 +14,7 @@ import {
 import os from "node:os";
 import path from "node:path";
 
-import { codexSpawnTarget, findCodexBinary } from "./codex-binary.mjs";
+import { findCodexBinary, spawnableCommand } from "./codex-binary.mjs";
 
 import {
   assertCallerSecret,
@@ -27,6 +27,11 @@ import {
   protectPrivateFile,
 } from "./file-security.mjs";
 import {
+  clearCodexRouterDefault,
+  readCodexRouterDefault,
+  writeCodexRouterDefault,
+} from "./codex-default-model.mjs";
+import {
   activateNativeCatalogSource,
   catalogPathsEqual,
   clearNativeCatalogSource,
@@ -38,6 +43,7 @@ import {
   CODEX_PROVIDER_MODE_PATH,
   CONFIG_PATH,
   LEGACY_STATE_DIRS,
+  LEGACY_PORTS,
   MERGED_CATALOG_PATH,
   PORTS,
   SIGNED_PROVIDER_MODE_PATH,
@@ -45,7 +51,10 @@ import {
 } from "./paths.mjs";
 import { scanTomlDocument } from "./toml-structure.mjs";
 
-const legacyRouterBaseUrl = loopback(PORTS.router, "/v1");
+const managedRouterBaseUrls = new Set([
+  loopback(PORTS.router, "/v1"),
+  loopback(LEGACY_PORTS.router, "/v1"),
+]);
 const startMarker = "# BEGIN codex-router-managed";
 const endMarker = "# END codex-router-managed";
 const providerStartMarker = "# BEGIN codex-router-provider-managed";
@@ -59,6 +68,22 @@ const multiAgentV2StartMarker = "# BEGIN codex-router-multi-agent-v2-managed";
 const multiAgentV2EndMarker = "# END codex-router-multi-agent-v2-managed";
 const createdAgentsTableMarker = "# codex-router-created-agents-table";
 const managedAgentMaxConcurrency = 100;
+// Codex 0.147 records a child's FINAL_ANSWER as subAgentActivity
+// `interacted` and keeps that child visually working for the whole live
+// parent turn. close_agent is not in the v2 toolset; interrupt_agent is the
+// only model-callable way to flip the badge to done without the user
+// clicking into the child. The usage hint is injected into the root
+// developer's collaboration preamble.
+const managedSubagentCompletionHint =
+  "When a child agent finishes (FINAL_ANSWER, task_complete, or an idle/errored wait snapshot), call interrupt_agent on that child so Codex can mark it done. Do not leave finished children in the working state.";
+
+export function managedMultiAgentV2FeatureLine() {
+  return (
+    `multi_agent_v2 = { enabled = true, max_concurrent_threads_per_session = ${managedAgentMaxConcurrency}, ` +
+    `expose_spawn_agent_model_overrides = true, usage_hint_enabled = true, ` +
+    `root_agent_usage_hint_text = ${tomlValue(managedSubagentCompletionHint)} }`
+  );
+}
 const routerProviderId = "codex-router";
 const signedProviderId = "codex-router-signed";
 const defaultChatgptBaseUrl = "https://chatgpt.com/backend-api";
@@ -74,9 +99,15 @@ function tomlValue(value) {
 const realtimeCallBaseUrlKey = "experimental_realtime_webrtc_call_base_url";
 const realtimeWebsocketBaseUrlKey = "experimental_realtime_ws_base_url";
 const markerPairs = [
-  [startMarker, endMarker],
-  [providerStartMarker, providerEndMarker],
-  [signedProviderStartMarker, signedProviderEndMarker],
+  // The legacy layout parked the managed provider table inside the root
+  // block, so the root pair recognizes that header as managed too.
+  [startMarker, endMarker, "[model_providers.codex-router]"],
+  [providerStartMarker, providerEndMarker, "[model_providers.codex-router]"],
+  [
+    signedProviderStartMarker,
+    signedProviderEndMarker,
+    "[model_providers.codex-router-signed]",
+  ],
   [agentConcurrencyStartMarker, agentConcurrencyEndMarker],
   [multiAgentV2StartMarker, multiAgentV2EndMarker],
   ["# BEGIN kimi-codex-router-managed", "# END kimi-codex-router-managed"],
@@ -96,8 +127,9 @@ function configuredRouterBaseUrl() {
 
 function isManagedRouterBaseUrl(value) {
   return (
-    value === legacyRouterBaseUrl ||
-    isManagedCallerBaseUrl(value, PORTS.router)
+    managedRouterBaseUrls.has(value) ||
+    isManagedCallerBaseUrl(value, PORTS.router) ||
+    isManagedCallerBaseUrl(value, LEGACY_PORTS.router)
   );
 }
 
@@ -119,18 +151,63 @@ function isRecognizedRouterBaseUrl(value) {
   }
 }
 
-function removeMarkerPair(input, start, end) {
-  const escapedStart = start.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const escapedEnd = end.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  return input.replace(
-    new RegExp(`(?:^|\\n)${escapedStart}\\n[\\s\\S]*?\\n${escapedEnd}(?:\\n|$)`, "g"),
-    "\n",
-  );
+// A managed block is regenerated from scratch on every enable/disable, but
+// foreign content can land inside one: the desktop app rewrites config.toml
+// wholesale and may park user tables (for example [desktop]) between the
+// managed provider table and the end marker. Dropping the whole block would
+// silently delete those user settings, so foreign table segments are hoisted
+// out of the block before it is removed. The managed table itself is
+// identified by its header and dropped, since the caller regenerates it.
+function foreignTableSegments(innerLines, managedHeader) {
+  // The real TOML scanner, not a `[`-prefix regex: a multiline string value
+  // inside a parked table can hold a line that merely looks like a header, and
+  // splitting there would corrupt the hoisted table. Ambiguous structure makes
+  // the scanner throw, which aborts the rewrite before anything is written —
+  // the same fail-closed posture the signed-routing path takes.
+  const { headers } = scanTomlDocument(innerLines.join("\n"));
+  const hoisted = [];
+  for (let position = 0; position < headers.length; position += 1) {
+    const start = headers[position].index;
+    if (managedHeader && innerLines[start].trim() === managedHeader) continue;
+    const end =
+      position + 1 < headers.length ? headers[position + 1].index : innerLines.length;
+    hoisted.push(...innerLines.slice(start, end));
+    // Lines before the first table header are the block's own root keys or
+    // blank/comment noise; both are regenerated by the caller, never hoisted.
+  }
+  return hoisted;
+}
+
+function removeMarkerPair(input, start, end, managedHeader) {
+  const lines = input.split("\n");
+  const output = [];
+  let index = 0;
+  while (index < lines.length) {
+    if (lines[index].trim() !== start) {
+      output.push(lines[index]);
+      index += 1;
+      continue;
+    }
+    let endIndex = index + 1;
+    while (endIndex < lines.length && lines[endIndex].trim() !== end) {
+      endIndex += 1;
+    }
+    if (endIndex >= lines.length) {
+      // An unterminated block is not recognized as managed; leave it alone.
+      output.push(lines[index]);
+      index += 1;
+      continue;
+    }
+    output.push(...foreignTableSegments(lines.slice(index + 1, endIndex), managedHeader));
+    index = endIndex + 1;
+  }
+  return output.join("\n");
 }
 
 function removeMarkedBlock(input) {
   return markerPairs.reduce(
-    (contents, [start, end]) => removeMarkerPair(contents, start, end),
+    (contents, [start, end, managedHeader]) =>
+      removeMarkerPair(contents, start, end, managedHeader),
     input,
   );
 }
@@ -236,17 +313,18 @@ function probeMultiAgentV2Support() {
     writeFileSync(
       path.join(probeHome, "config.toml"),
       `[features]
-multi_agent_v2 = { enabled = true, max_concurrent_threads_per_session = ${managedAgentMaxConcurrency}, expose_spawn_agent_model_overrides = true }
+${managedMultiAgentV2FeatureLine()}
 `,
       { encoding: "utf8", mode: 0o600 },
     );
-    const { command: probeCommand, options } = codexSpawnTarget(binary);
+    const probe = spawnableCommand(binary, ["login", "status"]);
     // `login status` exits non-zero when signed out, so the exit code says
     // nothing about the config; only the load-error message does.
-    const result = spawnSync(probeCommand, ["login", "status"], {
-      ...options,
+    const result = spawnSync(probe.command, probe.args, {
+      ...probe.options,
       encoding: "utf8",
       timeout: 10_000,
+      windowsHide: true,
       env: { ...process.env, CODEX_HOME: probeHome },
     });
     if (result.error) return false;
@@ -269,7 +347,7 @@ function withManagedMultiAgentV2(input) {
   const cleaned = withoutManagedMultiAgentV2(input);
   if (hasModernMultiAgentConfig(cleaned)) return cleaned;
   if (!installedCodexSupportsMultiAgentV2()) return cleaned;
-  const featureLine = `multi_agent_v2 = { enabled = true, max_concurrent_threads_per_session = ${managedAgentMaxConcurrency}, expose_spawn_agent_model_overrides = true }`;
+  const featureLine = managedMultiAgentV2FeatureLine();
   const managedLines = [
     multiAgentV2StartMarker,
     featureLine,
@@ -316,13 +394,14 @@ function probeAgentConcurrencyScalar() {
       `max_concurrent_threads_per_session = ${managedAgentMaxConcurrency}\n`,
       { encoding: "utf8", mode: 0o600 },
     );
-    const { command: probeCommand, options } = codexSpawnTarget(binary);
+    const probe = spawnableCommand(binary, ["login", "status"]);
     // `login status` exits non-zero when signed out, so the exit code says
     // nothing about the config; only the load-error message does.
-    const result = spawnSync(probeCommand, ["login", "status"], {
-      ...options,
+    const result = spawnSync(probe.command, probe.args, {
+      ...probe.options,
       encoding: "utf8",
       timeout: 10_000,
+      windowsHide: true,
       env: { ...process.env, CODEX_HOME: probeHome },
     });
     if (result.error) return true;
@@ -474,9 +553,40 @@ function managedSignedProviderBlock(providerId, baseUrl) {
     `base_url = ${JSON.stringify(baseUrl)}`,
     'wire_api = "responses"',
     "requires_openai_auth = true",
+    // Codex 0.146+ performs standalone web search on the client and sends
+    // the resulting items back through the selected custom provider. Keep
+    // this opt-in on the managed provider table; older Codex versions ignore
+    // the unknown field and retain their existing behavior.
+    "supports_standalone_web_search = true",
     "supports_websockets = false",
     signedProviderEndMarker,
   ].join("\n");
+}
+
+// Keep accepting the pre-standalone-search managed block while upgrading it
+// in place. Existing signed state must not become "user-owned" merely because
+// this optional Codex capability was added.
+function managedSignedProviderBlockLegacy(providerId, baseUrl) {
+  const headerId = /^[A-Za-z0-9_-]+$/.test(providerId)
+    ? providerId
+    : JSON.stringify(providerId);
+  return [
+    signedProviderStartMarker,
+    `[model_providers.${headerId}]`,
+    'name = "Codex Router (with ChatGPT)"',
+    `base_url = ${JSON.stringify(baseUrl)}`,
+    'wire_api = "responses"',
+    "requires_openai_auth = true",
+    "supports_websockets = false",
+    signedProviderEndMarker,
+  ].join("\n");
+}
+
+function managedSignedProviderBlockMatches(actual, providerId, baseUrl) {
+  return [
+    managedSignedProviderBlock(providerId, baseUrl),
+    managedSignedProviderBlockLegacy(providerId, baseUrl),
+  ].includes(actual);
 }
 
 function signedProviderSlot(state, index) {
@@ -546,7 +656,7 @@ function signedProviderBlockIsOwned(contents, state) {
     const range = signedManagedRange(contents);
     if (!range) return false;
     const actual = range.lines.slice(range.start, range.end).join("\n");
-    return actual === managedSignedProviderBlock(state.managedProvider, state.managedBaseUrl);
+    return managedSignedProviderBlockMatches(actual, state.managedProvider, state.managedBaseUrl);
   }
   if (state.version !== 3) return false;
   const sections = state.previousProviderSections;
@@ -567,7 +677,7 @@ function signedProviderBlockIsOwned(contents, state) {
   const actual = range.lines.slice(range.start, range.end).join("\n");
   const slotIndex = lines.indexOf(signedProviderSlot(state, 0));
   return (
-    actual === managedSignedProviderBlock(state.managedProvider, state.managedBaseUrl) &&
+    managedSignedProviderBlockMatches(actual, state.managedProvider, state.managedBaseUrl) &&
     slotIndex + 1 === range.start &&
     providerRanges.length === 1 &&
     providerRanges[0].start === range.start + 1
@@ -790,10 +900,12 @@ function legacyManagedRouterProvider(contents) {
     isManagedRouterBaseUrl(rootBaseUrl) &&
     fields.get("wire_api") === "responses";
   const currentShape =
-    fields.size === 3 &&
+    (fields.size === 3 ||
+      (fields.size === 4 && fields.get("supports_standalone_web_search") === "true")) &&
     fields.get("name") === "Codex Router (external models)";
   const prototypeShape =
-    fields.size === 4 &&
+    (fields.size === 4 ||
+      (fields.size === 5 && fields.get("supports_standalone_web_search") === "true")) &&
     fields.get("name") === "Codex Router (extra providers)" &&
     fields.get("requires_openai_auth") === "true";
   return commonFieldsMatch && (currentShape || prototypeShape)
@@ -841,6 +953,7 @@ function snapshot(contents) {
   const signedActive = signedState
     ? signedProviderStateIsOwned(contents, signedState)
     : false;
+  const routerDefault = readCodexRouterDefault();
   return {
     mode:
       isManagedRouterBaseUrl(baseUrl) && catalog === MERGED_CATALOG_PATH
@@ -858,10 +971,29 @@ function snapshot(contents) {
       signedActive && privateFileIsProtected(SIGNED_PROVIDER_MODE_PATH),
     ),
     signed_provider_state_present: existsSync(SIGNED_PROVIDER_MODE_PATH),
+    router_default_model: routerDefault?.model || null,
+    router_default_managed: Boolean(routerDefault),
     openai_base_url: baseUrl ? redactCallerUrl(baseUrl) : null,
     model_catalog_json: catalog || null,
     config_protected: privateFileIsProtected(CONFIG_PATH),
   };
+}
+
+function applyRouterDefault(contents, state = readCodexRouterDefault()) {
+  return state ? `${replaceRootValue(contents, "model", state.model)}\n` : contents;
+}
+
+// Restore only when the router still owns the exact value it installed. A
+// manual Codex edit wins over a later clear/disable rather than being erased.
+function restoreRouterDefault(contents, state = readCodexRouterDefault()) {
+  if (!state) return contents;
+  const { rootLines } = splitRoot(contents);
+  if (rootValue(rootLines, "model") !== state.model) return contents;
+  return `${replaceRootValue(
+    contents,
+    "model",
+    state.previousPresent ? state.previousModel : undefined,
+  )}\n`;
 }
 
 function enabledContents(contents) {
@@ -948,6 +1080,7 @@ function enabledContents(contents) {
     'name = "Codex Router (external models)"',
     `base_url = ${JSON.stringify(routerBaseUrl)}`,
     'wire_api = "responses"',
+    "supports_standalone_web_search = true",
     providerEndMarker,
   ];
   return withManagedAgentConcurrency(
@@ -1000,9 +1133,11 @@ if (!new Set([
   "login-free-disable",
   "signed-enable",
   "signed-disable",
+  "router-default-set",
+  "router-default-clear",
 ]).has(command)) {
   console.error(
-    "Usage: config-manager.mjs enable|disable|status|login-free-enable|login-free-disable|signed-enable|signed-disable [--adopt-native-catalog]",
+    "Usage: config-manager.mjs enable|disable|status|login-free-enable|login-free-disable|signed-enable|signed-disable|router-default-set MODEL|router-default-clear [--adopt-native-catalog]",
   );
   process.exit(2);
 }
@@ -1018,6 +1153,8 @@ let pendingProviderModeState;
 let clearNativeCatalogSourceAfterWrite = false;
 let activateNativeCatalogSourceAfterWrite = false;
 let pendingSignedProviderModeState;
+let pendingRouterDefaultState;
+let clearRouterDefaultState = false;
 if (command === "enable") {
   const signedState = readSignedProviderModeState();
   if (signedState?.version === 1) {
@@ -1045,13 +1182,41 @@ if (command === "enable") {
   } else {
     next = enabledContents(current);
   }
+  next = applyRouterDefault(next);
   activateNativeCatalogSourceAfterWrite = nativeCatalogNeedsActivation;
+} else if (command === "router-default-set") {
+  const model = String(process.argv[3] || "").trim();
+  if (!model) throw new Error("Usage: config-manager.mjs router-default-set MODEL");
+  const currentSnapshot = snapshot(current);
+  if (currentSnapshot.login_free) {
+    throw new Error("The router default is for signed-in Codex; login-free mode already owns its default.");
+  }
+  if (currentSnapshot.mode !== "router") {
+    throw new Error("Enable Codex Router before setting a router default model.");
+  }
+  const existing = readCodexRouterDefault();
+  const { rootLines } = splitRoot(current);
+  const previousPresent = existing?.previousPresent ?? rootHasValue(rootLines, "model");
+  pendingRouterDefaultState = {
+    version: 1,
+    model,
+    previousPresent,
+    ...(previousPresent
+      ? { previousModel: existing?.previousModel ?? rootValue(rootLines, "model") }
+      : {}),
+  };
+  next = applyRouterDefault(current, pendingRouterDefaultState);
+} else if (command === "router-default-clear") {
+  next = restoreRouterDefault(current);
+  clearRouterDefaultState = Boolean(readCodexRouterDefault());
 } else if (command === "login-free-enable") {
   if (existsSync(SIGNED_PROVIDER_MODE_PATH)) {
     throw new Error("Turn off signed routing before enabling login-free mode.");
   }
-  const enabled = enabledContents(current);
-  const { rootLines } = splitRoot(current);
+  const defaultRestored = restoreRouterDefault(current);
+  clearRouterDefaultState = Boolean(readCodexRouterDefault());
+  const enabled = enabledContents(defaultRestored);
+  const { rootLines } = splitRoot(defaultRestored);
   const loginFreeModel = String(process.argv[3] || "").trim();
   const alreadyManaged =
     rootValue(rootLines, "model_provider") === routerProviderId &&
@@ -1108,6 +1273,7 @@ if (command === "enable") {
     pendingSignedProviderModeState = managed.state;
     next = managed.contents;
   }
+  next = applyRouterDefault(next);
 } else {
   const state = readProviderModeState();
   const signedState = readSignedProviderModeState();
@@ -1201,6 +1367,10 @@ if (command === "enable") {
       ].join("\n").trimEnd()}\n`;
     }
   }
+  if (["disable", "login-free-disable", "signed-disable"].includes(command)) {
+    next = restoreRouterDefault(next);
+    clearRouterDefaultState = Boolean(readCodexRouterDefault());
+  }
 }
 if (existsSync(CONFIG_PATH) && !existsSync(BACKUP_PATH)) {
   copyFileSync(CONFIG_PATH, BACKUP_PATH);
@@ -1209,8 +1379,12 @@ if (existsSync(BACKUP_PATH)) protectPrivateFile(BACKUP_PATH);
 const previousSignedProviderModeState = pendingSignedProviderModeState
   ? readSignedProviderModeState()
   : undefined;
+const previousRouterDefaultState = pendingRouterDefaultState
+  ? readCodexRouterDefault()
+  : undefined;
 if (pendingProviderModeState) writeProviderModeState(pendingProviderModeState);
 if (pendingSignedProviderModeState) writeSignedProviderModeState(pendingSignedProviderModeState);
+if (pendingRouterDefaultState) writeCodexRouterDefault(pendingRouterDefaultState);
 try {
   atomicWrite(next);
   if (activateNativeCatalogSourceAfterWrite) activateNativeCatalogSource();
@@ -1221,6 +1395,13 @@ try {
       writeSignedProviderModeState(previousSignedProviderModeState);
     } else {
       clearSignedProviderModeState();
+    }
+  }
+  if (pendingRouterDefaultState) {
+    if (previousRouterDefaultState) {
+      writeCodexRouterDefault(previousRouterDefaultState);
+    } else {
+      clearCodexRouterDefault();
     }
   }
   if (activateNativeCatalogSourceAfterWrite) {
@@ -1238,4 +1419,5 @@ try {
 if (command === "disable" || command === "login-free-disable") clearProviderModeState();
 if (clearNativeCatalogSourceAfterWrite) clearNativeCatalogSource();
 if (command === "disable" || command === "signed-disable") clearSignedProviderModeState();
+if (clearRouterDefaultState) clearCodexRouterDefault();
 process.stdout.write(`${JSON.stringify(snapshot(next))}\n`);

@@ -1,23 +1,19 @@
 import { execFileSync } from "node:child_process";
 import {
-  chmodSync,
   existsSync,
-  mkdirSync,
   readFileSync,
-  renameSync,
-  writeFileSync,
 } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { protectPrivateFile } from "./file-security.mjs";
+import { writePrivateJson } from "./file-security.mjs";
 import {
   INSTALL_MANIFEST_PATH,
   SOURCE_ROOT,
-  STATE_DIR,
   TARGET,
 } from "./paths.mjs";
 import { providerSelectionStatus } from "./provider-selection.mjs";
+import { serviceProxyEnvironment } from "./proxy-environment.mjs";
 import { packSkillNames } from "./skills-install.mjs";
 
 function gitValue(args) {
@@ -52,16 +48,7 @@ export function readInstallManifest() {
 }
 
 function atomicWrite(value) {
-  mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
-  chmodSync(STATE_DIR, 0o700);
-  const temporary = `${INSTALL_MANIFEST_PATH}.tmp.${process.pid}`;
-  writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, {
-    encoding: "utf8",
-    mode: 0o600,
-  });
-  protectPrivateFile(temporary);
-  renameSync(temporary, INSTALL_MANIFEST_PATH);
-  protectPrivateFile(INSTALL_MANIFEST_PATH);
+  writePrivateJson(INSTALL_MANIFEST_PATH, value, { directoryMode: 0o700 });
 }
 
 export function recordInstall() {
@@ -85,6 +72,16 @@ export function recordInstall() {
     target: TARGET,
     platform: process.platform,
     packageManager: process.env.CODEX_ROUTER_PACKAGE_MANAGER || null,
+    // Recorded so a later repair can put it back. A repair started from a
+    // desktop app inherits no shell environment, and serviceProxyEnvironment()
+    // reads this field precisely to avoid rewriting the service without the
+    // proxy the operator configured.
+    //
+    // A proxy URL may embed `user:password@`, so this file is no less
+    // sensitive than the service definition that already stores the same
+    // value; both are owner-only. support-bundle.mjs strips the credential
+    // from the copy it produces, because that one is meant to be shared.
+    proxyEnvironment: serviceProxyEnvironment(),
     providers: providerSelectionStatus().providers,
     skills,
   };

@@ -37,6 +37,32 @@ export function callerBaseUrl(port, secret) {
   return `http://127.0.0.1:${port}${callerBasePath(secret)}`;
 }
 
+// The Gemini API leaf, behind the identical capability in the identical
+// position. Gemini CLI hands its base URL to @google/genai, which appends
+// `/v1beta/models/{model}:{method}` itself -- so the secret has to be a path
+// prefix here, and the leaf stops at `gemini` rather than naming a version the
+// SDK is going to add. Every leaf must also be known to `redactCallerUrl`
+// below, or the key reaches doctor output and support bundles in the clear.
+export function geminiBasePath(secret) {
+  return `${CALLER_PATH_PREFIX}/${assertCallerSecret(secret)}/gemini`;
+}
+
+export function geminiBaseUrl(port, secret) {
+  return `http://127.0.0.1:${port}${geminiBasePath(secret)}`;
+}
+
+// The companion's browser surface sits behind the same capability as the API,
+// so it is the same secret in the same position -- only the leaf differs. Built
+// here rather than assembled by the caller so the one place that knows the
+// path shape stays the one place that has to change.
+export function panelPath(secret) {
+  return `${CALLER_PATH_PREFIX}/${assertCallerSecret(secret)}/panel/`;
+}
+
+export function panelUrl(port, secret) {
+  return `http://127.0.0.1:${port}${panelPath(secret)}`;
+}
+
 export function authenticatedRoute(pathname, expectedSecret) {
   if (typeof pathname !== "string") return undefined;
   const prefix = `${CALLER_PATH_PREFIX}/`;
@@ -49,7 +75,7 @@ export function authenticatedRoute(pathname, expectedSecret) {
   return remainder.slice(separator) || "/";
 }
 
-export function isManagedCallerBaseUrl(value, port) {
+function isManagedLeafBaseUrl(value, port, leaf) {
   if (typeof value !== "string" || !value) return false;
   try {
     const url = new URL(value);
@@ -67,7 +93,7 @@ export function isManagedCallerBaseUrl(value, port) {
       return false;
     }
     const match = url.pathname.match(
-      new RegExp(`^${CALLER_PATH_PREFIX}/([A-Za-z0-9_-]+)/v1/?$`),
+      new RegExp(`^${CALLER_PATH_PREFIX}/([A-Za-z0-9_-]+)/${leaf}/?$`),
     );
     return Boolean(match && validCallerSecret(match[1]));
   } catch {
@@ -75,10 +101,28 @@ export function isManagedCallerBaseUrl(value, port) {
   }
 }
 
+export function isManagedCallerBaseUrl(value, port) {
+  return isManagedLeafBaseUrl(value, port, "v1");
+}
+
+// The base URL the Gemini integration writes. Checked separately from the
+// Responses one because the two are not interchangeable: a client pointed at
+// `/v1` speaks Responses and a client pointed at `/gemini` speaks Gemini, so
+// accepting either as "managed" would let a repair leave a working-looking
+// configuration that 404s on every turn.
+export function isManagedGeminiBaseUrl(value, port) {
+  return isManagedLeafBaseUrl(value, port, "gemini");
+}
+
+// Every leaf the capability guards, not just `/v1`. Redaction is what keeps the
+// caller key out of support bundles, doctor output, and error messages, and it
+// matched only the API path -- so the panel URL, which carries the identical
+// secret in the identical position, passed through those surfaces verbatim.
+// A new leaf must be added here at the same time it is added to the router.
 export function redactCallerUrl(value) {
   if (typeof value !== "string") return value;
   return value.replace(
-    new RegExp(`(${CALLER_PATH_PREFIX}/)[A-Za-z0-9_-]+(?=/v1(?:/|$))`, "g"),
+    new RegExp(`(${CALLER_PATH_PREFIX}/)[A-Za-z0-9_-]+(?=/(?:v1|panel|gemini)(?:/|$))`, "g"),
     "$1[REDACTED]",
   );
 }

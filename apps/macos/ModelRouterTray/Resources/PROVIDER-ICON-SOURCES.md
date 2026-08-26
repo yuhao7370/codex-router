@@ -15,5 +15,25 @@ blue accent and DeepSeek's original blue mark are preserved.
 | Command Code | https://commandcode.ai/ | https://commandcode.ai/apple-touch-icon.png |
 | GitHub Copilot | https://github.com/features/copilot | https://github.com/primer/octicons/blob/main/icons/copilot-24.svg (MIT) |
 | Chutes | https://chutes.ai/ | Inline SVG mark from the official site header |
+| OpenCode Free | https://opencode.ai/brand | Monochrome adaptation of the official OpenCode mark |
+| Kilo Free | https://kilo.ai/open | https://github.com/Kilo-Org/kilocode/blob/main/packages/kilo-vscode/assets/icons/kilo-dark.svg (Apache-2.0 repository asset) |
+| Z.AI (GLM) | https://z.ai/ | https://www.google.com/s2/favicons?domain=z.ai&sz=128 |
+| Qwen | https://qwen.ai/ | https://www.google.com/s2/favicons?domain=qwen.ai&sz=128 |
+| Ollama | https://ollama.com/ | https://www.google.com/s2/favicons?domain=ollama.com&sz=128 |
+| Cline | https://cline.bot/ | https://www.google.com/s2/favicons?domain=cline.bot&sz=128 |
+| MiniMax | https://www.minimax.io/ | https://www.google.com/s2/favicons?domain=minimax.io&sz=128 |
+| Meta AI | https://www.meta.ai/ | https://www.google.com/s2/favicons?domain=meta.ai&sz=128 |
+| Venice | https://venice.ai/ | https://venice.ai/apple-touch-icon.png |
+| Nous Research | https://nousresearch.com/ | https://nousresearch.com/apple-touch-icon.png |
+| OpenRouter | https://openrouter.ai/ | https://openrouter.ai/favicon/glyph.png |
+
+The Z.AI, Qwen, Ollama, Cline, MiniMax, and Meta AI marks were fetched on
+2026-08-15. The Venice, Nous Research, and OpenRouter marks were fetched on
+2026-08-23 and stored as the same monochrome white-on-transparent adaptation
+the other single-color marks use, because all three ship dark artwork that
+would be invisible against the Island's black bezel. The opencode-go routes reuse the OpenCode Free mark rather than
+shipping a duplicate asset. `custom` deliberately ships no mark at all: it is a
+container for whatever endpoints an operator puts in it, and its models come
+from different vendors, so any single logo would misattribute the rest.
 
 The marks remain trademarks of their respective owners.

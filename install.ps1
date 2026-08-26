@@ -3,7 +3,7 @@ param(
   [switch]$CheckoutInstall,
   [switch]$PrepareOnly,
   [switch]$ForceDeps,
-  [ValidateSet("codex")]
+  [ValidateSet("codex", "dsh", "gemini")]
   [string]$Target = "codex",
   [switch]$Guided,
   [switch]$Auto,
@@ -11,6 +11,14 @@ param(
   [switch]$MigrateKnown,
   [switch]$AdoptNativeCatalog,
   [switch]$SmokeTest,
+  # Matches install.sh's --with-tray/--no-tray. Windows previously had no way
+  # to ask for the companion at all, so it was never built and never started.
+  [switch]$WithTray,
+  [switch]$NoTray,
+  # Matches install.sh's --no-provider/--no-discovery: install idle with an
+  # explicit empty selection, optionally with credential discovery disabled.
+  [switch]$NoProvider,
+  [switch]$NoDiscovery,
   # Discards tracked edits in the managed checkout so the update can proceed.
   # Deliberately never touches untracked files -- see Reset-ManagedCheckout.
   [switch]$Force,
@@ -22,14 +30,32 @@ param(
 
 $ErrorActionPreference = "Stop"
 $env:MODEL_ROUTER_TARGET = $Target
+# Legacy migration replaces an older router's managed Codex config block, and
+# the native catalog is the ChatGPT-plan model list Codex adopts. Neither has a
+# counterpart in DeepSeek Harness, whose integration is one settings section.
 if ($Target -ne "codex" -and $MigrateKnown) {
   throw "-MigrateKnown applies only to the Codex target."
+}
+if ($Target -ne "codex" -and $AdoptNativeCatalog) {
+  throw "-AdoptNativeCatalog applies only to the Codex target."
 }
 if ($PrepareOnly -and $AdoptNativeCatalog) {
   throw "-AdoptNativeCatalog cannot be used with -PrepareOnly."
 }
 if ($MigrateKnown -and $AdoptNativeCatalog) {
   throw "-AdoptNativeCatalog cannot be combined with -MigrateKnown."
+}
+if ($WithTray -and $NoTray) {
+  throw "-WithTray cannot be combined with -NoTray."
+}
+# An idle install is exactly "no providers", so naming providers alongside it
+# is a contradiction; and -NoDiscovery alone would select providers that can
+# never authenticate.
+if ($NoProvider -and ($Guided -or $Providers)) {
+  throw "-NoProvider cannot be combined with -Guided or -Providers."
+}
+if ($NoDiscovery -and -not $NoProvider) {
+  throw "-NoDiscovery requires -NoProvider."
 }
 $PreviousRevision = $null
 $RepositoryUrl = if ($env:CODEX_ROUTER_REPOSITORY_URL) {
@@ -166,12 +192,16 @@ if (-not $CheckoutInstall) {
 
   $SetupScript = "src\setup.mjs"
   $SetupArguments = @((Join-Path $Repository $SetupScript))
-  $UseGuided = $Guided -or (-not $Auto -and [Environment]::UserInteractive)
+  $UseGuided = $Guided -or (-not $Auto -and -not $NoProvider -and [Environment]::UserInteractive)
   if ($UseGuided) { $SetupArguments += "--guided" }
   if ($Providers) { $SetupArguments += @("--providers", $Providers) }
   if ($MigrateKnown) { $SetupArguments += "--migrate-known" }
   if ($AdoptNativeCatalog) { $SetupArguments += "--adopt-native-catalog" }
   if ($SmokeTest) { $SetupArguments += "--smoke-test" }
+  if ($WithTray) { $SetupArguments += "--with-tray" }
+  if ($NoTray) { $SetupArguments += "--no-tray" }
+  if ($NoProvider) { $SetupArguments += "--no-provider" }
+  if ($NoDiscovery) { $SetupArguments += "--no-discovery" }
   & node @SetupArguments
   $SetupExitCode = $LASTEXITCODE
   # Exit 2 means setup left configuration unfinished (a declined prompt, a
@@ -201,12 +231,48 @@ if ([int]$VersionParts[0] -lt 22 -or
   throw "Node.js 22.19 or newer is required; Node.js 24 LTS is recommended."
 }
 
-$ConfigManager = "src\config-manager.mjs"
+# Each target enables its own client configuration; everything around that one
+# step is the shared router plane.
+$ConfigManager = switch ($Target) {
+  "dsh" { "src\dsh-config-manager.mjs" }
+  "gemini" { "src\gemini-config-manager.mjs" }
+  default { "src\config-manager.mjs" }
+}
+$ConfigEnableCommand = if ($Target -eq "codex") { "enable" } else { "install" }
+$ConfigDisableCommand = if ($Target -eq "codex") { "disable" } else { "uninstall" }
 $ConfigEnabled = $false
 $ServiceInstalled = $false
 $AdoptionPending = $false
+$ConfigWasEnabled = $false
+$ServiceWasInstalled = $false
+$TrayWasInstalled = $false
 Push-Location $ScriptDirectory
+
+# What this run found before it changed anything, so the catch block can undo
+# only what this run created. Read after Push-Location: these commands are
+# resolved relative to the checkout.
+function Get-InstallerStateField {
+  param([string[]]$CommandArguments, [string]$Field)
+  try {
+    $raw = (& node @CommandArguments 2>$null | Out-String)
+    if (-not $raw.Trim()) { return $null }
+    return (ConvertFrom-Json $raw).$Field
+  } catch {
+    return $null
+  }
+}
+
 try {
+  # Each manager reports enablement under its own name: the Codex manager
+  # publishes a routing mode, DSH reports whether its route reached the
+  # settings document, Gemini whether its catalog is published.
+  $ConfigWasEnabled = switch ($Target) {
+    "dsh" { (Get-InstallerStateField @($ConfigManager, "status") "routeInstalled") -eq $true }
+    "gemini" { (Get-InstallerStateField @($ConfigManager, "status") "installed") -eq $true }
+    default { (Get-InstallerStateField @($ConfigManager, "status") "mode") -eq "router" }
+  }
+  $ServiceWasInstalled = (Get-InstallerStateField @("src\service.mjs", "status") "installed") -eq $true
+  $TrayWasInstalled = (Get-InstallerStateField @("src\tray-service.mjs", "status") "installed") -eq $true
   if ($Target -eq "codex") {
     $CodexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME ".codex" }
     New-Item -ItemType Directory -Force -Path $CodexHome | Out-Null
@@ -248,10 +314,24 @@ try {
     Write-Host "LiteLLM already matches the pinned versions; skipping the Python install."
   } elseif (Get-Command "uv" -ErrorAction SilentlyContinue) {
     $VenvHomeOk = (& node src/install-plan.mjs venv-home-ok 2>$null | Select-Object -Last 1) -eq "ok"
+    $VenvRuntimeOk = $false
+    if (Test-Path $Python) {
+      try {
+        & $Python -I -c "import encodings, sys" 2>$null | Out-Null
+        $VenvRuntimeOk = $LASTEXITCODE -eq 0
+      } catch {
+        $VenvRuntimeOk = $false
+      }
+    }
     if (-not (Test-Path $Python)) {
-      & uv venv --python 3.12 .venv
+      if (Test-Path ".venv") {
+        Write-Host "The virtual environment's Python launcher is missing; recreating the venv."
+        & uv venv --clear --python 3.12 .venv
+      } else {
+        & uv venv --python 3.12 .venv
+      }
       if ($LASTEXITCODE -ne 0) { throw "uv could not create the Python environment." }
-    } elseif (-not $VenvHomeOk) {
+    } elseif (-not $VenvHomeOk -or -not $VenvRuntimeOk) {
       # A venv whose interpreter home was cleared (macOS wipes /private/tmp,
       # and installers that recorded a temporary Python as the venv home end
       # up with a dangling interpreter) must be recreated, not pip-installed
@@ -272,7 +352,16 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "Recording the Python dependency state failed." }
   } else {
     $VenvHomeOk = (& node src/install-plan.mjs venv-home-ok 2>$null | Select-Object -Last 1) -eq "ok"
-    $RecreateVenv = -not $VenvHomeOk
+    $VenvRuntimeOk = $false
+    if (Test-Path $Python) {
+      try {
+        & $Python -I -c "import encodings, sys" 2>$null | Out-Null
+        $VenvRuntimeOk = $LASTEXITCODE -eq 0
+      } catch {
+        $VenvRuntimeOk = $false
+      }
+    }
+    $RecreateVenv = -not $VenvHomeOk -or -not $VenvRuntimeOk
     if (Get-Command "py" -ErrorAction SilentlyContinue) {
       & py -3 -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)"
       if ($LASTEXITCODE -ne 0) { throw "Python 3.10 or newer is required." }
@@ -311,20 +400,46 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "Existing native model-catalog adoption failed." }
     $AdoptionPending = $true
   }
+  # The state root is read by both arms below, so it is computed once rather
+  # than inside the Codex branch: the harness arm needs it to find an existing
+  # native catalog, and the republish step needs it to find the harness's own.
+  $StateRoot = if ($env:MODEL_ROUTER_STATE_DIR) { $env:MODEL_ROUTER_STATE_DIR }
+    elseif ($env:CODEX_ROUTER_STATE_DIR) { $env:CODEX_ROUTER_STATE_DIR }
+    elseif ($env:KIMI_CODEX_STATE_DIR) { $env:KIMI_CODEX_STATE_DIR }
+    elseif ($env:CODEX_HOME) { Join-Path $env:CODEX_HOME "codex-router" }
+    else { Join-Path $HOME ".codex\codex-router" }
+  # `-s` in the POSIX scripts: present *and* non-empty. A zero-byte state file
+  # is a half-written one, and treating it as real publishes an empty catalog.
+  function Test-NonEmptyFile([string] $Path) {
+    return (Test-Path $Path -PathType Leaf) -and ((Get-Item $Path).Length -gt 0)
+  }
+  $NativeCatalogPath = Join-Path $StateRoot "native-models.json"
   if ($Target -eq "codex") {
-    $StateRoot = if ($env:MODEL_ROUTER_STATE_DIR) { $env:MODEL_ROUTER_STATE_DIR }
-      elseif ($env:CODEX_ROUTER_STATE_DIR) { $env:CODEX_ROUTER_STATE_DIR }
-      elseif ($env:CODEX_HOME) { Join-Path $env:CODEX_HOME "codex-router" }
-      else { Join-Path $HOME ".codex\codex-router" }
-    if (Test-Path (Join-Path $StateRoot "native-models.json")) {
+    if (Test-NonEmptyFile $NativeCatalogPath) {
       & node src/catalog.mjs
     } else {
       & node src/catalog.mjs --refresh-native
     }
     if ($LASTEXITCODE -ne 0) { throw "Codex model-catalog generation failed." }
+  } elseif (Test-NonEmptyFile $NativeCatalogPath) {
+    # A harness-only machine has no Codex to ask for a native catalog, so one is
+    # regenerated only when an earlier Codex install already left one behind.
+    & node src/catalog.mjs
+    if ($LASTEXITCODE -ne 0) { throw "Codex model-catalog generation failed." }
   }
   & node src/litellm-config.mjs
   if ($LASTEXITCODE -ne 0) { throw "Gateway configuration generation failed." }
+  # The router plane is shared, so an install for one client changes the routable
+  # set for the other. Republish whichever integration is already installed here
+  # rather than leaving it advertising a stale model list.
+  if ($Target -ne "gemini" -and (Test-NonEmptyFile (Join-Path $StateRoot "gemini-models.json"))) {
+    & node src/gemini-config-manager.mjs install | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "Gemini CLI republish failed." }
+  }
+  if ($Target -ne "dsh" -and (Test-NonEmptyFile (Join-Path $StateRoot "dsh-models.json"))) {
+    & node src/dsh-config-manager.mjs install | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "DeepSeek Harness republish failed." }
+  }
 
   if ($PrepareOnly) {
     Write-Host "Dependencies and generated files are prepared; application configuration was not changed."
@@ -332,7 +447,7 @@ try {
   }
 
   $ConfigEnabled = $true
-  $ConfigArguments = @($ConfigManager, "enable")
+  $ConfigArguments = @($ConfigManager, $ConfigEnableCommand)
   if ($AdoptNativeCatalog) { $ConfigArguments += "--adopt-native-catalog" }
   & node @ConfigArguments
   if ($LASTEXITCODE -ne 0) { throw "$Target configuration update failed." }
@@ -340,18 +455,84 @@ try {
   $ServiceInstalled = $true
   & node src/service.mjs install
   if ($LASTEXITCODE -ne 0) { throw "Background-service installation failed." }
-  & node src/wait-health.mjs
-  if ($LASTEXITCODE -ne 0) { throw "The router did not become healthy." }
+  # Record before the health wait, not after. The manifest is provenance for
+  # the install that just happened -- which checkout owns the state, and the
+  # proxy environment a later repair must restore -- and the service is already
+  # in place. Recording it only after a health check that a cold-starting
+  # gateway can lose left the manifest naming the previous owner while the
+  # running service pointed somewhere else.
   & node src/install-manifest.mjs record | Out-Null
   if ($LASTEXITCODE -ne 0) { throw "Install-manifest recording failed." }
-  # Match bin/install: skill installation is best effort and preserves any
-  # existing skill that is not verified as codex-router-owned.
-  & node src/skills-install.mjs install
-  Write-Host "Installed the selected external model routes. Fully quit and reopen Codex."
+  & node src/wait-health.mjs
+  if ($LASTEXITCODE -ne 0) { throw "The router did not become healthy." }
+
+  # Keep an existing companion in step with the checkout, but never turn a
+  # fresh router install into a tray install the operator did not request.
+  # Run the wrapper in a child PowerShell process because its deliberate
+  # `exit` would otherwise terminate this installer before the status could be
+  # checked. This remains best effort, matching bin/install: an optional Rust
+  # or Electron build failure must not roll back a healthy router update.
+  if ($TrayWasInstalled -and $env:CODEX_ROUTER_DEFER_TRAY_REBUILD -ne "1") {
+    $SavedRouterTarget = $env:MODEL_ROUTER_TARGET
+    try {
+      # The tray belongs to the shared router plane. codex-router.ps1 is the
+      # Windows companion entry point and deliberately accepts only its Codex
+      # spelling, even when this update was initiated for DSH or Gemini CLI.
+      $env:MODEL_ROUTER_TARGET = "codex"
+      & powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File (Join-Path $ScriptDirectory "codex-router.ps1") tray install --preserve-window
+      $TrayExitCode = $LASTEXITCODE
+      if ($TrayExitCode -ne 0) {
+        Write-Warning "Desktop companion refresh failed with exit code $TrayExitCode; the router is installed. Run '.\codex-router.ps1 tray repair' if an earlier elevated install owns the task."
+      }
+    } catch {
+      Write-Warning "Desktop companion refresh failed; the router is installed: $($_.Exception.Message) Run '.\codex-router.ps1 tray repair' if an earlier elevated install owns the task."
+    } finally {
+      $env:MODEL_ROUTER_TARGET = $SavedRouterTarget
+    }
+  } elseif ($TrayWasInstalled) {
+    # A Control Center cannot synchronously rebuild the executable that is
+    # running this installer: stop/drain waits for the caller's mutation, while
+    # the caller waits for install.ps1. The UI launches a detached `control tray
+    # refresh` after its mutation settles; that command rechecks tray-plan and
+    # does nothing when this install did not make the package stale.
+    Write-Output "Desktop companion refresh deferred until the Control Center mutation completes."
+  }
+
+  # Managed Codex skills are an integration convenience, not part of router
+  # health. Refresh them after the service transaction and keep a failure from
+  # entering the rollback path, exactly like the POSIX installer.
+  if ($Target -eq "codex") {
+    try {
+      & node src/skills-install.mjs install
+      $SkillsExitCode = $LASTEXITCODE
+      if ($SkillsExitCode -ne 0) {
+        Write-Warning "Managed Codex skills could not be refreshed (exit $SkillsExitCode); the router is installed."
+      }
+    } catch {
+      Write-Warning "Managed Codex skills could not be refreshed; the router is installed: $($_.Exception.Message)"
+    }
+  }
+
+  if ($Target -eq "dsh") {
+    Write-Host "Published the selected external model routes to DeepSeek Harness. It reloads them on the next request."
+  } elseif ($Target -eq "gemini") {
+    Write-Host "Published the selected external model routes to Gemini CLI. The next 'gemini' run picks them up."
+    Write-Host "Choose 'Use Gemini API key' once if it asks how to authenticate; the key is this router's local caller capability."
+  } else {
+    Write-Host "Installed the selected external model routes. Fully quit and reopen Codex."
+  }
 } catch {
-  if ($ServiceInstalled) { & node src/service.mjs uninstall 2>$null | Out-Null }
+  # Undo only what this run created. The router health wait can time out on a
+  # cold-starting gateway with a large model set -- retryable, not broken -- and
+  # tearing out a service and disabling a client config that were both working
+  # before the run turns that into an unrouted machine.
+  if ($ServiceInstalled -and -not $ServiceWasInstalled) {
+    & node src/service.mjs uninstall 2>$null | Out-Null
+  }
   if ($ConfigEnabled) {
-    & node $ConfigManager disable 2>$null | Out-Null
+    if (-not $ConfigWasEnabled) {
+      & node $ConfigManager $ConfigDisableCommand 2>$null | Out-Null
+    }
   } elseif ($AdoptionPending) {
     & node src/native-catalog-source.mjs clear-pending 2>$null | Out-Null
   }

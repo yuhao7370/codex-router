@@ -10,7 +10,7 @@
       "multiAgentVersion": "v2",
       "displayName": "Grok 4.5 (OAuth)",
       "description": "Grok 4.5 through the official Grok CLI OAuth session with agentic coding, tool calls, and hosted web/X search.",
-      "priority": 1,
+      "priority": 2,
       "defaultEffort": "high",
       "reasoningLevels": [
         {
@@ -33,6 +33,7 @@
         "image"
       ],
       "requestProfile": "xai-reasoning",
+      "supportsReasoningSummaries": true,
       "searchTool": {
         "mode": "hosted"
       },

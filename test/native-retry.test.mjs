@@ -194,6 +194,25 @@ test("a capacity error body is retryable while a quota 429 is not", async () => 
   assert.equal(await isAtCapacityResponse(new Response("ok", { status: 200 })), false);
 });
 
+test("a caller can delegate capacity retries to its account-rotation loop", async () => {
+  let attempts = 0;
+  const result = await fetchWithRetry("https://example.invalid", {}, {
+    retries: 2,
+    retryCapacity: false,
+    fetchImpl: async () => {
+      attempts += 1;
+      return new Response(JSON.stringify({ error: { message: "model at capacity" } }), {
+        status: 429,
+        headers: { "Content-Type": "application/json" },
+      });
+    },
+  });
+
+  assert.equal(result.response.status, 429);
+  assert.equal(result.retries, 0);
+  assert.equal(attempts, 1);
+});
+
 test("the native server_is_overloaded body is classified as capacity", async () => {
   const overloaded = new Response(
     JSON.stringify({
@@ -977,6 +996,35 @@ test("a connect failure is retried and an abort never is", async () => {
   assert.equal(abortCalls, 1);
 });
 
+// #171: a Windows machine under loopback churn failed native connects with
+// codes outside the original set while the same origin answered other
+// requests in the same window. Each of these fails before a connection
+// exists, so a retry can never re-execute work.
+test("pre-connection failures added after #171 are retried", async () => {
+  for (const code of ["ENOTFOUND", "EADDRNOTAVAIL", "ENOBUFS"]) {
+    let calls = 0;
+    const retried = await fetchWithRetry(
+      "http://upstream.invalid/responses",
+      {},
+      {
+        retries: 1,
+        backoffMs: 0,
+        fetchImpl: async () => {
+          calls += 1;
+          if (calls < 2) {
+            const error = new TypeError("fetch failed");
+            error.cause = Object.assign(new Error(`socket ${code}`), { code });
+            throw error;
+          }
+          return new Response("ok", { status: 200 });
+        },
+      },
+    );
+    assert.equal(calls, 2, `${code} was not retried`);
+    assert.equal(retried.response.status, 200);
+  }
+});
+
 // A 504 the edge spent half a minute producing is still a 504, but retrying it
 // twice would turn a slow failure into a hang.
 test("a retryable failure that was slow to arrive is not retried", async () => {
@@ -1057,6 +1105,124 @@ test("an image generation is never retried, however retryable the failure looks"
       1,
       `a billed image generation was sent ${attempts.length} times`,
     );
+  } finally {
+    await stopChild(router);
+    await closeServer(native.server);
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+function cancelNativeTurnAfterMarker(port, body, marker) {
+  const base = new URL(`${routerBase(port)}/responses`);
+  return new Promise((resolve) => {
+    const request = http.request(
+      {
+        host: "127.0.0.1",
+        port,
+        path: base.pathname,
+        method: "POST",
+        headers: { Authorization: "Bearer caller", "Content-Type": "application/json" },
+      },
+      (response) => {
+        let received = "";
+        response.setEncoding("utf8");
+        response.on("data", (chunk) => {
+          received += chunk;
+          if (received.includes(marker)) {
+            request.destroy();
+            resolve(received);
+          }
+        });
+      },
+    );
+    request.once("error", () => resolve(""));
+    request.end(JSON.stringify(body));
+  });
+}
+
+test("a native terminal tool response stays successful when the client closes after completion", async () => {
+  const native = await mockServer(async (_request, response) => {
+    // Native ChatGPT Responses can arrive as SSE without a content-type. The
+    // router's prefix detector must still observe the terminal event.
+    response.writeHead(200);
+    response.write(
+      [
+        "event: response.output_item.done",
+        `data: ${JSON.stringify({
+          type: "response.output_item.done",
+          item: {
+            type: "function_call",
+            name: "shell",
+            call_id: "call_terminal",
+            arguments: "{}",
+          },
+        })}`,
+        "",
+        "event: response.completed",
+        `data: ${JSON.stringify({
+          type: "response.completed",
+          response: {
+            id: "resp_terminal",
+            output: [],
+            usage: { input_tokens: 40, output_tokens: 4, total_tokens: 44 },
+          },
+        })}`,
+        "",
+        "",
+      ].join("\n"),
+    );
+    // Codex is allowed to stop reading once response.completed arrives. Keep
+    // the upstream open so the client close wins the race with upstream EOF.
+  });
+  const stateDir = stateDirectory();
+  const routerPort = await openPort();
+  const router = startRouter({ nativePort: native.port, routerPort, stateDir, retries: 0 });
+
+  try {
+    await waitFor(`${routerBase(routerPort)}/models`, router);
+    const received = await cancelNativeTurnAfterMarker(
+      routerPort,
+      { model: "gpt-5.6-sol", input: "use a tool", stream: true },
+      '"type":"response.completed"',
+    );
+    assert.match(received, /call_terminal/);
+
+    await waitUntil(() => usageEvents(stateDir).length > 0, "no usage event was recorded");
+    const event = usageEvents(stateDir).at(-1);
+    assert.equal(event.provider, "openai");
+    assert.equal(event.status, 200);
+    assert.equal(event.inputTokens, 40);
+    assert.equal(event.outputTokens, 4);
+  } finally {
+    await stopChild(router);
+    await closeServer(native.server);
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("a native client close before a terminal response still meters zero", async () => {
+  const native = await mockServer(async (_request, response) => {
+    response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+    response.write(
+      'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"partial"}\n\n',
+    );
+  });
+  const stateDir = stateDirectory();
+  const routerPort = await openPort();
+  const router = startRouter({ nativePort: native.port, routerPort, stateDir, retries: 0 });
+
+  try {
+    await waitFor(`${routerBase(routerPort)}/models`, router);
+    await cancelNativeTurnAfterMarker(
+      routerPort,
+      { model: "gpt-5.6-sol", input: "cancel me", stream: true },
+      "partial",
+    );
+
+    await waitUntil(() => usageEvents(stateDir).length > 0, "no usage event was recorded");
+    const event = usageEvents(stateDir).at(-1);
+    assert.equal(event.provider, "openai");
+    assert.equal(event.status, 0);
   } finally {
     await stopChild(router);
     await closeServer(native.server);

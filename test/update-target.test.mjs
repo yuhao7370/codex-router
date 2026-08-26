@@ -84,8 +84,28 @@ test("tray refresh is required when the checkout dist bundle exists", () => {
   }
 });
 
-test("tray refresh is required when setup installed the home app bundle", () => {
+test("tray refresh is required when setup installed the canonical home app bundle", () => {
   const root = mkdtempSync(path.join(os.tmpdir(), "tray-refresh-home-"));
+  try {
+    mkdirSync(path.join(root, "home", "Applications", "Codex Router.app"), {
+      recursive: true,
+    });
+    assert.equal(
+      trayRefreshRequired({
+        platform: "darwin",
+        home: path.join(root, "home"),
+        sourceRoot: path.join(root, "router"),
+        registeredPath: "",
+      }),
+      true,
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("tray refresh is required when only the legacy home app bundle exists", () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "tray-refresh-legacy-home-"));
   try {
     mkdirSync(path.join(root, "home", "Applications", "Model Router.app"), {
       recursive: true,
@@ -107,7 +127,7 @@ test("tray refresh is required when setup installed the home app bundle", () => 
 test("tray refresh is required when only a registered bundle path exists", () => {
   const root = mkdtempSync(path.join(os.tmpdir(), "tray-refresh-registered-"));
   try {
-    const registered = path.join(root, "Model Router.app");
+    const registered = path.join(root, "Codex Router.app");
     mkdirSync(registered, { recursive: true });
     assert.equal(
       trayRefreshRequired({
@@ -134,6 +154,38 @@ test("tray refresh is skipped when no tray bundle exists", () => {
         registeredPath: "",
       }),
       false,
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("tray refresh preserves an explicit macOS supervision disable", () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "tray-refresh-disabled-"));
+  try {
+    mkdirSync(path.join(root, "home", "Applications", "Codex Router.app"), {
+      recursive: true,
+    });
+    assert.equal(
+      trayRefreshRequired({
+        platform: "darwin",
+        home: path.join(root, "home"),
+        sourceRoot: path.join(root, "router"),
+        registeredPath: path.join(root, "home", "Applications", "Codex Router.app"),
+        supervisionPreference: { state: "disabled", enabled: false },
+      }),
+      false,
+    );
+    assert.equal(
+      trayRefreshRequired({
+        platform: "darwin",
+        home: path.join(root, "home"),
+        sourceRoot: path.join(root, "router"),
+        registeredPath: path.join(root, "home", "Applications", "Codex Router.app"),
+        supervisionPreference: { state: "invalid", enabled: null },
+      }),
+      false,
+      "a damaged marker must fail closed instead of resurrecting the tray",
     );
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -190,4 +242,33 @@ test("a long list of local changes is previewed, not dumped", () => {
 
 test("a single local change reads as one file, not one files", () => {
   assert.match(localModificationsMessage([" M src/router.mjs"]), /1 tracked file;/);
+});
+
+// The reviewer of #186 flagged that control.mjs's Windows apply branch was a
+// hand-rolled PowerShell argument list with no test. It now reuses this helper,
+// so the branch is covered here rather than being a second untested copy.
+test("the enable path picks each platform's checkout entry point", () => {
+  const windows = currentCheckoutInstaller("win32", "codex", { posixScript: "enable" });
+  assert.equal(windows.command, "powershell.exe");
+  assert.ok(windows.args.includes("-CheckoutInstall"));
+  assert.ok(windows.args.some((argument) => argument.endsWith("install.ps1")));
+  assert.deepEqual(windows.args.slice(-2), ["-Target", "codex"]);
+
+  const posix = currentCheckoutInstaller("linux", "codex", { posixScript: "enable" });
+  assert.match(posix.command, /bin[\\/]enable$/);
+  assert.deepEqual(posix.args, []);
+});
+
+test("Windows runs one installer whichever entry point is asked for", () => {
+  // codex-router.ps1 maps both `install` and `enable` onto
+  // install.ps1 -CheckoutInstall, so posixScript must not leak into the
+  // Windows argument list.
+  assert.deepEqual(
+    currentCheckoutInstaller("win32", "codex", { posixScript: "enable" }),
+    currentCheckoutInstaller("win32", "codex"),
+  );
+});
+
+test("the default entry point is still install", () => {
+  assert.match(currentCheckoutInstaller("darwin", "codex").command, /bin[\\/]install$/);
 });

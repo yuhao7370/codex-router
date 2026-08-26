@@ -6,6 +6,7 @@ import {
   readFileSync,
   readdirSync,
   rmSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import os from "node:os";
@@ -100,7 +101,7 @@ wire_api = "responses"
     };
 
     try {
-      const catalog = child("catalog.mjs", ["--refresh-native", "--bundled-native"], env);
+      const catalog = child("catalog.mjs", ["--refresh-native"], env);
       assert.equal(catalog.status, 0, catalog.stderr);
       assert.equal(JSON.parse(catalog.stdout).routed_catalog_active, false);
 
@@ -112,7 +113,22 @@ wire_api = "responses"
       const merged = JSON.parse(
         readFileSync(path.join(stateDir, "merged-models.json"), "utf8"),
       );
-      assert.deepEqual(merged.models.map((model) => model.slug), ["gpt-5.6-sol"]);
+      // The captured native model, plus the extended-window variant the
+      // router derives from it. Nothing routed, which is what this test is
+      // about — and the variant ships switched off, so a build that publishes
+      // it has still changed nothing the operator did not ask for.
+      assert.deepEqual(merged.models.map((model) => model.slug), [
+        "gpt-5.6-sol",
+        "gpt-5.6-sol-1m",
+      ]);
+      assert.equal(
+        merged.models.find((model) => model.slug === "gpt-5.6-sol-1m").visibility,
+        "hide",
+      );
+      assert.equal(
+        merged.models.find((model) => model.slug === "gpt-5.6-sol").visibility,
+        "list",
+      );
       assert.equal(
         readdirSync(path.join(codexHome, "agents")).filter((name) =>
           name.startsWith("router-model-"),
@@ -134,6 +150,92 @@ wire_api = "responses"
       assert.equal(byName.get("Routed model agents").status, "ok");
       assert.match(byName.get("Routed model agents").detail, /^0 current definitions/);
       assert.equal(byName.get("Signed router coexistence").status, "ok");
+    } finally {
+      rmSync(codexHome, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "a routed catalog waiting for Codex restart is a warning, not a failed repair",
+  { timeout: 30_000 },
+  () => {
+    const codexHome = mkdtempSync(path.join(os.tmpdir(), "codex-router-doctor-restart-"));
+    const stateDir = path.join(codexHome, "router-state");
+    const configPath = path.join(codexHome, "config.toml");
+    mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+    writeFileSync(configPath, 'model = "gpt-5.6-sol"\n', { mode: 0o600 });
+    writeFileSync(
+      path.join(stateDir, "enabled-providers.json"),
+      `${JSON.stringify({ version: 1, providers: ["kimi-api"] })}\n`,
+      { mode: 0o600 },
+    );
+    writeFileSync(path.join(stateDir, "kimi-api-key.secret"), "test-key\n", {
+      mode: 0o600,
+    });
+    // A registry model carrying `multiAgentVersion: "v2"`, not a local proof.
+    // Local proof records are diagnostic and application material only --
+    // promoting from them let a stream/tool probe masquerade as native
+    // collaboration proof -- so a seeded `proven` entry no longer produces a
+    // managed agent definition and there would be nothing here to remove.
+    // The catalog now publishes routed models only after an explicit picker
+    // selection. Keep this test focused on the doctor detecting a missing
+    // managed agent definition, rather than relying on the old implicit-show
+    // behavior.
+    writeFileSync(
+      path.join(stateDir, "model-picker.json"),
+      `${JSON.stringify({
+        version: 1,
+        hidden: [],
+        visible: ["kimi-api/kimi-k3"],
+        seeded: ["kimi-api/kimi-k3"],
+      })}\n`,
+      { mode: 0o600 },
+    );
+    writeFileSync(path.join(stateDir, "caller-secret"), `${callerSecret}\n`, {
+      mode: 0o600,
+    });
+    writeFileSync(
+      path.join(stateDir, "internal-secret"),
+      "doctor-internal-service-key-with-sufficient-length\n",
+      { mode: 0o600 },
+    );
+    const env = {
+      ...process.env,
+      CODEX_BIN: writeCodexStub(codexHome),
+      CODEX_HOME: codexHome,
+      CODEX_ROUTER_PORT: "46193",
+      CODEX_ROUTER_STATE_DIR: stateDir,
+      MODEL_ROUTER_STATE_DIR: stateDir,
+      MODEL_ROUTER_TARGET: "codex",
+    };
+
+    try {
+      const catalog = child("catalog.mjs", ["--refresh-native", "--bundled-native"], env);
+      assert.equal(catalog.status, 0, catalog.stderr);
+      assert.equal(JSON.parse(catalog.stdout).routed_catalog_active, true);
+      unlinkSync(path.join(codexHome, "agents", "router-model-kimi-api-kimi-k3.toml"));
+
+      const routes = child("litellm-config.mjs", [], env);
+      assert.equal(routes.status, 0, routes.stderr);
+      const enabled = child("config-manager.mjs", ["enable"], env);
+      assert.equal(enabled.status, 0, enabled.stderr);
+
+      const doctor = child("doctor.mjs", ["--json"], env);
+      const report = JSON.parse(doctor.stdout);
+      const byName = new Map(report.checks.map((check) => [check.name, check]));
+      assert.deepEqual(byName.get("Codex model catalog"), {
+        status: "warn",
+        name: "Codex model catalog",
+        detail: "startup catalog is stale",
+        fix: "Fully quit Codex, reopen it, and create a new task.",
+      });
+      assert.deepEqual(byName.get("Routed model agents"), {
+        status: "fail",
+        name: "Routed model agents",
+        detail: `0 of 1 current definitions in ${path.join(codexHome, "agents")}`,
+        fix: "Run ./bin/doctor --fix, then fully quit Codex, reopen it, and create a new task.",
+      });
     } finally {
       rmSync(codexHome, { recursive: true, force: true });
     }

@@ -591,11 +591,11 @@ function kickPoolAccount(
   return true;
 }
 
-export function notifyAccountFailure(status, capacity = false, quota = false) {
+export function notifyAccountFailure(status, capacity = false, quota = false, injectedAccountId) {
   if (!FAILOVER_TRIGGER_STATUSES.has(status)) return;
   const state = readTaskManagerConfig();
   if (!state.enabled) return;
-  const accountId = lastInjectedId || (cached && cached.id);
+  const accountId = injectedAccountId || lastInjectedId || (cached && cached.id);
   const poolEntry = poolCredentials.find(
     (account) => account.id === accountId,
   );
@@ -655,10 +655,10 @@ export function notifyAccountFailure(status, capacity = false, quota = false) {
 // loop already round-robins through the pool with `nextInjectionAccount`, and
 // pinning every seat as failed would stop injection entirely until the memory
 // expires.
-export function recordCapacityFailure(status = null) {
+export function recordCapacityFailure(status = null, injectedAccountId) {
   const state = readTaskManagerConfig();
   if (!state.enabled) return;
-  const accountId = lastInjectedId || (cached && cached.id);
+  const accountId = injectedAccountId || lastInjectedId || (cached && cached.id);
   const poolEntry = poolCredentials.find(
     (account) => account.id === accountId,
   );

@@ -16,6 +16,11 @@ import { DIRTY_PREVIEW_LIMIT, localModificationsMessage } from "../src/update.mj
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
+// Windows does not guarantee a POSIX shell. Run these executable-shell
+// assertions wherever `sh` is available (including Git Bash on CI), and skip
+// them honestly on a native Windows checkout that has no such runtime.
+const POSIX_SHELL_AVAILABLE = spawnSync("sh", ["-c", "exit 0"], { stdio: "ignore" }).status === 0;
+
 // Nothing on a non-Windows machine can execute PowerShell -- the parse test in
 // this file is skipped off Windows for exactly that reason -- so the Windows
 // assertions here read the shipped scripts as text instead. That still catches
@@ -109,11 +114,55 @@ function runPosixHelper(call, args, options = {}) {
   return result.stdout;
 }
 
-test("install.sh is valid POSIX shell", () => {
+function posixVenvHelper() {
+  const source = readScript("bin", "install");
+  const start = source.indexOf("ensure_uv_venv() {");
+  assert.notEqual(start, -1, "bin/install must define ensure_uv_venv");
+  const end = source.indexOf("\n}\n", start);
+  assert.notEqual(end, -1, "ensure_uv_venv must be a complete function");
+  return source.slice(start, end + 3);
+}
+
+test("install.sh is valid POSIX shell", { skip: !POSIX_SHELL_AVAILABLE }, () => {
   const result = spawnSync("sh", ["-n", path.join(root, "install.sh")], {
     encoding: "utf8",
   });
   assert.equal(result.status, 0, result.stderr);
+});
+
+test("Homebrew setup never reconciles package-manager-owned dependencies", () => {
+  const installer = readScript("bin", "install");
+  const policy = installer.slice(
+    installer.indexOf("install_step() {"),
+    installer.indexOf("node src/secret.mjs ensure"),
+  );
+  assert.match(policy, /CODEX_ROUTER_PACKAGE_MANAGER:-.*= homebrew/);
+  assert.match(policy, /echo managed/);
+  assert.match(policy, /case "\$\(install_step node-deps\)" in\n\s*managed\)/);
+  assert.match(policy, /case "\$\(install_step python-deps\)" in\n\s*managed\)/);
+  assert.ok(
+    policy.indexOf("CODEX_ROUTER_PACKAGE_MANAGER") < policy.indexOf('"$force_deps" = true'),
+    "--force-deps must not mutate Homebrew's managed dependency tree",
+  );
+});
+
+test("POSIX updates republish every installed companion client", () => {
+  const installer = readScript("bin", "install");
+  assert.match(installer, /\$target" != dsh[\s\S]*dsh-models\.json[\s\S]*dsh-config-manager\.mjs install/);
+  assert.match(installer, /\$target" != gemini[\s\S]*gemini-models\.json[\s\S]*gemini-config-manager\.mjs install/);
+  const windows = readScript("install.ps1");
+  assert.match(windows, /\$Target -ne "dsh"[\s\S]*dsh-models\.json[\s\S]*dsh-config-manager\.mjs install/);
+  assert.match(windows, /\$Target -ne "gemini"[\s\S]*gemini-models\.json[\s\S]*gemini-config-manager\.mjs install/);
+});
+
+test("Homebrew force-deps fails early with the package-manager repair command", { skip: !POSIX_SHELL_AVAILABLE }, () => {
+  const result = spawnSync("sh", [path.join(root, "bin", "install"), "--force-deps"], {
+    encoding: "utf8",
+    env: { ...process.env, CODEX_ROUTER_PACKAGE_MANAGER: "homebrew" },
+  });
+  assert.equal(result.status, 2);
+  assert.match(result.stderr, /brew reinstall codex-router/);
+  assert.doesNotMatch(result.stdout, /npm ci|LiteLLM|service|catalog/i);
 });
 
 test(
@@ -132,9 +181,11 @@ test(
       writeFileSync(
         wrapper,
         `#!/bin/sh
-printf '%s\\t%s\\t' "$CODEX_ROUTER_NODE_BIN" "$PATH" >>"$CODEX_ROUTER_WRAPPER_LOG"
-printf '<%s>' "$@" >>"$CODEX_ROUTER_WRAPPER_LOG"
-printf '\\n' >>"$CODEX_ROUTER_WRAPPER_LOG"
+logged_arguments=
+for argument in "$@"; do
+  logged_arguments="\${logged_arguments}<\${argument}>"
+done
+printf '%s\\t%s\\t%s\\n' "$CODEX_ROUTER_NODE_BIN" "$PATH" "$logged_arguments" >>"$CODEX_ROUTER_WRAPPER_LOG"
 if [ "\${1:-}" = src/install-plan.mjs ] && [ "\${2:-}" = status ]; then
   printf 'skip\\n'
 fi
@@ -166,6 +217,54 @@ fi
           calls.join("\n"),
         );
       }
+    } finally {
+      rmSync(testRoot, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "POSIX install finds the runtime a desktop launcher named instead of refusing",
+  { skip: process.platform === "win32" || !POSIX_SHELL_AVAILABLE },
+  () => {
+    // A GUI app, launchd, and systemd all start without the login-shell PATH.
+    // Refusing a routine catalog update as "node is required but was not found
+    // on PATH" while the app is running on that very Node is the failure this
+    // covers: the recorded runtime is honored before the PATH lookup.
+    const testRoot = mkdtempSync(path.join(os.tmpdir(), "codex-router-desktop-path-"));
+    const runtimeDir = path.join(testRoot, "runtime");
+    const callLog = path.join(testRoot, "calls.log");
+    try {
+      mkdirSync(runtimeDir, { recursive: true });
+      for (const name of ["node", "npm"]) {
+        writeFileSync(
+          path.join(runtimeDir, name),
+          `#!/bin/sh
+printf '%s\\n' "${name}" >>"$CODEX_ROUTER_WRAPPER_LOG"
+if [ "\${1:-}" = src/install-plan.mjs ] && [ "\${2:-}" = status ]; then
+  printf 'skip\\n'
+fi
+`,
+          { mode: 0o755 },
+        );
+      }
+      const result = spawnSync(path.join(root, "bin", "install"), ["--prepare-only"], {
+        cwd: root,
+        encoding: "utf8",
+        env: {
+          // Deliberately no runtime on PATH, exactly as a Finder-launched app sees it.
+          PATH: "/usr/bin:/bin",
+          HOME: testRoot,
+          CODEX_HOME: path.join(testRoot, "codex-home"),
+          CODEX_ROUTER_STATE_DIR: path.join(testRoot, "state"),
+          MODEL_ROUTER_STATE_DIR: path.join(testRoot, "state"),
+          CODEX_ROUTER_NODE_BIN: path.join(runtimeDir, "node"),
+          CODEX_ROUTER_WRAPPER_LOG: callLog,
+        },
+      });
+      assert.doesNotMatch(result.stderr, /is required but was not found on PATH/);
+      assert.equal(result.status, 0, result.stderr || result.stdout);
+      assert.match(readFileSync(callLog, "utf8"), /node/);
     } finally {
       rmSync(testRoot, { recursive: true, force: true });
     }
@@ -217,10 +316,42 @@ test("broken virtual environments use the venv tools' exact-target clear mode", 
   assert.doesNotMatch(posix, /rm\s+-rf\s+\.venv/);
   assert.match(posix, /uv venv --clear --python 3\.12 \.venv/);
   assert.match(posix, /python3 -m venv --clear \.venv/);
+  assert.match(posix, /\.venv\/bin\/python -I -c 'import encodings, sys'/);
   assert.doesNotMatch(windows, /Remove-Item\s+-Recurse.*\.venv/);
   assert.match(windows, /uv venv --clear --python 3\.12 \.venv/);
   assert.match(windows, /-m venv --clear \.venv/);
+  assert.match(windows, /\$Python -I -c "import encodings, sys"/);
+  assert.match(windows, /-not \$VenvHomeOk -or -not \$VenvRuntimeOk/);
 });
+
+test(
+  "a present venv with no Python launcher is cleared before uv recreates it",
+  { skip: !POSIX_SHELL_AVAILABLE },
+  () => {
+    const fixture = mkdtempSync(path.join(os.tmpdir(), "codex-router-missing-python-"));
+    const bin = path.join(fixture, "bin");
+    const calls = path.join(fixture, "uv-calls");
+    try {
+      mkdirSync(path.join(fixture, ".venv"), { recursive: true });
+      mkdirSync(bin, { recursive: true });
+      writeFileSync(
+        path.join(bin, "uv"),
+        `#!/bin/sh\nprintf '%s\\n' "$*" >>${JSON.stringify(calls)}\n`,
+        { mode: 0o755 },
+      );
+      const result = spawnSync("sh", ["-s"], {
+        cwd: fixture,
+        encoding: "utf8",
+        env: { ...process.env, PATH: `${bin}:${process.env.PATH || ""}` },
+        input: `${posixVenvHelper()}\nensure_uv_venv\n`,
+      });
+      assert.equal(result.status, 0, result.stderr);
+      assert.equal(readFileSync(calls, "utf8"), "venv --clear --python 3.12 .venv\n");
+    } finally {
+      rmSync(fixture, { recursive: true, force: true });
+    }
+  },
+);
 
 test("the kept-update message names the way back", () => {
   // Keeping the update on exit 2 is the right default, but a user who wanted
@@ -242,9 +373,9 @@ test("the Windows wrapper hands every command its own arguments", () => {
   );
   assert.ok(branches.size >= 16, `only found ${branches.size} branches`);
 
-  // bin/disable and bin/uninstall accept no arguments, so their
+  // bin/disable, bin/uninstall, and bin/stop accept no arguments, so their
   // branches pass fixed node subcommand names rather than user input.
-  const takesNoArguments = new Set(["disable", "uninstall"]);
+  const takesNoArguments = new Set(["disable", "uninstall", "stop"]);
   for (const [command, body] of branches) {
     if (takesNoArguments.has(command)) {
       assert.equal(
@@ -325,7 +456,7 @@ test("every copy of the refusal previews at the same limit", () => {
   }
 });
 
-test("the POSIX installer's refusal is byte-identical to src/update.mjs", () => {
+test("the POSIX installer's refusal is byte-identical to src/update.mjs", { skip: !POSIX_SHELL_AVAILABLE }, () => {
   // Not a pattern match: install.sh's own helper is executed and its output
   // compared with the Node original. A reword on either side fails here, which
   // is the coupling that was missing when the first fix landed in one file.
@@ -342,7 +473,7 @@ test("the POSIX installer's refusal is byte-identical to src/update.mjs", () => 
   }
 });
 
-test("the POSIX installer counts tracked edits and ignores untracked files", () => {
+test("the POSIX installer counts tracked edits and ignores untracked files", { skip: !POSIX_SHELL_AVAILABLE }, () => {
   // The behaviour change every curl|sh user gets: a checkout carrying nothing
   // but an untracked file now updates instead of refusing forever.
   const checkout = mkdtempSync(path.join(os.tmpdir(), "posix-dirty-"));
@@ -449,6 +580,27 @@ test("the documented rollback behaviour matches the exit-2 contract", () => {
 // Two structural properties guard that: --prepare-only must exit before the
 // skills step touches ~/.codex/skills, and the skills step must run after the
 // rollback trap is disarmed, so a skills failure cannot undo config/service.
+test("both installers declare, validate, and forward the idle-install flags", () => {
+  // The flags exist so issue #224's credential-free lifecycle validation can
+  // run identically on every platform; a flag that lands in only one
+  // installer silently narrows that promise to one OS.
+  const posix = readFileSync(path.join(root, "install.sh"), "utf8");
+  assert.match(posix, /--no-provider\)/);
+  assert.match(posix, /--no-discovery\)/);
+  assert.match(posix, /--no-discovery requires --no-provider/);
+  assert.match(posix, /--no-provider cannot be combined with/);
+  assert.match(posix, /set -- "\$@" --no-provider/);
+  assert.match(posix, /set -- "\$@" --no-discovery/);
+
+  const windows = readFileSync(path.join(root, "install.ps1"), "utf8");
+  assert.match(windows, /\[switch\]\$NoProvider/);
+  assert.match(windows, /\[switch\]\$NoDiscovery/);
+  assert.match(windows, /-NoDiscovery requires -NoProvider/);
+  assert.match(windows, /-NoProvider cannot be combined with/);
+  assert.match(windows, /\$SetupArguments \+= "--no-provider"/);
+  assert.match(windows, /\$SetupArguments \+= "--no-discovery"/);
+});
+
 test("prepare-only exits before the skills step", () => {
   const source = readScript("bin", "install");
   const prepareExit = source.indexOf("Dependencies and local Codex router files are prepared");
@@ -473,4 +625,52 @@ test("uninstall removes the managed skills", () => {
   const uninstallStep = source.indexOf("skills-install.mjs uninstall");
   const serviceStep = source.indexOf("src/service.mjs uninstall");
   assert.ok(serviceStep < uninstallStep, "skills removal must follow the service removal");
+});
+
+// A reinstall over a working router must not be able to leave the machine
+// worse than it found it. `service.mjs install` waits up to 300 s for /health,
+// and a LiteLLM gateway with a large model set can lose that race on a cold
+// start -- retryable, not broken. The rollback used to disable the client
+// config and uninstall the LaunchAgent unconditionally, so that timeout took a
+// working, routed machine and left it unrouted with no service at all.
+test("installer rollback undoes only what the run created", () => {
+  const posix = readFileSync(path.join(root, "bin", "install"), "utf8");
+  const windows = readFileSync(path.join(root, "install.ps1"), "utf8");
+
+  // Both installers must read the pre-existing state before they mutate it.
+  assert.match(posix, /config_was_enabled=/);
+  assert.match(posix, /service_was_installed=/);
+  assert.ok(
+    posix.indexOf("service_was_installed=false") < posix.indexOf("rollback() {"),
+    "POSIX must capture prior state before defining the rollback that reads it",
+  );
+  assert.match(windows, /\$ConfigWasEnabled\s*=/);
+  assert.match(windows, /\$ServiceWasInstalled\s*=/);
+
+  // ...and both teardowns must be gated on it.
+  assert.match(
+    posix,
+    /\[ "\$service_installed" = true \] && \[ "\$service_was_installed" != true \]/,
+  );
+  assert.match(posix, /\[ "\$config_was_enabled" != true \]/);
+  assert.match(windows, /\$ServiceInstalled -and -not \$ServiceWasInstalled/);
+  assert.match(windows, /-not \$ConfigWasEnabled/);
+});
+
+// The manifest names the checkout that owns the generated state, and the
+// desktop app resolves its source root from it. Recording it only after the
+// health wait meant a timeout left the manifest naming the previous owner
+// while the installed service pointed at the new one.
+test("both installers record the manifest before waiting on health", () => {
+  const posix = readFileSync(path.join(root, "bin", "install"), "utf8");
+  const windows = readFileSync(path.join(root, "install.ps1"), "utf8");
+
+  assert.ok(
+    posix.indexOf("install-manifest.mjs record") < posix.indexOf("wait-health.mjs"),
+    "POSIX must record the manifest before the health wait",
+  );
+  assert.ok(
+    windows.indexOf("install-manifest.mjs record") < windows.indexOf("wait-health.mjs"),
+    "Windows must record the manifest before the health wait",
+  );
 });

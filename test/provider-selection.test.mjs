@@ -9,23 +9,19 @@ process.env.CODEX_HOME = path.join(testRoot, "codex");
 process.env.CODEX_ROUTER_STATE_DIR = path.join(testRoot, "state");
 process.env.KIMI_CODE_HOME = path.join(testRoot, "kimi-code");
 process.env.GROK_AUTH_PATH = path.join(testRoot, "grok", "auth.json");
+process.env.DEVIN_CREDENTIALS_PATH = path.join(testRoot, "devin", "credentials.toml");
 const { PROVIDERS } = await import("../src/model-registry.mjs");
 // Clearing every registry-declared credential variable keeps the "no provider
 // is configured yet" assertions deterministic on a developer machine that has
 // real keys exported, and stays correct as providers are added.
 for (const provider of PROVIDERS.values()) {
   for (const name of provider.credential?.environment || []) delete process.env[name];
-  // A CLI sign-in is an external credential too: a developer who has really
-  // run `command-code login` must not turn "nothing is configured yet" false.
-  const session = provider.credential?.cliSession;
-  if (session?.homeEnv) {
-    process.env[session.homeEnv] = path.join(testRoot, "cli-sessions", provider.id);
-  }
 }
 
 const { writeProviderCredential } = await import("../src/provider-credentials.mjs");
 const {
   configuredProviderIds,
+  defaultProviderIds,
   disableProvider,
   enableProvider,
   providerSelectionStatus,
@@ -46,19 +42,52 @@ function stageSelectionFile(contents) {
   writeFileSync(PROVIDER_SELECTION_PATH, contents, { encoding: "utf8", mode: 0o600 });
 }
 
+test("a valid official Devin CLI session configures the provider family", () => {
+  try {
+    mkdirSync(path.dirname(process.env.DEVIN_CREDENTIALS_PATH), { recursive: true });
+    writeFileSync(
+      process.env.DEVIN_CREDENTIALS_PATH,
+      'windsurf_api_key = "TEST_DEVIN_SESSION_ONLY"\napi_server_url = "https://server.invalid"\n',
+      { mode: 0o600 },
+    );
+    assert.ok(configuredProviderIds().includes("devin-cli"));
+  } finally {
+    rmSync(process.env.DEVIN_CREDENTIALS_PATH, { force: true });
+  }
+});
+
 test("provider selection keeps backward compatibility and can hide the final provider", () => {
   try {
     // No selection file means every registry provider stays visible; the
     // credential-aware catalog is what hides providers that cannot authenticate.
     assert.deepEqual(readProviderSelection(), [...PROVIDERS.keys()]);
     process.env.KIMI_API_KEY = "TEST_ENVIRONMENT_ONLY_KEY";
-    // Both local providers are keyless: they serve from this machine, so there
-    // is no credential to configure and they are always available. Everything
-    // else has to authenticate before it counts.
-    assert.deepEqual(configuredProviderIds(), ["local", "local-router"]);
+    // Local backends are keyless: they serve from this machine, so there is no
+    // credential to configure and they are always available. Everything else
+    // has to authenticate before it counts.
+    assert.deepEqual(configuredProviderIds(), [
+      "custom",
+      "kilo-free",
+      "lmstudio",
+      "local",
+      "local-router",
+      "opencode-free",
+      "opencode-free-responses",
+    ]);
+    assert.deepEqual(defaultProviderIds(), ["lmstudio", "local", "local-router"]);
     delete process.env.KIMI_API_KEY;
     writeProviderCredential("deepseek", "TEST_DEEPSEEK_SELECTION_KEY");
-    assert.deepEqual(configuredProviderIds(), ["deepseek", "local", "local-router"]);
+    assert.deepEqual(configuredProviderIds(), [
+      "custom",
+      "deepseek",
+      "kilo-free",
+      "lmstudio",
+      "local",
+      "local-router",
+      "opencode-free",
+      "opencode-free-responses",
+    ]);
+    assert.deepEqual(defaultProviderIds(), ["deepseek", "lmstudio", "local", "local-router"]);
 
     writeProviderSelection(["chatgpt-oauth"]);
     assert.deepEqual(readProviderSelection(), ["grok-oauth"]);
@@ -70,11 +99,19 @@ test("provider selection keeps backward compatibility and can hide the final pro
     }
     assert.deepEqual(
       selectedListedModels().map((model) => model.slug),
-      ["deepseek/deepseek-v4-flash", "deepseek/deepseek-v4-pro"],
+      [
+        "deepseek/deepseek-v4-flash",
+        "deepseek/deepseek-v4-flash-vision-exp",
+        "deepseek/deepseek-v4-pro",
+      ],
     );
     assert.deepEqual(
       selectedConfiguredListedModels().map((model) => model.slug),
-      ["deepseek/deepseek-v4-flash", "deepseek/deepseek-v4-pro"],
+      [
+        "deepseek/deepseek-v4-flash",
+        "deepseek/deepseek-v4-flash-vision-exp",
+        "deepseek/deepseek-v4-pro",
+      ],
     );
 
     assert.deepEqual(disableProvider("deepseek"), []);
@@ -104,7 +141,7 @@ test("opencode Go protocol variants follow their parent as one family", () => {
     ]);
 
     const slugs = selectedConfiguredListedModels().map((model) => model.slug);
-    assert.ok(slugs.includes("opencode-go/grok-4.5"));
+    assert.ok(slugs.includes("opencode-go-responses/grok-4.5"));
     assert.ok(slugs.includes("opencode-go-messages/minimax-m3"));
     assert.ok(slugs.includes("opencode-go-messages/qwen3.8-max"));
     assert.ok(slugs.includes("opencode-go-responses/gpt-5.6-luna"));
@@ -119,6 +156,23 @@ test("opencode Go protocol variants follow their parent as one family", () => {
         .map((model) => model.slug)
         .includes("opencode-go-messages/minimax-m2.7"),
     );
+  } finally {
+    rmSync(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("OpenCode Free protocol variants follow the anonymous parent as one family", () => {
+  try {
+    writeProviderSelection(["opencode-free-responses"]);
+    assert.deepEqual(
+      JSON.parse(readFileSync(PROVIDER_SELECTION_PATH, "utf8")).providers,
+      ["opencode-free"],
+    );
+    assert.deepEqual(readProviderSelection(), [
+      "opencode-free",
+      "opencode-free-responses",
+    ]);
+    assert.deepEqual(disableProvider("opencode-free-responses"), []);
   } finally {
     rmSync(testRoot, { recursive: true, force: true });
   }
@@ -176,7 +230,11 @@ test("an unknown provider id in the selection file is filtered out, not fatal", 
     // The surviving provider still routes and still filters the catalog.
     assert.deepEqual(
       selectedListedModels().map((model) => model.slug),
-      ["deepseek/deepseek-v4-flash", "deepseek/deepseek-v4-pro"],
+      [
+        "deepseek/deepseek-v4-flash",
+        "deepseek/deepseek-v4-flash-vision-exp",
+        "deepseek/deepseek-v4-pro",
+      ],
     );
     // Doctor and the support bundle read through this, so the damage is
     // reportable instead of arriving as a 502 on every request.

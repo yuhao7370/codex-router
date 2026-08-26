@@ -12,6 +12,8 @@ migrate_known=false
 smoke_test=false
 with_tray=false
 no_tray=false
+no_provider=false
+no_discovery=false
 previous_revision=
 force=false
 target=codex
@@ -20,11 +22,12 @@ usage() {
   cat <<'EOF'
 Usage: install.sh [options]
 
-Install external model routes for Codex.
+Install external model routes for Codex or DeepSeek Harness.
 
 Options:
   --install-dir PATH  Stable checkout used by the background service
-  --target APP        Install for "codex" (the default and only target)
+  --target APP        Install for "codex" (default), "dsh" (DeepSeek Harness),
+                      or "gemini" (Gemini CLI)
   --prepare-only      Install dependencies without changing either app
   --api-key           Alias for --kimi-api-key
   --kimi-api-key      Prompt securely for a Kimi Platform API key
@@ -38,6 +41,9 @@ Options:
   --smoke-test       Make one small billed request per enabled provider
   --with-tray        Also build and launch the desktop companion app
   --no-tray          Never offer the desktop companion app
+  --no-provider      Install idle: no provider is selected or configured
+  --no-discovery     With --no-provider: never read credentials, the Keychain,
+                     or other CLIs' sessions; Codex traffic gets a local error
   --force            Discard edits to tracked files in the managed checkout
                      before updating it. Untracked files are never touched.
   -h, --help          Show this help
@@ -50,6 +56,20 @@ EOF
 die() {
   printf 'codex-router: %s\n' "$*" >&2
   exit 1
+}
+
+# The single restore path for a step that runs after the pull. Every such step
+# can leave the checkout on code the machine cannot run -- `npm ci` empties
+# node_modules before it refills it -- so failing one has to return the managed
+# checkout to the revision the service was last known to work on, exactly as a
+# failed setup does. Steps that run before the pull have nothing to restore and
+# keep using die() directly.
+restore_previous_revision() {
+  if [ -n "$previous_revision" ]; then
+    git -C "$repo_dir" switch --detach "$previous_revision" >/dev/null 2>&1 || true
+    die "$1; the managed source checkout was restored to $previous_revision"
+  fi
+  die "$1"
 }
 
 # Mirrors DIRTY_PREVIEW_LIMIT in src/update.mjs and $DirtyPreviewLimit in
@@ -94,7 +114,7 @@ local_modifications_message() {
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --target)
-      [ "$#" -ge 2 ] || die "--target requires codex"
+      [ "$#" -ge 2 ] || die "--target requires codex, dsh, or gemini"
       target=$2
       shift 2
       ;;
@@ -149,6 +169,14 @@ while [ "$#" -gt 0 ]; do
       no_tray=true
       shift
       ;;
+    --no-provider)
+      no_provider=true
+      shift
+      ;;
+    --no-discovery)
+      no_discovery=true
+      shift
+      ;;
     --migrate-known)
       migrate_known=true
       shift
@@ -172,11 +200,23 @@ while [ "$#" -gt 0 ]; do
 done
 
 case "$target" in
-  codex) ;;
-  *) die "--target must be codex" ;;
+  codex|dsh|gemini) ;;
+  *) die "--target must be codex, dsh, or gemini" ;;
 esac
+# Legacy migration replaces an older router's managed Codex config block, and
+# the native catalog is the ChatGPT-plan model list Codex adopts. Neither has a
+# counterpart in the harness, whose integration is one settings section.
 if [ "$target" != codex ] && [ "$migrate_known" = true ]; then
   die "--migrate-known applies only to the Codex target"
+fi
+# An idle install is exactly "no providers", so naming providers or pasting
+# keys alongside it is a contradiction; and --no-discovery alone would select
+# providers that can never authenticate.
+if [ "$no_provider" = true ] && { [ -n "$providers" ] || [ -n "$configure_provider_keys" ] || [ "$guided" = true ]; }; then
+  die "--no-provider cannot be combined with --guided, --providers, or key flags"
+fi
+if [ "$no_discovery" = true ] && [ "$no_provider" != true ]; then
+  die "--no-discovery requires --no-provider"
 fi
 MODEL_ROUTER_TARGET=$target
 export MODEL_ROUTER_TARGET
@@ -248,12 +288,22 @@ command -v node >/dev/null 2>&1 ||
 command -v npm >/dev/null 2>&1 ||
   die "npm is required and is normally included with Node.js"
 
+# The key prompt imports modules from node_modules, which a fresh clone does
+# not have yet: bin/install installs them, and it runs later. Doing it here is
+# what makes the prompt work at all, and the failure has to reach the restore
+# path rather than abort under `set -e`.
+if [ -n "$configure_provider_keys" ]; then
+  node "$repo_dir/src/node-dependency-install.mjs" ||
+    restore_previous_revision "installing Node dependencies failed"
+fi
 for provider_id in $configure_provider_keys; do
   "$repo_dir/bin/provider-key" "$provider_id" set
 done
 
 if [ "$guided" = auto ]; then
-  if [ -t 1 ] && [ -r /dev/tty ] && [ -w /dev/tty ]; then
+  if [ "$no_provider" = true ]; then
+    guided=false
+  elif [ -t 1 ] && [ -r /dev/tty ] && [ -w /dev/tty ]; then
     guided=true
   else
     guided=false
@@ -267,6 +317,8 @@ if [ "$migrate_known" = true ]; then set -- "$@" --migrate-known; fi
 if [ "$smoke_test" = true ]; then set -- "$@" --smoke-test; fi
 if [ "$with_tray" = true ]; then set -- "$@" --with-tray; fi
 if [ "$no_tray" = true ]; then set -- "$@" --no-tray; fi
+if [ "$no_provider" = true ]; then set -- "$@" --no-provider; fi
+if [ "$no_discovery" = true ]; then set -- "$@" --no-discovery; fi
 setup_status=0
 "$repo_dir/bin/setup" "$@" || setup_status=$?
 # Exit 2 means setup left configuration unfinished (a declined prompt, a
@@ -279,11 +331,7 @@ if [ "$setup_status" -eq 2 ]; then
   printf 'setup did not finish configuring; the update was kept. Re-run setup to continue, or ./bin/rollback to return to the previous revision.\n' >&2
   exit 2
 elif [ "$setup_status" -ne 0 ]; then
-  if [ -n "$previous_revision" ]; then
-    git -C "$repo_dir" switch --detach "$previous_revision" >/dev/null 2>&1 || true
-    die "setup failed; the managed source checkout was restored to $previous_revision"
-  fi
-  die "setup failed"
+  restore_previous_revision "setup failed"
 fi
 
 cat <<'EOF'

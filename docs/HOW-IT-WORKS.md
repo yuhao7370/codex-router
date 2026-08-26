@@ -22,10 +22,10 @@ Four pieces make the integration work:
 ```mermaid
 sequenceDiagram
   participant C as Codex
-  participant R as Router :4102
-  participant L as LiteLLM :4100
-  participant O as Kimi OAuth :4101
-  participant A as API forwarder :4103
+  participant R as Router :4202
+  participant L as LiteLLM :4200
+  participant O as Kimi OAuth :4201
+  participant A as API forwarder :4203
   participant G as ChatGPT Codex
   participant P as External provider
 
@@ -55,12 +55,17 @@ sequenceDiagram
 The split registry tree under `config/` supplies the model mapping used by the
 catalog, router, gateway generator, API forwarder, and doctor.
 
-`enabled-providers.json` is a separate local policy. It controls both picker
-visibility and dispatcher access. A known namespaced model whose provider is
-hidden receives a local `provider_not_enabled` error; it is never mistaken for a
-native model or forwarded with Codex authentication. The policy is read on each
-external request, so provider visibility can change without restarting the
-service (Codex itself still needs a restart to reload the picker catalog).
+`enabled-providers.json` is a separate local policy owned by the router plane.
+It controls routed picker visibility and dispatcher access. `model-picker.json`
+stores the durable per-model decision, including explicit show choices, and the
+Codex, DeepSeek Harness, and Gemini publishers all consume that same state for
+external models. In a signed-in Codex install, the native GPT catalog and its
+base-entry visibility remain Codex-owned, so a router "hide all" action cannot
+erase the original native picker. A known namespaced model whose provider is hidden receives a local
+`provider_not_enabled` error; it is never mistaken for a native model or
+forwarded with Codex authentication. The policy is read on each external
+request, so provider visibility can change without restarting the service
+(Codex itself still needs a restart to reload the picker catalog).
 Catalog generation also requires a stored credential or valid OAuth session for
 each enabled external provider. Native GPT entries are included only when
 `codex login status` confirms an OpenAI login, so signed-out login-free users see
@@ -95,8 +100,13 @@ map, which restores native GPT routing.
 | DeepSeek V4 Pro Ollama Cloud | `ollama-cloud/deepseek-v4-pro` | `ollama-cloud-deepseek-v4-pro` | `deepseek-v4-pro` |
 | Qwen3.7 Max Plan | `qwen-plan/qwen3.7-max` | `qwen-plan-qwen3-7-max` | `qwen3.7-max` |
 | Qwen3.7 Plus Plan | `qwen-plan/qwen3.7-plus` | `qwen-plan-qwen3-7-plus` | `qwen3.7-plus` |
+| GLM-5.3 Coding Plan | `zai-coding/glm-5.3` | `zai-coding-glm-5-3` | `glm-5.3` |
 | GLM-5.2 Coding Plan | `zai-coding/glm-5.2` | `zai-coding-glm-5-2` | `glm-5.2` |
 | GLM-5-Turbo Coding Plan | `zai-coding/glm-5-turbo` | `zai-coding-glm-5-turbo` | `glm-5-turbo` |
+| GLM-5.3 Z.ai API | `zai-api/glm-5.3` | `zai-api-glm-5-3` | `glm-5.3` |
+| GLM-5.2 Z.ai API | `zai-api/glm-5.2` | `zai-api-glm-5-2` | `glm-5.2` |
+| GLM-4.7 Z.ai API | `zai-api/glm-4.7` | `zai-api-glm-4-7` | `glm-4.7` |
+| GLM-5.3 opencode Go | `opencode-go/glm-5.3` | `opencode-go-glm-5-3` | `glm-5.3` |
 
 The native catalog objects are preserved rather than reconstructed, which keeps
 current instructions and capability metadata from the installed Codex build.
@@ -166,6 +176,26 @@ The retired DeepSeek alias routes remain hidden registry entries. This keeps
 old CLI commands working only as long as DeepSeek continues serving those
 upstream aliases without advertising them to new users.
 
+### Standalone web search
+
+Codex 0.146 and newer can execute web search itself for a custom model
+provider. A routed model may opt in with `"searchTool": { "mode":
+"standalone" }`; the merged catalog then advertises the search capability and
+Codex sends the search result back through the normal routed Responses turn.
+This is a per-model compatibility declaration, not a claim that the upstream
+provider hosts search. Only enable it after verifying that the provider's
+model accepts Codex's web-search result items and preserves tool/function-call
+history. The managed Codex provider table must also set
+`supports_standalone_web_search = true` (on Codex versions that support that
+field); older clients ignore the field and continue without standalone search.
+
+The checked-in registry currently enables this mode for DeepSeek V4 Flash on
+its direct API and opencode Go routes, DeepSeek V4 Flash Vision Exp, Xiaomi
+MiMo v2.5, and GLM-5.3 on the Z.ai Coding Plan. Other provider/model pairs
+stay off until verified -- including GLM-5.3 on the opencode Go relay, which
+is a different transport from the Z.ai route the capability was proven on. User-model curation can opt in locally without changing the
+shared registry.
+
 ## Transport and compaction
 
 Current Codex builds first attempt a Responses WebSocket. The router responds
@@ -175,9 +205,61 @@ the model ID.
 
 Codex can compact history through `/responses/compact` or a
 `compaction_trigger`. External Chat Completions providers cannot create OpenAI's
-opaque encrypted compaction payload, so the router asks the selected external
-model for a continuation summary and wraps it in a router-owned `kcr1:` payload.
-On replay, it converts that payload back to a plain continuation message.
+opaque encrypted compaction payload. The router therefore assigns stable source
+IDs to the visible transcript, asks the selected external model for a structured
+selection of those IDs, and validates the selection before creating a
+router-owned `kcr2:` checkpoint. `U` entries preserve user requirements, `C`
+entries record only that the model requested a tool call and do not prove that
+execution started or completed, and `R` entries preserve the tool's returned
+status and a bounded, redacted excerpt. Assistant-authored `A` entries and every
+free-form model conclusion remain unverified navigation.
+
+Excerpt redaction reuses the router's managed caller-URL sanitizer and removes
+obvious named credentials and recognized token prefixes before either the
+source catalog or checkpoint is serialized. This is a narrow secret-safety
+control, not a general PII or arbitrary-string data-loss-prevention system.
+
+`kcr2` is Base64-encoded JSON, not encryption or a tamper-evident signature. Its
+trust boundary prevents model-authored summaries from becoming evidence; it does
+not defend against a client that deliberately rewrites request history. It
+carries at most 32 referenced sources, a 32 KiB recent tail, stable counters for
+repeated compaction, and an explicit warning that historical evidence does not
+prove mutable current state. The router preserves unresolved unknowns across
+another compaction and never asks a second model to bless the first model's
+prose. Invalid JSON or schema produces a safe checkpoint with no newly trusted
+references. Source IDs and counters must remain positive safe integers, and the
+source catalog sent to the model is capped at 96 KiB after JSON encoding. A model
+may select only IDs present in that catalog; fabricated, misclassified, or
+undisclosed IDs are rejected and recorded as an unverified warning. Providers
+that wrap their answer in prose or a Markdown fence are tolerated only when the
+response is at most 256 KiB and contains exactly one complete object that passes
+the checkpoint contract; incomplete or ambiguous JSON still fails closed. The
+router reads that contract only from the final Responses `message` (or the Chat
+Completions message fallback); separate `reasoning` output is a draft and never
+participates in KCR2 parsing. The latest two user messages are offered ahead of
+early requirements and newer tool traffic, and they are reserved in the bounded
+recent tail as well. The v1 compact replacement history replays at most those
+latest two ordinary user messages, subject to its existing 80,000-character
+complete-message budget, before the rendered checkpoint. Older user messages
+survive only when selected into bounded KCR2 evidence; otherwise their state is
+unknown rather than silently replayed as a current instruction. An over-budget
+message is represented by the checkpoint's explicitly truncated head-and-tail
+excerpt rather than by an unmarked tail fragment. KCR2 is intentionally lossy:
+its goal is to prevent unsupported conclusions, not to reconstruct a complete
+transcript.
+
+Existing `kcr1:` payloads and the plain continuation messages emitted by the old
+v1 compact endpoint remain readable for compatibility, but replay labels their
+model-written text `UNVERIFIED_LEGACY_SUMMARY`. Native OpenAI compaction items
+remain opaque and byte-preserved on native OpenAI requests; they are never
+decoded or promoted to evidence.
+
+Routed turns that carry a native OpenAI compaction item are unchanged by this
+work: the router does not yet build a checkpoint from them, and continues to
+follow its existing unreadable-compaction path. Bridging that boundary means
+generating a checkpoint on an ordinary turn, which puts summarization work --
+and its provider call -- on the request path, so it is deliberately held back
+for its own change rather than landing behind the checkpoint format.
 
 Standalone `/images/generations` and `/images/edits` requests always pass through
 to the native OpenAI Codex backend with filtered Codex authentication headers.
@@ -196,13 +278,20 @@ The relay requires an active ChatGPT sign-in because only the native Codex
 backend can open its own opaque payload. In login-free mode the router fails
 closed instead of forwarding unreadable ciphertext to an external provider.
 
-Only registry-proven models are advertised as native v2 spawn-agent overrides
-by default. The Settings tab (desktop panel and macOS tray) exposes two local
-accordions: **Subagent models** controls whether all selected models, or only
-individually chosen models, are promoted to `multi_agent_version: "v2"` in the
-merged catalog. The all-models mode follows the picker dynamically: a model
-hidden from **Model picker** is not exposed as a subagent. Each accordion also
-has select-all and unselect-all bulk actions. `bin/multi-agent on` still
-promotes every picker-visible selected model, and `bin/multi-agent off`
-restores the conservative set. The checked-in provider registry is never
-changed by these switches.
+Only registry-proven models are advertised as native v2 spawn-agent overrides.
+The Settings tab (desktop panel and macOS tray) exposes two local accordions:
+**Subagent models** can withhold or re-enable proven models, while **Model
+picker** controls visibility. Local settings never promote an unverified model
+to `multi_agent_version: "v2"`; that capability requires the checked-in native
+collaboration proof. A model hidden from the picker is not exposed as a
+subagent. Each accordion also has select-all and unselect-all bulk actions.
+
+On Codex 0.147, a child's FINAL_ANSWER is recorded as `subAgentActivity`
+`interacted` and stays visually working for the whole live parent turn.
+`close_agent` is not in that v2 toolset. The managed `multi_agent_v2` block
+therefore also sets `usage_hint_enabled` and tells the root agent to call
+`interrupt_agent` on a finished child. Because long multi-agent parents
+still skip that call, the router additionally injects any missing
+`interrupt_agent` tool calls into the parent response when the request input
+already contains those children's FINAL_ANSWER messages. That is the only
+path that settles the badge without the user clicking into each child.

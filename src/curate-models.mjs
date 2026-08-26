@@ -1,19 +1,45 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { spawnSync } from "node:child_process";
 
 import { discoverProviderModels } from "./model-discovery.mjs";
 import { MODELS, PROVIDERS, USER_MODEL_WARNINGS } from "./model-registry.mjs";
-import { SOURCE_ROOT } from "./paths.mjs";
 import { confirm, promptLine } from "./setup-shared.mjs";
 import { toggleSelection } from "./setup-ui.mjs";
-import { readUserModels, userModelEntry, writeUserModels } from "./user-models.mjs";
+import {
+  DEFAULT_AUTO_COMPACT,
+  DEFAULT_CONTEXT_WINDOW,
+  USER_MODELS_PATH,
+  defaultUserModelDescription,
+  hasDefaultUserModelReasoning,
+  readUserModels,
+  userModelEntry,
+  userModelIdentity,
+  writeUserModels,
+} from "./user-models.mjs";
+import {
+  curationPrimaryProviderId,
+  curationProviderIds,
+  curatedModelContextLength,
+  curatedModelDescription,
+  curatedModelProviderId,
+  curatedModelReasoningLevels,
+} from "./opencode-curation.mjs";
+import {
+  applyModelOverlayPublication,
+  transactModelOverlayMutation,
+} from "./model-overlay-publication.mjs";
+import {
+  migrateModelVisibility,
+  MODEL_PICKER_STATE_PATH,
+  setModelsVisible,
+} from "./model-picker-state.mjs";
 
 // Interactive curation: list the provider's live models that are not part of
 // the checked-in registry, let the user toggle the ones they want, and persist
 // them as user models. Discovery never edits the checked-in config/ registry tree.
 
-const providerId = process.argv[2];
+const requestedProviderId = process.argv[2];
+const providerId = curationPrimaryProviderId(requestedProviderId);
 const modelsOption = (() => {
   const index = process.argv.indexOf("--models");
   return index === -1 ? undefined : process.argv[index + 1];
@@ -24,6 +50,8 @@ const removeOption = (() => {
 })();
 const apply = process.argv.includes("--apply");
 const noApply = process.argv.includes("--no-apply");
+const freeOnly = process.argv.includes("--free-only");
+const refreshCatalog = process.argv.includes("--refresh");
 const effortsOption = (() => {
   const index = process.argv.indexOf("--efforts");
   return index === -1 ? undefined : process.argv[index + 1];
@@ -57,10 +85,32 @@ const REQUEST_PROFILE_DESCRIPTIONS = {
     'reject a forced tool_choice ("required") while still calling tools under "auto"',
 };
 
+// Codex compacts at this fraction of the declared window.
+const AUTO_COMPACT_RATIO = 0.85;
+
+// The sizing to store for a context window, from the provider's catalog or from
+// the interactive prompt. Both have to derive `autoCompact` the same way: it is
+// the number Codex actually reads to decide when to summarize, and a window
+// stored without it keeps whatever the conservative default said.
+//
+// Guessing 131072 for a model the provider advertises at 1,050,000 does not
+// fail safe. The estimate the router substitutes when an upstream reports zero
+// prompt tokens errs high on purpose, so against an eight-times-too-small
+// threshold it lands above the compaction limit on turn after turn and the
+// session compacts forever without finishing anything (#266).
+export function curatedSizing(contextLength) {
+  if (!Number.isInteger(contextLength) || contextLength < 1) return undefined;
+  return {
+    contextWindow: contextLength,
+    autoCompact: Math.floor(contextLength * AUTO_COMPACT_RATIO),
+  };
+}
+
 function usage() {
   console.error(
     "Usage: curate-models.mjs PROVIDER [--models id1,id2 | interactive] " +
-      "[--remove id1,id2] [--apply|--no-apply] [--efforts minimal,low,medium,high,xhigh] " +
+      "[--free-only] [--remove id1,id2] [--refresh] [--apply|--no-apply] " +
+      "[--efforts minimal,low,medium,high,xhigh] " +
       `[--request-profile ${Object.keys(REQUEST_PROFILE_DESCRIPTIONS).join("|")}]`,
   );
   process.exit(2);
@@ -98,6 +148,100 @@ export function planCuration({ mine, chosen, removals, interactive }) {
   };
 }
 
+// Apply a prompt/discovery result to the document observed at commit time.
+// Unrelated providers are merged from that current document; replacing the
+// whole array from the pre-prompt read would lose a concurrent curation. The
+// same provider is intentionally compare-and-swap: its current entries may
+// contain a newer user's edit that this run cannot safely reconcile.
+export function mergeCurationIntoCurrent(
+  current,
+  { providerId, providerIds = [providerId], expectedMine, nextMine },
+) {
+  const models = Array.isArray(current) ? current : [];
+  const owned = new Set(providerIds);
+  const currentMine = models.filter((model) => owned.has(model.provider));
+  if (JSON.stringify(currentMine) !== JSON.stringify(expectedMine)) {
+    throw new Error(
+      `Curated ${providerId} models changed while this command was running; review them and retry.`,
+    );
+  }
+  return [
+    ...models.filter((model) => !owned.has(model.provider)),
+    ...nextMine,
+  ];
+}
+
+// Normalize every entry in one local curation set onto the protocol OpenCode
+// documents for that upstream id. Existing metadata stays byte-for-byte alone
+// except for the untouched generic sizing pair on an exact documented model;
+// that pair is evidence curation had no model-specific answer, not a user tune.
+// Prefer an already correct entry if an older run left both protocol copies.
+export function normalizeCurationModels(models, providerId) {
+  const normalized = new Map();
+  for (const model of models) {
+    const targetProvider = curatedModelProviderId(providerId, model.upstreamModel, {
+      existingProvider: model.provider,
+    });
+    const routed = model.provider === targetProvider
+      ? model
+      : {
+          ...model,
+          ...userModelIdentity({
+            providerId: targetProvider,
+            upstreamId: model.upstreamModel,
+            metadata: model,
+          }),
+          provider: targetProvider,
+        };
+    // The untouched generic sizing pair is the one signal that nobody has been
+    // inside this entry by hand. Every documented value below is gated on it,
+    // so an operator who tuned the window keeps their whole entry byte for
+    // byte -- including an effort ladder they may have edited beside it.
+    const untuned =
+      routed.contextWindow === DEFAULT_CONTEXT_WINDOW &&
+      routed.autoCompact === DEFAULT_AUTO_COMPACT;
+    const documented = curatedSizing(
+      curatedModelContextLength(providerId, model.upstreamModel),
+    );
+    const upgradeSizing = Boolean(documented) && untuned;
+    // The same upgrade for the effort ladder: high-only is what curation
+    // stores when nothing documents the model's efforts, so replacing it with
+    // a published ladder is finishing the job, not overruling a choice. A
+    // ladder that is no longer the stock one was chosen by someone.
+    const documentedEfforts = curatedModelReasoningLevels(providerId, model.upstreamModel);
+    const efforts = documentedEfforts
+      ? parseEfforts(documentedEfforts.join(","))
+      : undefined;
+    const upgradeEfforts =
+      Boolean(efforts) && untuned && hasDefaultUserModelReasoning(routed);
+    // The stock description says the entry carries conservative defaults, so
+    // it stops being true the moment any of them is upgraded. Replace it with
+    // the sourcing note only while it is still the untouched stock string;
+    // anything the user wrote there is theirs.
+    const documentedDescription = curatedModelDescription(providerId, model.upstreamModel);
+    const upgradeDescription =
+      (upgradeSizing || upgradeEfforts) &&
+      documentedDescription &&
+      // An entry rerouted onto the Responses variant still carries the stock
+      // string naming the provider it was curated under, so accept either.
+      (routed.description === defaultUserModelDescription(routed.provider) ||
+        routed.description === defaultUserModelDescription(model.provider));
+    const sized = upgradeSizing || upgradeEfforts
+      ? {
+          ...routed,
+          ...(upgradeSizing ? documented : {}),
+          ...(upgradeEfforts ? efforts : {}),
+          ...(upgradeDescription ? { description: documentedDescription } : {}),
+        }
+      : routed;
+    const existing = normalized.get(model.upstreamModel);
+    if (!existing || model.provider === targetProvider) {
+      normalized.set(model.upstreamModel, sized);
+    }
+  }
+  return [...normalized.values()];
+}
+
 export function parseEfforts(raw) {
   const efforts = raw.split(",").map((value) => value.trim().toLowerCase()).filter(Boolean);
   for (const effort of efforts) {
@@ -118,7 +262,7 @@ export function parseEfforts(raw) {
   };
 }
 
-if (!providerId) usage();
+if (!requestedProviderId) usage();
 const provider = PROVIDERS.get(providerId);
 if (!provider) {
   console.error(`Unknown provider: ${providerId}`);
@@ -174,35 +318,20 @@ function chooseInteractively(candidates, curated) {
   return [...selected].sort((a, b) => a - b).map((position) => candidates[position - 1]);
 }
 
-function applyInstall() {
-  const result =
-    process.platform === "win32"
-      ? spawnSync(
-          "powershell.exe",
-          [
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-            path.join(SOURCE_ROOT, "install.ps1"),
-            "-CheckoutInstall",
-          ],
-          { stdio: "inherit" },
-        )
-      : spawnSync(path.join(SOURCE_ROOT, "bin", "install"), [], { stdio: "inherit" });
-  if (result.status !== 0) {
-    throw new Error("Applying the curated models did not finish; run the install command manually.");
-  }
-}
 
 async function main() {
   for (const warning of USER_MODEL_WARNINGS) console.error(warning);
   const existing = readUserModels();
-  const mine = existing.filter((model) => model.provider === providerId);
-  const others = existing.filter((model) => model.provider !== providerId);
+  const familyProviderIds = curationProviderIds(providerId);
+  const familyProviders = new Set(familyProviderIds);
+  const storedMine = existing.filter((model) => familyProviders.has(model.provider));
+  const mine = normalizeCurationModels(storedMine, providerId);
   const curated = new Set(mine.map((model) => model.upstreamModel));
   if (modelsOption !== undefined && removeOption !== undefined) {
     throw new Error("Use --models to add models or --remove to prune them, not both.");
+  }
+  if (freeOnly && (modelsOption !== undefined || removeOption !== undefined)) {
+    throw new Error("Use --free-only, --models, or --remove by itself.");
   }
   if (modelsOption !== undefined && (!modelsOption.trim() || modelsOption.startsWith("--"))) {
     throw new Error("--models requires at least one model id.");
@@ -224,27 +353,50 @@ async function main() {
 
   // Removing local curation must not depend on provider credentials or network
   // availability. Discovery is needed only for additions and the picker.
+  //
+  // Additions read the provider's cached list by default: it is the same list
+  // the caller chose from, and re-asking the provider makes every add pay for
+  // a network round trip it does not need. `--refresh` re-asks.
   const discovery = removeOption === undefined
-    ? await discoverProviderModels(providerId)
-    : { unregistered: [] };
-  const candidates = [...new Set([...discovery.unregistered, ...curated])].sort();
+    ? await discoverProviderModels(providerId, { refresh: refreshCatalog })
+    : { unregistered: [], addable: [], blocked: {} };
+  const candidates = [...new Set([...(discovery.addable || discovery.unregistered), ...curated])].sort();
 
-  if (candidates.length === 0 && removeOption === undefined) {
-    process.stdout.write(
-      `Every model ${provider.displayName} advertises is already in the registry.\n`,
-    );
+  if (freeOnly && !Array.isArray(discovery.free)) {
+    throw new Error(`${provider.displayName} does not publish a supported free-model catalog.`);
+  }
+  const freeCandidates = freeOnly
+    ? discovery.free.filter((id) => candidates.includes(id))
+    : [];
+  if (freeOnly && freeCandidates.length === 0) {
+    throw new Error(`${provider.displayName} currently advertises no unregistered free OpenAI-compatible models.`);
+  }
+
+  if (candidates.length === 0 && removeOption === undefined && modelsOption === undefined) {
+    const blockedCandidates = Object.entries(discovery.blocked || {});
+    if (blockedCandidates.length) {
+      process.stdout.write(`No newly advertised ${provider.displayName} models are supported by this Codex Router version yet.\n`);
+      for (const [id, reason] of blockedCandidates) process.stdout.write(`${id}: ${reason}\n`);
+    } else {
+      process.stdout.write(
+        `Every model ${provider.displayName} advertises is already in the registry.\n`,
+      );
+    }
     return;
   }
 
-  const interactiveSelection = modelsOption === undefined && removeOption === undefined;
+  const interactiveSelection = modelsOption === undefined && removeOption === undefined && !freeOnly;
   const chosen = modelsOption
     ? modelsOption.split(",").map((value) => value.trim()).filter(Boolean)
+    : freeOnly
+      ? freeCandidates
     : interactiveSelection
       ? chooseInteractively(candidates, curated)
       : [];
   if (removeOption === undefined) {
     for (const id of chosen) {
       if (candidates.includes(id)) continue;
+      if (discovery.blocked?.[id]) throw new Error(discovery.blocked[id]);
       throw new Error(
         `${id} is not an available candidate for ${providerId}. Candidates: ${candidates.join(", ")}`,
       );
@@ -252,30 +404,71 @@ async function main() {
   }
 
   const inheritedProfile = MODELS.find(
-    (model) => model.provider === providerId && model.requestProfile,
+    (model) => familyProviders.has(model.provider) && model.requestProfile,
   )?.requestProfile;
 
-  // Metadata comes from the user, not from any online catalog: which models
-  // exist is decided by the provider's own /v1/models endpoint above, and the
-  // sizing/effort details are asked interactively (or default conservatively
-  // in --models mode). Existing curated entries are never touched.
+  // Which models exist is decided by the provider's own /v1/models endpoint.
+  // Metadata comes from that catalog, the interactive user, or the narrow
+  // documented OpenCode exceptions whose catalog records omit their size.
+  // Existing curated entries are never touched.
   const interactive = interactiveSelection && Boolean(process.stdin.isTTY);
 
   const metadataFor = (id) => {
-    const discovered = discovery?.metadataById?.[id] || {};
-    const metadata = { ...discovered, ...(flagEfforts || {}) };
+    const discovered = discovery?.metadataById?.[id] || discovery?.metadata?.[id] || {};
+    const metadata = {
+      ...discovered,
+      ...(flagEfforts || {}),
+      ...(discovery.free?.includes(id) ? { isFree: true } : {}),
+    };
+    // The served catalog value wins when present. OpenCode's exact documented
+    // free-model size is the fallback for its id-only Zen catalog; every other
+    // silent catalog still gets the conservative generic default.
+    const advertised = curatedSizing(discovery.contextLengths?.[id] ?? discovered.contextWindow);
+    const documented = curatedSizing(curatedModelContextLength(providerId, id));
+    const sizing = advertised || documented;
+    if (sizing) Object.assign(metadata, sizing);
+    // OpenCode publishes an effort ladder per free id where the route has one,
+    // and the id-only Zen catalog carries none -- so without this every free
+    // model ships the single conservative `high` level whatever it supports
+    // (#352). An explicit --efforts is the operator speaking and still wins.
+    const documentedEfforts = curatedModelReasoningLevels(providerId, id);
+    if (!flagEfforts && documentedEfforts) {
+      Object.assign(metadata, parseEfforts(documentedEfforts.join(",")) || {});
+    }
+    // A documented window or effort ladder is not a conservative default, and
+    // this repository records where such a value came from in the entry's own
+    // description rather than only in a source comment. The same note names
+    // the capabilities that stayed unknown, so the stored entry says which of
+    // its values are real and which are still defaults. The live catalog's own
+    // figure needs no note; it is first-hand and already labeled "advertised".
+    let omitContextNote = Boolean(advertised);
+    let omitReasoningNote = Boolean(flagEfforts);
+    const describe = () => {
+      if (!documented && !documentedEfforts) return;
+      const description = curatedModelDescription(providerId, id, {
+        omitContextNote,
+        omitReasoningNote,
+      });
+      if (description) metadata.description = description;
+      else delete metadata.description;
+    };
+    describe();
     if (!interactive) return Object.keys(metadata).length > 0 ? metadata : undefined;
-
-    const defaultContext = discovered.contextWindow || 131072;
     process.stdout.write(`\nMetadata for ${id} (Enter keeps the default):\n`);
-    const rawContext = promptLine(`  Context window in tokens [${defaultContext}]`).trim();
+    const suggested = sizing?.contextWindow ?? DEFAULT_CONTEXT_WINDOW;
+    const rawContext = promptLine(
+      `  Context window in tokens [${suggested}${
+        advertised ? ", advertised" : documented ? ", documented" : ""
+      }]`,
+    ).trim();
     if (rawContext) {
       const context = Number.parseInt(rawContext, 10);
-      if (!Number.isInteger(context) || context < 1) {
-        throw new Error(`Invalid context window: ${rawContext}`);
-      }
-      metadata.contextWindow = context;
-      metadata.autoCompact = Math.floor(context * 0.85);
+      const sizing = curatedSizing(context);
+      if (!sizing) throw new Error(`Invalid context window: ${rawContext}`);
+      Object.assign(metadata, sizing);
+      // The sourcing note describes the documented figure. The user just
+      // replaced it, so that clause no longer matches what is stored.
+      if (context !== documented?.contextWindow) omitContextNote = true;
     }
 
     const imageDefault =
@@ -285,16 +478,19 @@ async function main() {
     }
 
     if (!flagEfforts) {
-      const discoveredEfforts = (discovered.reasoningLevels || [])
-        .map((level) => level.effort)
-        .filter(Boolean);
-      const effortDefault = discoveredEfforts.length > 0 ? discoveredEfforts.join(",") : "high";
+      const ladder = metadata.reasoningLevels?.map((level) => level.effort).join(",") || "high";
       const rawEfforts = promptLine(
         "  Reasoning efforts, comma-separated from " +
-          `${Object.keys(EFFORT_DESCRIPTIONS).join(",")} [${effortDefault}]`,
+          `${Object.keys(EFFORT_DESCRIPTIONS).join(",")} [${ladder}${
+            documentedEfforts ? ", documented" : ""
+          }]`,
       ).trim();
-      if (rawEfforts) Object.assign(metadata, parseEfforts(rawEfforts) || {});
+      if (rawEfforts) {
+        Object.assign(metadata, parseEfforts(rawEfforts) || {});
+        omitReasoningNote = true;
+      }
     }
+    describe();
     return Object.keys(metadata).length > 0 ? metadata : undefined;
   };
 
@@ -317,10 +513,16 @@ async function main() {
       : undefined;
   };
 
+  // Older builds included OrcaRouter's moving free meta-router. A free-only
+  // refresh replaces it with the concrete free models the live catalog names,
+  // while preserving every paid model the operator curated separately.
+  const effectiveRemovals = freeOnly && curated.has("orcarouter/free")
+    ? [...removals, "orcarouter/free"]
+    : removals;
   const { surviving, additions } = planCuration({
     mine,
     chosen,
-    removals,
+    removals: effectiveRemovals,
     interactive: interactiveSelection,
   });
   const nextMine = [
@@ -329,33 +531,111 @@ async function main() {
       // Ask for metadata before the profile so interactive prompts stay under
       // one model heading and in the order they are printed.
       const metadata = metadataFor(id);
+      const routedProviderId = curatedModelProviderId(providerId, id);
       return userModelEntry({
-        providerId,
+        providerId: routedProviderId,
         upstreamId: id,
         requestProfile: requestProfileFor(id),
         priority: 100 + mine.length + index,
         metadata,
       });
     }),
-  ];
-  const target = writeUserModels([...others, ...nextMine]);
+  ].map((model) => {
+    if (providerId !== "orca" || !discovery.free?.includes(model.upstreamModel)) return model;
+    return {
+      ...model,
+      ...userModelIdentity({
+        providerId,
+        upstreamId: model.upstreamModel,
+        metadata: { ...model, isFree: true },
+      }),
+      isFree: true,
+    };
+  });
+  let target;
   const added = nextMine.filter((model) => !curated.has(model.upstreamModel)).length;
   const removed = mine.length - (nextMine.length - added);
+  // Selecting a model in curation means selecting it for the picker as well.
+  // Provider enablement alone remains deliberately non-expansive: it must not
+  // flood every installed client's picker with that provider's whole catalog.
+  const pickerSelections = nextMine
+    .filter((model) => chosen.includes(model.upstreamModel))
+    .map((model) => model.slug);
+  const normalizedByUpstream = new Map(
+    nextMine.map((model) => [model.upstreamModel, model]),
+  );
+  const pickerMigrations = storedMine
+    .map((model) => ({
+      from: model.slug,
+      to: normalizedByUpstream.get(model.upstreamModel)?.slug,
+    }))
+    .filter(({ from, to }) => to && from !== to);
+
+  const wantsApply =
+    !noApply && (
+      apply ||
+      confirm("Apply now? This rebuilds gateway routes and restarts the background service.")
+    );
+  await transactModelOverlayMutation({
+    files: [USER_MODELS_PATH, MODEL_PICKER_STATE_PATH],
+    mutate: () => {
+      // Discovery and prompts intentionally happen before the lock, but the
+      // document merge cannot: another provider's curation may have landed
+      // while this command was waiting. Re-read both sides under the lock and
+      // merge current unrelated entries. A same-provider edit is ambiguous
+      // (the user's choices were based on an older list), so fail closed rather
+      // than overwrite it with a stale interactive result.
+      const current = readUserModels();
+      target = writeUserModels(mergeCurationIntoCurrent(current, {
+        providerId,
+        providerIds: familyProviderIds,
+        expectedMine: storedMine,
+        nextMine,
+      }));
+      if (pickerMigrations.length) migrateModelVisibility(pickerMigrations);
+      if (pickerSelections.length) setModelsVisible(pickerSelections, true);
+    },
+    restart: wantsApply,
+    // Publishing curated models is a catalog operation, not an installation.
+    // This used to shell out to bin/install, which reinstalls the background
+    // service and waits on its health -- and whose own EXIT trap disables the
+    // client config when that wait fails. Adding one model could therefore
+    // leave the router unrouted. rebuildModelOverlayPublication already writes
+    // the gateway routes and republishes every installed client's picker --
+    // the same catalog steps the installer ran -- and the restart requested
+    // above is the only reload the new gateway routes actually need.
+    //
+    // --no-apply still publishes nothing: it persists the overlay and leaves
+    // the routing plane untouched until the operator asks for it.
+    applyPublication: async (options) => (
+      wantsApply ? applyModelOverlayPublication(options) : {}
+    ),
+  });
   process.stdout.write(
     `Saved ${nextMine.length} curated ${provider.displayName} model${
       nextMine.length === 1 ? "" : "s"
     } (${added} added, ${removed} removed) to ${target}.\n`,
   );
-
   if (noApply) {
     process.stdout.write("Run ./bin/install to regenerate routes and the picker catalog.\n");
     return;
   }
-  const wantsApply =
-    apply ||
-    confirm("Apply now? This rebuilds gateway routes and restarts the background service.");
   if (wantsApply) {
-    applyInstall();
+    // An auto-policy is standing, provider/family-scoped consent to verify a
+    // newly curated model. This runs only after the overlay is published: the
+    // worker imports a fresh registry and can route the new slug immediately.
+    const addedModels = nextMine.filter((model) => !curated.has(model.upstreamModel));
+    if (addedModels.length) {
+      const { matchingSubagentAutoPolicyModels } = await import("./subagent-auto-policy.mjs");
+      const matching = matchingSubagentAutoPolicyModels(addedModels);
+      if (matching.length) {
+        const { spawnDetachedVerification } = await import("./subagent-verify.mjs");
+        spawnDetachedVerification(
+          matching.map((model) => model.slug),
+          { deferCandidateResolution: true },
+        );
+      }
+    }
     process.stdout.write("Curated models are live. Fully quit and reopen the app to refresh its picker.\n");
   } else {
     process.stdout.write("Run ./bin/install to regenerate routes and the picker catalog.\n");

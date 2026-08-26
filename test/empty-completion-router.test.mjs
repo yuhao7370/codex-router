@@ -20,7 +20,27 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const INTERNAL_KEY = "test-internal-service-key-with-sufficient-length";
 const CALLER_KEY = "test-router-caller-capability-with-sufficient-length";
 
+// An attempt that never proves it was generating. The guard holds all of it, so
+// the router can swap it for a retry the client never sees.
 const EMPTY_SSE = [
+  'event: response.created',
+  'data: {"type":"response.created","sequence_number":0,"response":{"id":"r-empty"}}',
+  "",
+  'event: response.in_progress',
+  'data: {"type":"response.in_progress","sequence_number":1,"response":{"id":"r-empty"}}',
+  "",
+  'event: response.completed',
+  'data: {"type":"response.completed","sequence_number":2,"response":{"id":"r-empty","output":[]}}',
+  "",
+  'event: response.done',
+  'data: {"type":"response.done","sequence_number":3,"response":{"id":"r-empty"}}',
+  "",
+].join("\n");
+
+// The same failure after the upstream proved it was generating. The reasoning
+// delta releases the hold, so this attempt is already on the wire by the time
+// it turns out to be empty and cannot be retried invisibly.
+const REASONING_EMPTY_SSE = [
   'event: response.created',
   'data: {"type":"response.created","sequence_number":0,"response":{"id":"r-empty"}}',
   "",
@@ -54,15 +74,17 @@ const CONTENT_SSE = [
 ].join("\n");
 
 // Large enough to force the guard past its 1 MiB pre-content hold budget
-// before any client-visible output arrives.
+// before any client-visible output arrives. Deliberately not a reasoning event:
+// reasoning releases the hold on liveness long before the byte cap, so a
+// reasoning prelude would exercise the wrong release path.
 const BUDGET_RELEASE_REASONING_SSE = [
   "event: response.created",
   'data: {"type":"response.created","response":{"id":"r-budget"}}',
   "",
-  "event: response.reasoning_text.delta",
+  "event: response.in_progress",
   `data: ${JSON.stringify({
-    type: "response.reasoning_text.delta",
-    delta: "x".repeat(2 * 1024 * 1024),
+    type: "response.in_progress",
+    response: { id: "r-budget", status: "x".repeat(2 * 1024 * 1024) },
   })}`,
   "",
 ].join("\n");
@@ -398,6 +420,7 @@ function routerEnv(gatewayPort, routerPort) {
     CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${gatewayPort}/v1`,
     CODEX_ROUTER_OAUTH_HEALTH_URL: `http://127.0.0.1:${gatewayPort}/health`,
     CODEX_ROUTER_API_HEALTH_URL: `http://127.0.0.1:${gatewayPort}/health`,
+    CODEX_ROUTER_GROK_OAUTH_HEALTH_URL: `http://127.0.0.1:${gatewayPort}/health`,
     CODEX_ROUTER_GATEWAY_HEALTH_URL: `http://127.0.0.1:${gatewayPort}/health`,
   };
 }
@@ -455,6 +478,91 @@ test("an empty completion is retried once and the retry's content reaches the cl
     assert.equal(event.status, 200);
     assert.equal(event.emptyCompletionRetried, true);
     assert.equal(event.emptyCompletion, undefined);
+  } finally {
+    await stopChild(router);
+    await closeServer(gw.server);
+  }
+});
+
+// The counterpart to the test above. Once the upstream streams reasoning, the
+// hold is over and the attempt is on the wire, so the router cannot substitute
+// a retry for it. It states the failure into the open stream instead. Holding
+// the prologue for this case is what used to cost every reasoning turn seconds
+// of dead air, and the silent rescue it bought landed on roughly one routed
+// turn in a thousand.
+test("a reasoning turn that ends empty is relayed and stated, never retried", async () => {
+  let posts = 0;
+  const gw = await gateway((_request, response) => {
+    posts += 1;
+    response.writeHead(200, {
+      "Content-Type": "text/event-stream; charset=utf-8",
+      "X-Upstream-Attempt": posts === 1 ? "first" : "retry",
+    });
+    response.end(posts === 1 ? REASONING_EMPTY_SSE : CONTENT_SSE);
+  });
+  const routerPort = await openPort();
+  const router = run(routerEnv(gw.port, routerPort));
+
+  try {
+    await waitFor(`${callerBaseUrl(routerPort, CALLER_KEY)}/models`, router);
+
+    const result = await readRouted(routerPort, TURN_BODY);
+
+    assert.equal(result.status, 200);
+    // The reasoning the user watched arrive is still theirs...
+    assert.match(result.body, /thinking/);
+    assert.match(result.body, /r-empty/);
+    // ...followed by a stated failure rather than a silent stop.
+    assert.match(result.body, /event: error/);
+    assert.match(result.body, /empty_completion/);
+    assert.doesNotMatch(result.body, /event: response\.(?:completed|done)/);
+    // No second attempt: the response had already started.
+    assert.equal(posts, 1, "a relayed attempt must not be retried");
+    assert.doesNotMatch(result.body, /Recovered|r-content/);
+    assert.equal(result.headers["x-upstream-attempt"], "first");
+
+    const [event] = await waitForUsageEvents(router.stateDir, 1, router);
+    assert.equal(event.status, 502);
+    assert.equal(event.emptyCompletion, true);
+    assert.equal(event.emptyCompletionUnrepairable, true);
+    assert.equal(event.emptyCompletionRetried, undefined);
+  } finally {
+    await stopChild(router);
+    await closeServer(gw.server);
+  }
+});
+
+test("a headers-only attempt times out, retries once, and returns content", async () => {
+  let posts = 0;
+  const gw = await gateway((_request, response) => {
+    posts += 1;
+    response.writeHead(200, {
+      "Content-Type": "text/event-stream; charset=utf-8",
+      "X-Upstream-Attempt": posts === 1 ? "first" : "retry",
+    });
+    response.flushHeaders();
+    if (posts === 1) return;
+    response.end(CONTENT_SSE);
+  });
+  const routerPort = await openPort();
+  const router = run({
+    ...routerEnv(gw.port, routerPort),
+    CODEX_ROUTER_EMPTY_COMPLETION_PRELUDE_MS: "25",
+  });
+
+  try {
+    await waitFor(`${callerBaseUrl(routerPort, CALLER_KEY)}/models`, router);
+    const result = await readRouted(routerPort, TURN_BODY);
+
+    assert.equal(result.status, 200);
+    assert.match(result.body, /Recovered/);
+    assert.equal(result.headers["x-upstream-attempt"], "retry");
+    assert.equal(posts, 2);
+
+    const [event] = await waitForUsageEvents(router.stateDir, 1, router);
+    assert.equal(event.status, 200);
+    assert.equal(event.emptyCompletionRetried, true);
+    assert.equal(event.emptyCompletionPreludeLimit, "time");
   } finally {
     await stopChild(router);
     await closeServer(gw.server);
@@ -570,7 +678,7 @@ test("a retried turn meters the tokens of both attempts", async () => {
   }
 });
 
-test("a retry that crosses the guard byte budget records the release", async () => {
+test("a retry that crosses the guard byte limit returns an explicit error", async () => {
   let posts = 0;
   const gw = await gateway((_request, response) => {
     posts += 1;
@@ -584,15 +692,46 @@ test("a retry that crosses the guard byte budget records the release", async () 
     await waitFor(`${callerBaseUrl(routerPort, CALLER_KEY)}/models`, router);
     const result = await readRouted(routerPort, TURN_BODY);
 
+    assert.equal(result.status, 502);
+    assert.equal(result.complete, true);
+    assert.doesNotMatch(result.body, /r-budget/);
+    assert.match(result.body, /precontent_limit/);
+    assert.equal(posts, 2);
+
+    const [event] = await waitForUsageEvents(router.stateDir, 1, router);
+    assert.equal(event.status, 502);
+    assert.equal(event.emptyCompletionRetried, true);
+    assert.equal(event.emptyCompletionPreludeLimit, "bytes");
+  } finally {
+    await stopChild(router);
+    await closeServer(gw.server);
+  }
+});
+
+test("a first-attempt byte limit retries without leaking its staged response", async () => {
+  let posts = 0;
+  const gw = await gateway((_request, response) => {
+    posts += 1;
+    response.writeHead(200, { "Content-Type": "text/event-stream" });
+    response.end(posts === 1 ? BUDGET_RELEASE_REASONING_SSE : CONTENT_SSE);
+  });
+  const routerPort = await openPort();
+  const router = run(routerEnv(gw.port, routerPort));
+
+  try {
+    await waitFor(`${callerBaseUrl(routerPort, CALLER_KEY)}/models`, router);
+    const result = await readRouted(routerPort, TURN_BODY);
+
     assert.equal(result.status, 200);
     assert.equal(result.complete, true);
-    assert.match(result.body, /r-budget/);
+    assert.match(result.body, /Recovered/);
+    assert.doesNotMatch(result.body, /r-budget/);
     assert.equal(posts, 2);
 
     const [event] = await waitForUsageEvents(router.stateDir, 1, router);
     assert.equal(event.status, 200);
     assert.equal(event.emptyCompletionRetried, true);
-    assert.equal(event.emptyCompletionGuardReleased, true);
+    assert.equal(event.emptyCompletionPreludeLimit, "bytes");
   } finally {
     await stopChild(router);
     await closeServer(gw.server);

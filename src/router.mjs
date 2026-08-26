@@ -13,17 +13,47 @@ import { promisify } from "node:util";
 import {
   assertCallerSecret,
   authenticatedRoute,
+  callerBaseUrl,
+  secretEqual,
 } from "./caller-auth.mjs";
 import {
+  CHECKPOINT_WARNING,
+  COMPACTION_PROMPT,
+  encodeCheckpoint,
+  finalizeCheckpoint,
+  isRouterCompactionValue,
+  LEGACY_V1_SUMMARY_PREFIX,
+  LEGACY_WARNING,
+  prepareCompaction,
+  renderCheckpoint,
+  renderCompactionValue,
+} from "./compaction-checkpoint.mjs";
+import { handlePanelRequest, isPanelRoute } from "./desktop-panel.mjs";
+import { handleGeminiRequest, isGeminiRoute } from "./gemini-surface.mjs";
+import {
+  applyKeepAliveTimeouts,
   endStreamedResponse,
   finishResponse,
+  formatErrorChain,
   HOP_BY_HOP_HEADERS,
   httpErrorStatus,
+  installGracefulShutdown,
   pipeResponse,
   readRequestBody,
+  writeEventStreamHead,
   writeJson,
+  writeStreamErrorEvent,
 } from "./http-utils.mjs";
-import { EmptyCompletionGuard } from "./empty-completion-guard.mjs";
+import {
+  EmptyCompletionGuard,
+  EmptyCompletionTerminalGuard,
+  isEmptyCompletionPreludeLimitError,
+} from "./empty-completion-guard.mjs";
+import {
+  ZaiResponsesCompatTransform,
+  zaiResponsesCompatTransform,
+} from "./zai-responses-compat.mjs";
+import { deepseekToolMessageCompatTransform } from "./deepseek-tool-message-compat.mjs";
 import {
   MERGED_CATALOG_PATH,
   NATIVE_CATALOG_PATH,
@@ -32,7 +62,9 @@ import {
 } from "./paths.mjs";
 import { MODEL_BY_SLUG, PROVIDERS, providerForModel } from "./model-registry.mjs";
 import { createHealthCache } from "./health-cache.mjs";
+import { discoveryDisabled } from "./discovery-mode.mjs";
 import { readNativeAliases } from "./native-alias.mjs";
+import { nativeContextVariantBase } from "./native-context-variants.mjs";
 import { readNativeRedirect } from "./native-redirect.mjs";
 import {
   canonicalProviderId,
@@ -56,12 +88,42 @@ import {
 import { nativeProxyFetch } from "./native-proxy.mjs";
 import {
   NamespaceToolCallTransform,
+  agentMessagesAsUserMessages,
+  bridgeCustomTools,
+  downgradeOriginalImageDetail,
   flattenNamespacedHistory,
   flattenNamespaceTools,
+  flattenToolSearchHistory,
+  repairToolSchemaRoots,
+  stripSearchContentTypes,
 } from "./namespace-relay.mjs";
+import { collaborationToolAvailable, pendingInterruptTargets } from "./subagent-completion.mjs";
+import {
+  FAILOVER_BUDGET_MS,
+  MAX_FAILOVER_HOPS,
+  classifyRoutedFailure,
+  clearProviderCooldown,
+  providerCooldown,
+  rankFailoverCandidates,
+  readFailoverSettings,
+  recordProviderCooldown,
+} from "./model-failover.mjs";
+import {
+  awaitingSpawnProof,
+  recordSpawnFailure,
+  recordSpawnObserved,
+  spawnProofRevocable,
+  subagentProofSnapshot,
+} from "./subagent-proofs.mjs";
+import { forgetChildSpawn, observeChildTurn } from "./subagent-turns.mjs";
+import { subagentEffort } from "./multi-agent-state.mjs";
 import { mergeCodexAppTools } from "./codex-app-tools.mjs";
-import { activityMetadataFromHeaders } from "./codex-session-names.mjs";
-import { translateGatewayError } from "./error-translation.mjs";
+import {
+  activityMetadataFromHeaders,
+  threadIdFromHeaders,
+} from "./codex-session-names.mjs";
+import { gatewayErrorStatus, translateGatewayError } from "./error-translation.mjs";
+import { describeTransportFailure } from "./transport-failure.mjs";
 import { recordUsageEvent } from "./usage-events.mjs";
 import {
   classifySsePrefix,
@@ -82,6 +144,15 @@ import {
 import { readHiddenModels } from "./model-picker-state.mjs";
 import { readVisionBridgeSettings } from "./vision-bridge-state.mjs";
 import { installedNativeVisionEngines } from "./vision-engines.mjs";
+import { ageToolResults } from "./tool-result-aging.mjs";
+import {
+  applyTokenMaxxingOverlay,
+  tokenMaxxingActive,
+} from "./instruction-overlays.mjs";
+import {
+  nativeToolResultAgingEnabled,
+  toolResultAgingEnabled,
+} from "./tool-result-aging-state.mjs";
 import { VERSION } from "./version.mjs";
 import {
   nextInjectionAccount,
@@ -93,6 +164,13 @@ import {
   startTaskManagerPoller,
 } from "./task-manager-bridge.mjs";
 import { startTaskManagerUi } from "./task-manager-ui.mjs";
+import { nativeSessionHeaders } from "./codex-native-session.mjs";
+import {
+  installStableFetchTransport,
+  loopbackProbeFetch,
+} from "./fetch-transport.mjs";
+
+installStableFetchTransport();
 
 const LISTEN_HOST =
   process.env.CODEX_ROUTER_HOST || process.env.KIMI_ROUTER_HOST || "127.0.0.1";
@@ -115,6 +193,9 @@ const API_HEALTH =
   process.env.CODEX_ROUTER_API_HEALTH_URL ||
   process.env.KIMI_API_HEALTH_URL ||
   loopback(PORTS.api, "/health");
+const GROK_OAUTH_HEALTH =
+  process.env.CODEX_ROUTER_GROK_OAUTH_HEALTH_URL ||
+  loopback(PORTS.grokOauth, "/health");
 const GATEWAY_HEALTH =
   process.env.CODEX_ROUTER_GATEWAY_HEALTH_URL ||
   process.env.KIMI_GATEWAY_HEALTH_URL ||
@@ -139,6 +220,22 @@ const ZERO_INPUT_ESTIMATE = process.env.CODEX_ROUTER_ZERO_INPUT_ESTIMATE !== "0"
 // turn it off without downgrading the router.
 const EMPTY_COMPLETION_RETRY =
   process.env.CODEX_ROUTER_EMPTY_COMPLETION_RETRY !== "0";
+const configuredEmptyCompletionPreludeMs = Number(
+  process.env.CODEX_ROUTER_EMPTY_COMPLETION_PRELUDE_MS || 30_000,
+);
+const EMPTY_COMPLETION_PRELUDE_MS =
+  Number.isFinite(configuredEmptyCompletionPreludeMs) &&
+  configuredEmptyCompletionPreludeMs >= 0
+    ? configuredEmptyCompletionPreludeMs
+    : 30_000;
+const configuredEmptyCompletionPreludeBytes = Number(
+  process.env.CODEX_ROUTER_EMPTY_COMPLETION_PRELUDE_BYTES || 1024 * 1024,
+);
+const EMPTY_COMPLETION_PRELUDE_BYTES =
+  Number.isFinite(configuredEmptyCompletionPreludeBytes) &&
+  configuredEmptyCompletionPreludeBytes >= 0
+    ? Math.floor(configuredEmptyCompletionPreludeBytes)
+    : 1024 * 1024;
 const ERROR_STATUS_DURATION_MS = 8_000;
 const configuredDecodedBodyBytes = Number(
   process.env.MODEL_ROUTER_MAX_DECODED_BODY_BYTES ||
@@ -259,13 +356,6 @@ const FORWARD_HEADERS = new Set([
   "x-responsesapi-include-timing-metrics",
 ]);
 
-const COMPACT_PROMPT = `You are performing a CONTEXT CHECKPOINT COMPACTION. Create a handoff summary for another language model that will resume the task.
-
-Include current progress, key decisions, constraints, user preferences, remaining steps, and critical data or references. Be concise, structured, and focused on seamless continuation.`;
-const SUMMARY_PREFIX =
-  "Another language model started this task and produced a continuation summary. Use it to continue without repeating completed work:";
-const COMPACTION_PREFIX = "kcr1:";
-
 function parseBody(buffer) {
   try {
     const value = JSON.parse(buffer.toString("utf8"));
@@ -280,6 +370,23 @@ function parseBody(buffer) {
     wrapped.status = 400;
     throw wrapped;
   }
+}
+
+// Large Codex turns parse several megabytes of JSON on the event loop. Yield
+// first so an already-accepted GET /health can answer instead of sitting
+// behind that parse and looking like a dead router to the tray.
+async function parseBodyAsync(buffer) {
+  await new Promise((resolve) => setImmediate(resolve));
+  return parseBody(buffer);
+}
+
+function bindClientAbort(request, response, onAbort) {
+  const abort = () => onAbort();
+  request.once("aborted", abort);
+  response.once("close", () => {
+    if (!response.writableEnded) abort();
+  });
+  if (request.aborted || response.destroyed) abort();
 }
 
 function decodeBody(body, contentEncoding) {
@@ -388,6 +495,23 @@ function nativeHeaders(request, fastContext) {
       request.url,
       nativeFast ? "native" : injectedFast ? "injected" : undefined,
     );
+  } else {
+    // A caller that brought its own upstream session is relayed exactly as it
+    // arrived -- Codex always does, so nothing about a Codex turn changes here.
+    // A router-local bearer key counts as no upstream credential at all.
+    const presented = bearerToken(headers.authorization);
+    const routerLocal =
+      presented !== undefined &&
+      (secretEqual(presented, CALLER_KEY || "") || secretEqual(presented, INTERNAL_KEY || ""));
+    if (!headers.authorization || routerLocal) {
+      const fallback = nativeSessionHeaders();
+      if (fallback) {
+        Object.assign(headers, fallback);
+      } else if (routerLocal) {
+        // Never forward the router's local caller credential to ChatGPT.
+        delete headers.authorization;
+      }
+    }
   }
   return headers;
 }
@@ -400,6 +524,82 @@ function injectedAccountId(headers) {
   return typeof value === "string" && value ? value : undefined;
 }
 
+// The token out of an `Authorization: Bearer <token>` header, or undefined for
+// any other scheme -- which is relayed untouched rather than inspected.
+//
+// Parsed rather than matched. `/^Bearer\s+(.+)$/` reads well and backtracks
+// polynomially on a header of many spaces and no token, and this runs on a
+// header an unauthenticated caller controls. Scanning is linear and needs no
+// reasoning about which quantifiers can overlap.
+const BEARER_PREFIX = "bearer";
+function bearerToken(value) {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  if (trimmed.length <= BEARER_PREFIX.length) return undefined;
+  if (trimmed.slice(0, BEARER_PREFIX.length).toLowerCase() !== BEARER_PREFIX) return undefined;
+  // The scheme and the token must be separated by whitespace, or `BearerX` and
+  // `Bearer X` would parse the same.
+  const separator = trimmed[BEARER_PREFIX.length];
+  if (separator !== " " && separator !== "\t") return undefined;
+  const token = trimmed.slice(BEARER_PREFIX.length + 1).trim();
+  return token || undefined;
+}
+
+// True when the caller authenticated to this router and brought no upstream
+// credential of its own -- the harness, and anything else pointed at a managed
+// caller base URL. Codex is never this.
+function callerBroughtNoUpstreamCredential(request) {
+  const presented = bearerToken(request.headers.authorization);
+  if (presented === undefined) return request.headers.authorization === undefined;
+  return secretEqual(presented, CALLER_KEY || "") || secretEqual(presented, INTERNAL_KEY || "");
+}
+
+// ChatGPT's own backend accepts a narrower request than the public Responses
+// API does. Codex knows the difference and complies; a generic OpenAI client
+// does not, and every one of these comes back as a bare 400 that names a single
+// parameter. Measured against the live endpoint rather than guessed.
+const NATIVE_UNSUPPORTED_PARAMS = Object.freeze([
+  "temperature",
+  "top_p",
+  "presence_penalty",
+  "frequency_penalty",
+  "max_tokens",
+  "max_output_tokens",
+  "metadata",
+  "seed",
+  "user",
+  "truncation",
+]);
+
+/**
+ * Make a generic Responses request acceptable to the native endpoint.
+ *
+ * Applied only for a caller whose session this router substituted, so a Codex
+ * turn is never rewritten -- Codex sends a compliant request already, and the
+ * promise that its traffic is byte-identical is worth more than the tidiness of
+ * one shared path.
+ */
+function normalizeNativeForSubstitutedCaller(payload) {
+  // Not optional upstream: `store` must be false, and anything else is a 400.
+  payload.store = false;
+  for (const key of NATIVE_UNSUPPORTED_PARAMS) delete payload[key];
+  return payload;
+}
+
+/**
+ * Remove the legacy cache-retention shape that GPT-5.6 rejects.
+ *
+ * Current Codex builds can still emit the old top-level field on a later turn.
+ * Omitting it keeps implicit prompt caching active. A caller that already uses
+ * `prompt_cache_options` passes through unchanged.
+ */
+function normalizeNativePromptCacheCompatibility(payload) {
+  if (/^gpt-5\.6(?:-|$)/.test(String(payload.model || ""))) {
+    delete payload.prompt_cache_retention;
+  }
+  return payload;
+}
+
 function routedHeaders() {
   return {
     Authorization: `Bearer ${INTERNAL_KEY}`,
@@ -407,6 +607,51 @@ function routedHeaders() {
     "Accept-Encoding": "identity",
     "User-Agent": `codex-router/${VERSION}`,
   };
+}
+
+// LiteLLM translates Codex Responses requests into Chat Completions only after
+// this router hands the turn to the gateway. A profile that rejects forced
+// tool choices therefore has to be normalized here, before that translation
+// can cause the upstream model to emit an invalid forced call.
+function normalizeAutoToolChoice(payload, route) {
+  if (
+    ["auto-tool-choice", "ollama-cloud-auto-tool-choice"].includes(route.requestProfile) &&
+    payload.tool_choice !== undefined &&
+    payload.tool_choice !== "none"
+  ) {
+    payload.tool_choice = "auto";
+  }
+}
+
+// The documented Zen Free pair has two different wire contracts: Ox uses Chat
+// Completions and Muse Contributor Free uses Responses. Their observed strict
+// tool/input limitations do not establish a contract for paid Zen, Go, or any
+// other free model, so keep this compatibility boundary exact.
+function needsZenFreeToolCompatibility(route) {
+  const providerId = providerForModel(route)?.id;
+  return (
+    (providerId === "opencode-free" && route.upstreamModel === "x-preview-f-free") ||
+    (providerId === "opencode-free-responses" &&
+      route.upstreamModel === "muse-spark-1.2-contributor-free")
+  );
+}
+
+// Moonshot accepts a `$ref` only when it points into `#/$defs/` and rejects the
+// whole request -- not the one tool -- over any other pointer, including the
+// sibling-property pointers Codex App connector tools ship: Wego
+// `_flights_search` points `inboundTotalDurationRange` at its own sibling
+// `priceRange` (issue #353). Scope this to the provider the rejection was
+// reproduced on. The Moonshot platform keys (`kimi-api`, `kimi-api-cn`) reach a
+// different front end and were never observed rejecting these schemas, and
+// inlining for everyone would rewrite the wire payload for providers that work
+// today.
+function needsMoonshotDefsOnlyRefs(route) {
+  return providerForModel(route)?.id === "kimi-oauth";
+}
+
+function zenFreeCompatibleInput(input, route) {
+  if (!needsZenFreeToolCompatibility(route)) return input;
+  return downgradeOriginalImageDetail(agentMessagesAsUserMessages(input));
 }
 
 function nativeTarget(pathname, search = "") {
@@ -701,7 +946,7 @@ function catalogModels() {
 
 // Shared across every /health request so a polling companion collapses into
 // one probe per service per window instead of three per poll.
-const healthCache = createHealthCache();
+const healthCache = createHealthCache({ staleWhileRevalidate: true });
 
 function serviceHealth(url) {
   return healthCache(url, () => probeService(url));
@@ -709,7 +954,9 @@ function serviceHealth(url) {
 
 async function probeService(url) {
   try {
-    const response = await fetch(url, {
+    // No dispatcher argument: `loopbackProbeFetch` owns one shared probe pool
+    // for the process, so this cannot fork a second one.
+    const response = await loopbackProbeFetch(url, {
       headers: { Authorization: `Bearer ${INTERNAL_KEY}` },
       signal: AbortSignal.timeout(3_000),
     });
@@ -726,36 +973,45 @@ async function healthPayload() {
   const apiEnabled = [...PROVIDERS.values()].some(
     (provider) => enabled.has(provider.id) && provider.kind === "openai-compatible",
   );
-  const [oauth, api, gateway] = await Promise.all([
+  const [oauth, api, grokOauth, gateway] = await Promise.all([
     enabled.has("kimi-oauth")
       ? serviceHealth(OAUTH_HEALTH)
       : { reachable: true, enabled: false },
     apiEnabled ? serviceHealth(API_HEALTH) : { reachable: true, enabled: false },
+    // The Grok OAuth forwarder is started unconditionally but is only a real
+    // dependency for an operator who selected the provider, so it is gated the
+    // way the Kimi OAuth forwarder is: an unselected provider reports standby
+    // rather than being probed on a port nobody routes through.
+    enabled.has("grok-oauth")
+      ? serviceHealth(GROK_OAUTH_HEALTH)
+      : { reachable: true, enabled: false },
     serviceHealth(GATEWAY_HEALTH),
   ]);
+  // Naming the unreachable dependency is the difference between "the router is
+  // broken" and "the gateway is restarting". It costs nothing to carry: these
+  // are four fixed local service names, so it is safe on the unauthenticated
+  // leaf too, which is the only one `waitForRouterHealth` and therefore doctor
+  // can read.
+  const degraded = [
+    ["oauth", oauth],
+    ["api", api],
+    ["grokOauth", grokOauth],
+    ["gateway", gateway],
+  ]
+    .filter(([, service]) => !service.reachable)
+    .map(([name]) => name);
   return {
-    ok: oauth.reachable && api.reachable && gateway.reachable,
+    ok: degraded.length === 0,
     service: "codex-router",
     version: VERSION,
     router: "ready",
+    degraded,
     activity: activityPayload(),
     oauth,
     api,
+    grokOauth,
     gateway,
   };
-}
-
-function encodeSummary(summary) {
-  return COMPACTION_PREFIX + Buffer.from(summary, "utf8").toString("base64");
-}
-
-function decodeSummary(value) {
-  if (typeof value !== "string" || !value.startsWith(COMPACTION_PREFIX)) return undefined;
-  try {
-    return Buffer.from(value.slice(COMPACTION_PREFIX.length), "base64").toString("utf8");
-  } catch {
-    return undefined;
-  }
 }
 
 function messageItem(text) {
@@ -772,12 +1028,7 @@ function normalizeRoutedInput(input) {
     .filter((item) => item?.type !== "compaction_trigger")
     .map((item) => {
       if (item?.type !== "compaction") return item;
-      const summary = decodeSummary(item.encrypted_content);
-      return messageItem(
-        summary
-          ? `${SUMMARY_PREFIX}\n\n${summary}`
-          : "[Earlier conversation history was compacted in an unreadable format.]",
-      );
+      return messageItem(renderCompactionValue(item.encrypted_content));
     })
     .map((item) => {
       // LiteLLM rejects messages whose text content is empty; Codex emits
@@ -1087,6 +1338,42 @@ function visionEngineProvider(engine) {
 // refusal again.
 const visionReadsInFlight = new Map();
 
+// A provider can report account quota exhaustion without a trustworthy reset
+// header. Do not invent a provider cooldown in that case, but also do not buy
+// the exact same failed image read again on every rapid follow-up turn. This is
+// deliberately a short, per-read anti-storm backoff rather than a claim about
+// when the provider quota resets. Provider-named reset windows still use the
+// durable cooldown store below.
+const VISION_FAILURE_BACKOFF_MS = 60_000;
+const VISION_FAILURE_CACHE_MAX_ENTRIES = 128;
+const visionFailedReads = new Map();
+
+function visionFailureCacheKey(readKey) {
+  return createHash("sha256").update(readKey).digest("base64url");
+}
+
+function cachedVisionFailure(readKey, now = Date.now()) {
+  const cacheKey = visionFailureCacheKey(readKey);
+  const cached = visionFailedReads.get(cacheKey);
+  if (!cached) return undefined;
+  if (cached.expiresAt > now) return cached.error;
+  visionFailedReads.delete(cacheKey);
+  return undefined;
+}
+
+function rememberVisionFailure(readKey, error, now = Date.now()) {
+  // A reset-bearing 429 is handled by providerCooldown(), which is broader and
+  // more accurate. The negative cache exists only for quota exhaustion where
+  // the provider named no usable reset window.
+  if (error?.failureKind !== "out_of_usage" || error?.cooldownUntil) return;
+  const cacheKey = visionFailureCacheKey(readKey);
+  visionFailedReads.delete(cacheKey);
+  visionFailedReads.set(cacheKey, { error, expiresAt: now + VISION_FAILURE_BACKOFF_MS });
+  while (visionFailedReads.size > VISION_FAILURE_CACHE_MAX_ENTRIES) {
+    visionFailedReads.delete(visionFailedReads.keys().next().value);
+  }
+}
+
 // Codex resends the whole conversation every turn, so the same screenshot
 // arrives again on every follow-up. Without the hash cache a five-turn
 // conversation about one image would buy the same transcript five times.
@@ -1117,6 +1404,8 @@ async function visionEvidenceFor(url, engine, request, effort, question = "", re
   // record of spend, not of calls the router avoided.
   if (cached !== undefined) return cached;
   const readKey = `${key}\u0000${question}`;
+  const failed = cachedVisionFailure(readKey);
+  if (failed) throw failed;
   const running = visionReadsInFlight.get(readKey);
   if (running) return running;
   // Deliberately not tied to the caller's AbortSignal. The read is shared, so
@@ -1128,6 +1417,9 @@ async function visionEvidenceFor(url, engine, request, effort, question = "", re
   visionReadsInFlight.set(readKey, read);
   try {
     return await read;
+  } catch (error) {
+    rememberVisionFailure(readKey, error);
+    throw error;
   } finally {
     visionReadsInFlight.delete(readKey);
   }
@@ -1158,6 +1450,22 @@ async function readVisionEvidence({ url, engine, nativeCall, effort, question, k
     });
     status = 200;
     return evidenceCache.set(key, question, text);
+  } catch (error) {
+    const errorStatus = Number(error?.status);
+    if (Number.isFinite(errorStatus)) status = errorStatus;
+    const reason =
+      error?.failureKind === "out_of_usage"
+        ? "out_of_usage"
+        : errorStatus === 429 && error?.cooldownUntil
+          ? "rate_limited"
+          : undefined;
+    if (reason && error?.cooldownUntil) {
+      recordProviderCooldown(visionEngineProvider(engine), {
+        until: error.cooldownUntil,
+        reason,
+      });
+    }
+    throw error;
   } finally {
     recordUsageEvent({
       model: engine.slug,
@@ -1168,47 +1476,96 @@ async function readVisionEvidence({ url, engine, nativeCall, effort, question, k
   }
 }
 
-// DeepSeek thinking mode rejects a tool-call turn whose assistant message
-// carries no reasoning_content. LiteLLM's Responses->chat translation drops
-// `reasoning` input items entirely, so the reasoning text never reaches the
-// provider. Replace each reasoning item with a synthetic assistant message
-// carrying the reasoning text; LiteLLM merges it into the following
-// function_call's assistant message, and the forwarder's replay attaches it as
-// `reasoning_content` on the tool-call message. In-place, no-op when there is
-// nothing to carry.
-function carryReasoningThroughInput(input) {
+// DeepSeek thinking mode rejects a turn whose assistant message carries no
+// reasoning_content. LiteLLM's Responses->chat translation drops `reasoning`
+// input items entirely (`_transform_responses_api_input_item_to_chat_completion_message`
+// returns nothing for an item whose `content` is null, which is the shape
+// Codex stores), so the reasoning text never reaches the provider at all.
+// Carry each run of reasoning items onto the assistant turn it belongs to, and
+// the translation keeps it as that message's content. In-place, no-op when
+// there is nothing to carry.
+//
+// Every assistant turn needs covering, not only the ones that call a tool.
+// This used to carry the reasoning solely into a following `function_call` or
+// an empty assistant filler, which is the shape of a tool loop -- so a turn
+// that answers in prose lost its reasoning, and the provider refused the
+// *next* request for a reasoning_content it had never been given. A subagent
+// always ends that way, which is why spawning one failed every time and an
+// ordinary tool loop did not (#256).
+function carryReasoningThroughInput(input, { nativeThinking = false } = {}) {
   if (!Array.isArray(input) || input.length < 2) return;
-  for (let i = 0; i < input.length - 1; i += 1) {
-    const item = input[i];
-    if (item?.type !== "reasoning") continue;
-    const text = reasoningItemText(item);
-    if (!text) continue;
-    const next = input[i + 1];
-    // DeepSeek emits reasoning directly before a function_call, or before an
-    // empty assistant message that announces the call. Carry the reasoning in
-    // both cases; otherwise LiteLLM's Responses->chat translation drops it and
-    // the tool-call turn 400s for missing `reasoning_content`.
-    const nextIsCall = next?.type === "function_call";
-    const nextIsEmptyAssistant =
-      next?.type === "message" &&
-      next?.role === "assistant" &&
-      assistantMessageText(next) === "";
-    if (!nextIsCall && !nextIsEmptyAssistant) continue;
-    // Replace the reasoning item with an assistant message carrying its text.
-    input[i] = {
-      type: "message",
-      role: "assistant",
-      content: [{ type: "output_text", text }],
-    };
+  for (let index = 0; index < input.length - 1; index += 1) {
+    if (input[index]?.type !== "reasoning") continue;
+    // One assistant turn can emit several reasoning items in a row, and they
+    // all belong to the turn that follows. Carrying only the item nearest the
+    // turn dropped everything the model thought before it.
+    let end = index;
+    const texts = [];
+    while (end < input.length && input[end]?.type === "reasoning") {
+      const text = reasoningItemText(input[end]);
+      if (text) texts.push(text);
+      end += 1;
+    }
+    const text = texts.join("\n");
+    const next = input[end];
+    // Only the last item of the run is rewritten. The earlier ones stay
+    // `reasoning` items, which the translation drops -- their text is already
+    // in the joined value, and leaving them in place keeps the array the same
+    // length for every other pass over it.
+    if (text && next) {
+      if (next.type === "function_call" || next.type === "custom_tool_call") {
+        input[end - 1] = assistantTextItem(text, nativeThinking);
+      } else if (next.type === "message" && next.role === "assistant") {
+        // Merged into the assistant message rather than inserted in front of
+        // it. A separate message would put two assistant turns back to back,
+        // which the same strict chat-completions providers reject outright --
+        // and the tool-call branch above ends up merged anyway, because
+        // LiteLLM folds a following function_call into the assistant message
+        // it already emitted.
+        input[end] = mergeAssistantText(next, text, nativeThinking);
+      }
+    }
+    index = end - 1;
   }
 }
 
-// Text of an assistant message item, or "" when it has no readable text.
-function assistantMessageText(item) {
-  if (!Array.isArray(item?.content)) return "";
-  return item.content
-    .map((part) => (part && typeof part.text === "string" ? part.text : ""))
-    .join("");
+// A trailing model turn is a destructive rewrite: it discards part of the
+// caller's conversation. Only Google's own provider gets that behavior from
+// identity. Resellers and custom endpoints must opt in per model after their
+// endpoint has proved that it rejects a prefilled model turn.
+function requiresTrailingUserTurn(route) {
+  const provider = providerForModel(route);
+  if (provider?.id === "gemini-api" || provider?.ownedBy?.toLowerCase?.() === "google") {
+    return true;
+  }
+  return route?.requiresTrailingUserTurn === true;
+}
+
+function assistantTextItem(text, nativeThinking = false) {
+  return {
+    type: "message",
+    role: "assistant",
+    content: [{ type: nativeThinking ? "thinking" : "output_text", text }],
+  };
+}
+
+// The reasoning goes in front of the answer it produced. `content` is an array
+// of parts on everything Codex stores, but a bare string is equally legal on
+// the Responses API, so both shapes are handled rather than assumed away.
+function mergeAssistantText(item, text, nativeThinking = false) {
+  const part = { type: nativeThinking ? "thinking" : "output_text", text };
+  if (typeof item.content === "string") {
+    return {
+      ...item,
+      content: item.content
+        ? [part, { type: "output_text", text: item.content }]
+        : [part],
+    };
+  }
+  return {
+    ...item,
+    content: [part, ...(Array.isArray(item.content) ? item.content : [])],
+  };
 }
 
 function reasoningItemText(item) {
@@ -1286,12 +1643,26 @@ async function bridgeVisionInput(input, route, request) {
   }
   const { effort } = settings;
   let fellBack = 0;
+  // A quota exhaustion is account/provider-wide evidence, not a reason to walk
+  // every model slug backed by that same account. Keep this set scoped to the
+  // current bridge call when the provider did not name a reset window; that
+  // avoids duplicate spend without inventing how long the quota will stay
+  // empty. A provider-named window is persisted by readVisionEvidence instead.
+  const exhaustedProviders = new Set();
   // Each engine in turn until one reads the image. The first is the operator's
   // choice and answers nearly always; the rest exist so a lapsed session or a
   // provider outage costs a slower read rather than the whole image.
   const readWithAnyEngine = async (url, question) => {
     let lastError;
     for (const [index, engine] of engines.entries()) {
+      const provider = canonicalProviderId(visionEngineProvider(engine));
+      const cooled = providerCooldown(provider);
+      if (cooled || exhaustedProviders.has(provider)) {
+        lastError ??= new Error(
+          `${engine.displayName || engine.slug} is temporarily unavailable because its provider reported a quota or rate limit`,
+        );
+        continue;
+      }
       // Retry the engine only when there is nothing else to try. Waiting out a
       // 250ms + 1s ladder against an endpoint that is down, when a working
       // engine is sitting right behind it, is how a fallback that works turns
@@ -1311,6 +1682,7 @@ async function bridgeVisionInput(input, route, request) {
         return { text, engineName: engine.displayName || engine.slug };
       } catch (error) {
         lastError = error;
+        if (error?.failureKind === "out_of_usage") exhaustedProviders.add(provider);
       }
     }
     // Every engine refused, so the turn says what the last one said -- the
@@ -1412,10 +1784,9 @@ function normalizeNativeInput(input) {
   return input.map((item) => {
     if (item?.type === "reasoning") return sanitizeReasoningForNative(item);
     if (item?.type !== "compaction") return sanitizeCollaborationForNative(item);
-    const summary = decodeSummary(item.encrypted_content);
-    return summary === undefined
-      ? item
-      : messageItem(`${SUMMARY_PREFIX}\n\n${summary}`);
+    return isRouterCompactionValue(item.encrypted_content)
+      ? messageItem(renderCompactionValue(item.encrypted_content))
+      : item;
   });
 }
 
@@ -1436,50 +1807,176 @@ function extractUserMessages(input) {
       : typeof item.content === "string"
         ? item.content
         : "";
-    if (text.trim()) messages.push(text);
+    if (
+      text.trim() &&
+      !text.startsWith(CHECKPOINT_WARNING) &&
+      !text.startsWith(LEGACY_WARNING) &&
+      !text.startsWith(LEGACY_V1_SUMMARY_PREFIX)
+    ) {
+      messages.push(text);
+    }
   }
   return messages;
 }
 
 // The v1 compact response shape follows Codex's replacement-history contract.
-function compactOutput(input, summary) {
+function compactOutput(input, checkpoint) {
   const budget = 80_000;
   const selected = [];
   let remaining = budget;
-  const messages = extractUserMessages(input);
+  // Older requirements survive through bounded KCR2 evidence, not as stale
+  // ordinary messages that can be mistaken for the user's current request.
+  const messages = extractUserMessages(input).slice(-2);
   for (let index = messages.length - 1; index >= 0 && remaining > 0; index -= 1) {
     const value = messages[index];
     if (value.length <= remaining) {
       selected.push(value);
       remaining -= value.length;
     } else {
-      selected.push(value.slice(value.length - remaining));
+      // A message that does not fit is not replayed as an unmarked fragment
+      // that reads like a complete request. It is not lost either: it is
+      // retained inside the bounded checkpoint, flagged `truncated`.
       break;
     }
   }
   selected.reverse();
   return [
     ...selected.map(messageItem),
-    messageItem(summary.trim() ? `${SUMMARY_PREFIX}\n${summary}` : "(no summary available)"),
+    messageItem(renderCheckpoint(checkpoint)),
   ];
 }
 
-function extractResponseText(payload) {
-  if (typeof payload?.output_text === "string") return payload.output_text;
+// Output item types that are never the model's contract answer. Reasoning is
+// a draft the provider exposes separately; the rest are tool traffic. Naming
+// what to refuse -- rather than requiring `type === "message"` -- keeps a
+// routed provider whose Responses-shaped items omit `type` or carry a vendor
+// tag from silently contributing nothing to a compaction.
+const NON_ANSWER_OUTPUT_TYPES = new Set([
+  "reasoning",
+  "function_call",
+  "function_call_output",
+  "custom_tool_call",
+  "custom_tool_call_output",
+  "local_shell_call",
+  "local_shell_call_output",
+  "computer_call",
+  "computer_call_output",
+  "tool_search_call",
+  "tool_search_output",
+  "web_search_call",
+  "file_search_call",
+  "image_generation_call",
+  "code_interpreter_call",
+  "mcp_call",
+  "mcp_list_tools",
+  "mcp_approval_request",
+  "compaction",
+  "compaction_trigger",
+]);
+
+function outputItemText(item) {
   const text = [];
-  for (const item of Array.isArray(payload?.output) ? payload.output : []) {
-    for (const part of Array.isArray(item?.content) ? item.content : []) {
-      if (
-        ["output_text", "text"].includes(part?.type) &&
-        typeof part.text === "string"
-      ) {
-        text.push(part.text);
-      }
+  for (const part of Array.isArray(item?.content) ? item.content : []) {
+    if (
+      ["output_text", "text"].includes(part?.type) &&
+      typeof part.text === "string" &&
+      part.text.length > 0
+    ) {
+      text.push(part.text);
     }
   }
+  return text;
+}
+
+function extractResponseText(payload) {
+  if (typeof payload?.output_text === "string" && payload.output_text.length > 0) {
+    return payload.output_text;
+  }
+  const output = Array.isArray(payload?.output) ? payload.output : [];
+  // A provider that tags its answer is read strictly, so private reasoning is
+  // never mistaken for the final message.
+  const tagged = output
+    .filter((item) => item?.type === "message")
+    .flatMap(outputItemText);
+  if (tagged.length > 0) return tagged.join("\n");
+  // Otherwise fall back to any item that is not known tool or reasoning
+  // traffic, which is the only way a non-standard Responses shim contributes
+  // its answer at all.
+  const untagged = output
+    .filter((item) => !NON_ANSWER_OUTPUT_TYPES.has(item?.type))
+    .flatMap(outputItemText);
+  if (untagged.length > 0) return untagged.join("\n");
   const chatText = payload?.choices?.[0]?.message?.content;
-  if (typeof chatText === "string") text.push(chatText);
-  return text.join("\n");
+  return typeof chatText === "string" ? chatText : "";
+}
+
+// The models a compaction may be tried on, best first, without sending
+// anything. The conversation's own model leads unless it has already said it
+// is empty, in which case asking it again only buys the same rejection.
+function compactionAttempts(route, aged) {
+  const settings = readFailoverSettings();
+  if (!settings.enabled) return [route];
+  const candidates = rankFailoverCandidates(
+    selectedConfiguredListedModels().filter((model) => !readHiddenModels().has(model.slug)),
+    {
+      from: route,
+      // The transcript being summarized is nearly all of the request, so its
+      // serialized size is the honest measure of what a candidate must hold.
+      estimatedTokens: estimateInputTokens(JSON.stringify(aged.input ?? [])),
+      needsImage: inputHasImage(aged.input),
+      // Compaction sends `tools: []`, so no candidate needs the collaboration
+      // proof to serve one.
+      chain: settings.chain,
+    },
+  )
+    .slice(0, MAX_FAILOVER_HOPS)
+    .map((entry) => entry.model);
+  if (!candidates.length) return [route];
+  return providerCooldown(route.provider) ? candidates : [route, ...candidates];
+}
+
+// One compaction attempt against one model. Everything route-dependent lives
+// here so a compaction can be moved to another model exactly like an ordinary
+// turn -- a compaction that fails ends the session just as hard, because the
+// conversation cannot get under its context limit without one.
+async function summarizeWith(request, payload, route, aged, prepared, signal) {
+  const compatibleInput = zenFreeCompatibleInput(aged.input, route);
+  const providerInput = needsZenFreeToolCompatibility(route)
+    ? bridgeCustomTools([], compatibleInput, new Map()).input
+    : compatibleInput;
+  const bridged = await bridgeVisionInput(
+    providerInput,
+    route,
+    request,
+  );
+  const body = {
+    ...payload,
+    model: route.gatewayModel,
+    stream: false,
+    // An empty tool list already disables tool use on every forwarder, and
+    // xAI rejects tool_choice "none" paired with it, so the field is omitted
+    // rather than sent redundantly.
+    tools: [],
+    input: [
+      ...bridged,
+      messageItem(prepared.catalogText),
+      messageItem(COMPACTION_PROMPT),
+    ],
+  };
+  normalizeAutoToolChoice(body, route);
+  delete body.previous_response_id;
+  delete body.client_metadata;
+  // Compaction re-enters the same provider as the routed turn; Fireworks
+  // rejects this OpenAI search parameter at that boundary too.
+  if (providerForModel(route)?.id === "fireworks") delete body.web_search_options;
+  const serialized = JSON.stringify(body);
+  const upstream = await fetch(`${GATEWAY_BASE}/responses`, {
+    method: "POST",
+    headers: routedHeaders(),
+    body: serialized,
+    signal,
+  });
+  return { upstream, bridged, bytes: Buffer.byteLength(serialized, "utf8") };
 }
 
 async function summarize(request, payload, route, signal) {
@@ -1493,46 +1990,140 @@ async function summarize(request, payload, route, signal) {
   // inside a `/goal` or subagent session summarizes opaque payloads. The relay
   // is cached by ciphertext, so a conversation whose turns already resolved
   // costs nothing extra here.
-  const bridged = await bridgeVisionInput(
-    await normalizeRoutedAgentInput(request, originalInput, signal),
-    route,
-    request,
-  );
-  const body = {
-    ...payload,
-    model: route.gatewayModel,
-    stream: false,
-    // An empty tool list already disables tool use on every forwarder, and
-    // xAI rejects tool_choice "none" paired with it, so the field is omitted
-    // rather than sent redundantly.
-    tools: [],
-    input: [...bridged, messageItem(COMPACT_PROMPT)],
-  };
-  delete body.previous_response_id;
-  delete body.client_metadata;
-  // Compaction re-enters the same provider as the routed turn; Fireworks
-  // rejects this OpenAI search parameter at that boundary too.
-  if (providerForModel(route)?.id === "fireworks") delete body.web_search_options;
-  const upstream = await fetch(`${GATEWAY_BASE}/responses`, {
-    method: "POST",
-    headers: routedHeaders(),
-    body: JSON.stringify(body),
-    signal,
+  const normalized = await normalizeRoutedAgentInput(request, originalInput, signal);
+  // Evidence is extracted before tool-result aging rewrites old output bytes.
+  // The summarizer may select source IDs, but only this deterministic pass can
+  // decide which source types and machine outcomes enter a kcr2 checkpoint.
+  const prepared = prepareCompaction(normalized);
+  const agingEnabled = toolResultAgingEnabled();
+  const aged = ageToolResults(normalized, {
+    enabled: agingEnabled,
+    // A compaction request is already at the context boundary. Dense shaping
+    // gives its summarizer more distinct evidence without changing low-pressure
+    // turns, and every shaped result keeps the exact rerun path.
+    tokenMaxxing: agingEnabled,
   });
-  const bytes = Buffer.from(await upstream.arrayBuffer());
-  if (bytes.length > 32 * 1024 * 1024) {
-    return { ok: false, status: 502, payload: { error: { message: "Compact response is too large." } } };
+
+  // The models this compaction may be moved to, in order, starting with the one
+  // the conversation is on. A provider already known to be empty is dropped
+  // rather than asked, exactly as on the turn path. Nothing is sent while this
+  // list is built.
+  const attempts = compactionAttempts(route, aged);
+  // Attempts that were sent and rejected, kept so the caller can meter each one.
+  const failed = [];
+  const retryConfig = readTaskManagerConfig();
+  const transientAttempts = retryConfig.capacityRetry === false
+    ? 1
+    : Math.max(1, Number(retryConfig.capacityRetryAttempts) || 5);
+  let last;
+  for (let index = 0; index < attempts.length; index += 1) {
+    const attemptRoute = attempts[index];
+    let sent;
+    let backoffMs = 500;
+    for (let retry = 0; retry < transientAttempts; retry += 1) {
+      sent = await summarizeWith(request, payload, attemptRoute, aged, prepared, signal);
+      const transient = !sent.upstream.ok && (await isTransientRateLimitResponse(sent.upstream));
+      if (!transient || retry === transientAttempts - 1) break;
+      await sent.upstream.body?.cancel().catch(() => {});
+      await sleep(backoffMs, signal);
+      backoffMs = Math.min(backoffMs * 2, 8_000);
+      signal?.throwIfAborted?.();
+    }
+    const bytes = Buffer.from(await sent.upstream.arrayBuffer());
+    if (bytes.length > 32 * 1024 * 1024) {
+      return {
+        ok: false,
+        status: 502,
+        payload: { error: { message: "Compact response is too large." } },
+        toolResultAging: aged.stats,
+      };
+    }
+    const parsed = JSON.parse(bytes.toString("utf8"));
+    // Compaction is a plain non-streaming call, so the usage block (when the
+    // provider sends one) is already in hand. `tokenUsageFromPayload` returns
+    // undefined when it is absent, and `recordUsageEvent` then omits the token
+    // fields entirely rather than metering an invented zero.
+    const usage = tokenUsageFromPayload(parsed);
+    if (sent.upstream.ok) {
+      clearProviderCooldown(attemptRoute.provider);
+      const answer = extractResponseText(parsed);
+      // finalizeCheckpoint turns empty model output into a structurally valid
+      // checkpoint, so an upstream whose answer this router cannot read would
+      // otherwise report ok with nothing in it. Say so where an operator sees
+      // it rather than shipping a silently empty summary.
+      if (!answer.trim() && !QUIET) {
+        console.error(
+          `[codex-router] compaction read no model text model=${attemptRoute.slug} provider=${canonicalProviderId(attemptRoute.provider)}`,
+        );
+      }
+      return {
+        ok: true,
+        checkpoint: finalizeCheckpoint(answer, prepared),
+        input: originalInput,
+        usage,
+        toolResultAging: aged.stats,
+        route: attemptRoute,
+        failed,
+        ...(attemptRoute === route ? {} : { failoverFrom: route.slug }),
+      };
+    }
+    // Each attempt that failed was still sent and still billed, so it is
+    // metered on its own row exactly as on the turn path -- otherwise a
+    // compaction the router rescued would leave no trace of the provider that
+    // could not serve it.
+    failed.push({ route: attemptRoute, status: sent.upstream.status, usage });
+    // The first failure is the one reported if every attempt fails: it came
+    // from the model the conversation is actually on, which is the one the
+    // operator can do something about.
+    last ??= {
+      ok: false,
+      status: sent.upstream.status,
+      payload: parsed,
+      usage,
+      toolResultAging: aged.stats,
+      route: attemptRoute,
+    };
+    const verdict = classifyRoutedFailure({
+      status: sent.upstream.status,
+      bodyText: bytes.toString("utf8"),
+      retryAfterSeconds: Number(sent.upstream.headers.get("retry-after")),
+    });
+    if (!verdict.swap) return { ...last, failed };
+    recordProviderCooldown(attemptRoute.provider, verdict);
+    if (index + 1 < attempts.length) {
+      logFailover(
+        attemptRoute,
+        attempts[index + 1],
+        `compaction/${verdict.reason}`,
+        sent.upstream.status,
+        "retrying",
+      );
+    }
   }
-  const parsed = JSON.parse(bytes.toString("utf8"));
-  // Compaction is a plain non-streaming call, so the usage block (when the
-  // provider sends one) is already in hand. `tokenUsageFromPayload` returns
-  // undefined when it is absent, and `recordUsageEvent` then omits the token
-  // fields entirely rather than metering an invented zero.
-  const usage = tokenUsageFromPayload(parsed);
-  if (!upstream.ok) {
-    return { ok: false, status: upstream.status, payload: parsed, usage };
+  return last && { ...last, failed };
+}
+
+function recordCompactionUsage(result, route, startedAt) {
+  const servedRoute = result?.route || route;
+  const failed = (result?.failed || []).filter((entry) => entry.route !== servedRoute);
+  for (const attempt of failed) {
+    recordUsageEvent({
+      model: attempt.route.slug,
+      provider: canonicalProviderId(attempt.route.provider),
+      status: attempt.status,
+      durationMs: Date.now() - startedAt,
+      ...attempt.usage,
+    });
   }
-  return { ok: true, summary: extractResponseText(parsed), input: originalInput, usage };
+  recordUsageEvent({
+    model: servedRoute.slug,
+    provider: canonicalProviderId(servedRoute.provider),
+    status: result?.ok ? 200 : result?.status || 502,
+    durationMs: Date.now() - startedAt,
+    ...result?.usage,
+    ...result?.toolResultAging,
+    ...(result?.failoverFrom ? { failoverFrom: result.failoverFrom } : {}),
+  });
 }
 
 function compactionSnapshot(model, item, status = "completed") {
@@ -1547,11 +2138,11 @@ function compactionSnapshot(model, item, status = "completed") {
   };
 }
 
-function writeCompactionSse(response, model, summary) {
+function writeCompactionSse(response, model, checkpoint) {
   const item = {
     type: "compaction",
     id: `cmp_${randomUUID().replaceAll("-", "")}`,
-    encrypted_content: encodeSummary(summary),
+    encrypted_content: encodeCheckpoint(checkpoint),
   };
   const created = compactionSnapshot(model, undefined, "in_progress");
   const completed = { ...created, status: "completed", output: [item] };
@@ -1560,11 +2151,7 @@ function writeCompactionSse(response, model, summary) {
     ["response.output_item.done", { output_index: 0, item }],
     ["response.completed", { response: completed }],
   ];
-  response.writeHead(200, {
-    "Content-Type": "text/event-stream; charset=utf-8",
-    "Cache-Control": "no-cache",
-    Connection: "keep-alive",
-  });
+  writeEventStreamHead(response);
   events.forEach(([type, data], sequence) => {
     response.write(
       `event: ${type}\ndata: ${JSON.stringify({ type, sequence_number: sequence, ...data })}\n\n`,
@@ -1577,25 +2164,48 @@ function writeCompactionSse(response, model, summary) {
 // routed compaction leaves the same telemetry trail as any other routed turn.
 async function handleRoutedCompaction(request, response, payload, route, signal, v2) {
   const result = await summarize(request, payload, route, signal);
+  // A compaction moved to another model is metered against the model that
+  // actually produced the summary, the same as any other turn.
+  const served = {
+    route: result.route,
+    // Only the attempts that lost; the winner is metered by the caller.
+    failed: (result.failed || []).filter((entry) => entry.route !== result.route),
+    ...(result.failoverFrom ? { failoverFrom: result.failoverFrom } : {}),
+  };
   if (!result.ok) {
     writeJson(response, result.status, result.payload);
-    return { status: result.status, usage: result.usage };
+    return {
+      status: result.status,
+      usage: result.usage,
+      toolResultAging: result.toolResultAging,
+      ...served,
+    };
   }
   if (v2) {
     if (payload.stream === false) {
       const item = {
         type: "compaction",
         id: `cmp_${randomUUID().replaceAll("-", "")}`,
-        encrypted_content: encodeSummary(result.summary),
+        encrypted_content: encodeCheckpoint(result.checkpoint),
       };
       writeJson(response, 200, compactionSnapshot(payload.model, item));
     } else {
-      writeCompactionSse(response, payload.model, result.summary);
+      writeCompactionSse(response, payload.model, result.checkpoint);
     }
-    return { status: 200, usage: result.usage };
+    return {
+      status: 200,
+      usage: result.usage,
+      toolResultAging: result.toolResultAging,
+      ...served,
+    };
   }
-  writeJson(response, 200, { output: compactOutput(result.input, result.summary) });
-  return { status: 200, usage: result.usage };
+  writeJson(response, 200, { output: compactOutput(result.input, result.checkpoint) });
+  return {
+    status: 200,
+    usage: result.usage,
+    toolResultAging: result.toolResultAging,
+    ...served,
+  };
 }
 
 async function handleModels(response) {
@@ -1607,6 +2217,25 @@ async function handleModels(response) {
       : "openai",
   }));
   writeJson(response, 200, { object: "list", data });
+}
+
+// What the Gemini surface will accept a turn for.
+//
+// Deliberately the catalog the router already serves on `/v1/models`, not the
+// narrower set the Gemini settings document was published with. The gate exists
+// so a typo cannot fall through to the native path and quietly become a
+// ChatGPT-session request; being *stricter* than the published list would
+// instead refuse a model the user was legitimately offered, and a native model
+// whose session has since expired is better served by the provider's own 401
+// than by a 404 that misdescribes why.
+function geminiRoutedModels() {
+  return catalogModels().map((model) => ({
+    slug: String(model.slug),
+    displayName: model.display_name || model.displayName || String(model.slug),
+    contextWindow: Number.isFinite(model.context_window)
+      ? model.context_window
+      : model.contextWindow,
+  }));
 }
 
 function requireCodexTransport(request, response) {
@@ -1635,6 +2264,472 @@ function requireCodexTransport(request, response) {
   return true;
 }
 
+// Older releases advertised a locally probed route as experimental and then
+// refined that record from `x-openai-subagent` traffic. Keep observing only
+// those historical experimental records so upgrades preserve useful evidence,
+// but never treat the result as catalog authority: local traffic can neither
+// promote nor demote the exact checked-in registry certificate. A 400/422 is
+// useful negative application evidence; transient failures prove nothing. A
+// clean 200 proves only one HTTP turn completed, not that a delegated task did.
+
+function observeSubagentOutcome(request, route, status, options = {}) {
+  if (!route) return;
+  try {
+    if (!request.headers["x-openai-subagent"]) return;
+    const proofs = subagentProofSnapshot();
+    if (!spawnProofRevocable(route.slug, proofs)) return;
+    const spawnId = threadIdFromHeaders(request.headers);
+    const settle = (reason, detail = { status }) => {
+      recordSpawnFailure(route.slug, { reason, ...detail });
+      forgetChildSpawn(spawnId);
+      console.error(
+        `[codex-router] legacy subagent evidence rejected: ${route.slug} ${reason}; ` +
+          "the route still requires a reviewed repository v2 certificate",
+      );
+    };
+    if (status === 400 || status === 422) {
+      settle(
+        `child turn rejected with HTTP ${status}` +
+          (proofs[route.slug]?.status === "proven"
+            ? ", revoking the child role it had already served"
+            : ""),
+      );
+      return;
+    }
+    if (status !== 200 || options.emptyCompletion) return;
+    if (awaitingSpawnProof(route.slug, proofs)) {
+      recordSpawnObserved(route.slug, { status });
+      console.error(
+        `[codex-router] legacy subagent evidence observed: ${route.slug} served one child HTTP turn; ` +
+          "this remains diagnostic and is not a repository v2 certificate",
+      );
+    }
+    const spawn = observeChildTurn({
+      spawnId,
+      slug: route.slug,
+      autoCompact: route.autoCompact,
+      event: {
+        status,
+        inputTokens: options.usage?.inputTokens,
+        estimatedInputTokens: options.estimatedInputTokens,
+        emptyCompletionRetried: options.emptyCompletionRetried,
+        progressOnlyRetried: options.progressOnlyRetried === true,
+      },
+    });
+    if (!spawn?.exceeded) return;
+    settle(
+      `one child spawn ran ${spawn.turns} turns and produced ${spawn.newInputTokens} new input ` +
+        `tokens without converging, past the ${spawn.budget}-token ceiling this model's own ` +
+        "auto-compact budget sets",
+      // Deliberately no `status`: every turn of this spawn answered 200, and
+      // recording one of them as the failure would read as a rejection that
+      // never happened. The counts are the evidence.
+      { turns: spawn.turns, newInputTokens: spawn.newInputTokens },
+    );
+  } catch {
+    // Observation is bookkeeping; it must never fail the turn it watched.
+  }
+}
+
+// Everything about a routed request that depends on which model is serving it.
+//
+// Extracted so it can run more than once for a single turn: a turn whose
+// provider reports it has no usage left is rebuilt for another model and sent
+// again, and that second build has to start from exactly what the first one
+// started from. Two things in here would quietly corrupt a second pass if it
+// did not.
+//
+//   - The tool list is rewritten for chat-completions providers (merged,
+//     flattened, schema-repaired). `flattenNamespaceTools` only recognizes
+//     items of `type: "namespace"`, so a second pass over already-flattened
+//     tools returns an *empty* namespace map -- shipping plausible tools with
+//     no way to map the model's calls back to the client's namespace shape.
+//   - `carryReasoningThroughInput` replaces `reasoning` items in place, so a
+//     responses-native second pass would find the reasoning already gone.
+//
+// Both are avoided the same way: nothing here writes to `payload` or to
+// `agedInput`. The tool list is a local, and the input array is copied before
+// anything rewrites it.
+async function buildRoutedRequest({ request, payload, route, agedInput, tokenMaxxing = false }) {
+  let namespacesFlattened = false;
+  let flattenedNamespaces = new Map();
+  const bridged = await bridgeVisionInput(
+    zenFreeCompatibleInput(agedInput, route),
+    route,
+    request,
+  );
+  // `bridgeVisionInput` returns its argument unchanged when there is no image
+  // to read, and `carryReasoningThroughInput` writes into the array it is
+  // given -- so without this copy the first build would rewrite the shared
+  // aged input and a second build would start from the result.
+  //
+  // Copied only when it *is* an array. `input` is equally legal as a bare
+  // string, and spreading one of those produces an array of single characters
+  // -- a turn that still reaches the provider, and still reads as a 200,
+  // having quietly replaced the prompt with its own letters.
+  const input = Array.isArray(bridged) ? [...bridged] : bridged;
+  const provider = providerForModel(route);
+  const chatCompletionsProvider = provider?.protocol !== "openai-responses";
+  // Thinking chat providers need the assistant's reasoning replayed, but
+  // LiteLLM drops Responses `reasoning` input items. Generic providers keep
+  // the established visible-content carry used for DeepSeek. GLM's native
+  // preserved-thinking contract needs reasoning kept structurally separate so
+  // the API forwarder can restore it as `reasoning_content` before Z.ai.
+  carryReasoningThroughInput(input, {
+    nativeThinking: chatCompletionsProvider && route.requestProfile === "glm-thinking",
+  });
+  // Models marked requiresTrailingUserTurn reject requests ending with a model
+  // turn. Pop trailing assistant messages, reasoning, or subagent outputs.
+  if (requiresTrailingUserTurn(route)) {
+    while (
+      input.length > 0 &&
+      (input[input.length - 1]?.role === "assistant" ||
+        input[input.length - 1]?.type === "reasoning" ||
+        input[input.length - 1]?.type === "function_call" ||
+        input[input.length - 1]?.type === "custom_tool_call" ||
+        (input[input.length - 1]?.type === "message" &&
+          input[input.length - 1]?.role === "assistant"))
+    ) {
+      input.pop();
+    }
+  }
+  let tools = payload.tools;
+  // LiteLLM's Responses -> Chat Completions bridge drops namespace tools, which
+  // is how the client ships the collaboration runtime, the app toolset
+  // (threads, automations, navigation), and every MCP server (node_repl,
+  // peekaboo, github, ...). Chat-completions providers need every namespace
+  // flattened into ordinary functions; the response transform maps calls back
+  // to the client's native namespace shape.
+  if (chatCompletionsProvider) {
+    // Relay the app's full native toolset (threads, automations, app
+    // navigation) to the provider. The client registers these tools with
+    // deferLoading and executes the calls natively, but only sends a reduced
+    // codex_app namespace on routed requests; merge the deferred definitions in
+    // so routed models see what native models see. The router never executes
+    // these calls -- the app owns thread, automation, and navigation state --
+    // it only relays definitions and results.
+    const merged = mergeCodexAppTools(tools);
+    if (merged.merged) tools = merged.tools;
+    const flattened = flattenNamespaceTools(tools);
+    namespacesFlattened = flattened.flattened;
+    flattenedNamespaces = flattened.namespaces;
+    if (namespacesFlattened) {
+      tools = flattened.tools;
+    }
+  } else {
+    // Responses-native providers keep the namespace tools untouched, so nothing
+    // is flattened and the list is left alone. The inventory is still built,
+    // because the response transform reads the exact spawn_agent model enum off
+    // it to drop an invented or stale optional override before Codex validates
+    // the call.
+    flattenedNamespaces = flattenNamespaceTools(tools, {
+      bridgeToolSearch: false,
+    }).namespaces;
+    // Keeping the namespace shape is not the same as keeping a root the
+    // upstream rejects. `opencode-go-responses/gpt-5.6-luna` 400s a
+    // `type: ["object","null"]` parameter root while accepting the same request
+    // with a plain or union root -- so the strict-root repair has to run here
+    // too, on the tools alone, without flattening anything.
+    tools = repairToolSchemaRoots(tools);
+  }
+  if (needsZenFreeToolCompatibility(route)) {
+    // Ox reaches Chat Completions after namespace flattening while Muse reaches
+    // Responses with native namespaces. Run the same recursive-ref repair
+    // after both protocol branches so neither wire shape can bypass it.
+    tools = repairToolSchemaRoots(tools, { nonRecursive: true });
+    tools = stripSearchContentTypes(tools);
+  }
+  if (needsMoonshotDefsOnlyRefs(route)) {
+    // After the namespace flattening above, so the connector tools Codex ships
+    // inside `codex_app` are repaired in the shape Moonshot actually receives.
+    tools = repairToolSchemaRoots(tools, { inlineForeignRefs: true });
+  }
+  let routedInput = input;
+  let routedToolChoice = payload.tool_choice;
+  if (needsZenFreeToolCompatibility(route)) {
+    const customTools = bridgeCustomTools(
+      tools,
+      routedInput,
+      flattenedNamespaces,
+      routedToolChoice,
+    );
+    tools = customTools.tools;
+    routedInput = customTools.input;
+    routedToolChoice = customTools.toolChoice;
+  }
+  if (chatCompletionsProvider) {
+    const searchHistory = flattenToolSearchHistory(
+      routedInput,
+      tools,
+      flattenedNamespaces,
+    );
+    routedInput = searchHistory.input;
+    tools = searchHistory.tools;
+  }
+  // The stored call history must use the same tool names as the tool list, or
+  // the model copies the bare names out of its own transcript.
+  if (namespacesFlattened) {
+    routedInput = flattenNamespacedHistory(routedInput, flattenedNamespaces);
+  }
+  const routed = {
+    ...payload,
+    tools,
+    model: route.gatewayModel,
+    input: routedInput,
+  };
+  if (routedToolChoice !== payload.tool_choice) routed.tool_choice = routedToolChoice;
+  // Codex chooses a child's model; this is where an operator gets to choose its
+  // depth. Applied only to turns Codex marked as a child, so a parent
+  // conversation on the same model is untouched -- running one model
+  // differently in the two roles is the whole point.
+  //
+  // The level is deliberately not validated against the model here. A provider
+  // that rejects an unsupported effort says so in a way the operator can read,
+  // whereas silently dropping the setting looks like the feature never worked.
+  const childEffort = request.headers["x-openai-subagent"]
+    ? subagentEffort(route.slug)
+    : undefined;
+  // This leaves on the Responses API, where the effort travels inside
+  // `reasoning`. A flat `reasoning_effort` is a Chat Completions field:
+  // LiteLLM's Responses bridge derives its own effort from `reasoning` whenever
+  // the client sent one -- and Codex always does -- then that derived value
+  // overwrites anything flat the router set, so a flat-only override never
+  // reaches the provider. Set both: `reasoning.effort` is what actually
+  // travels, and the flat field is what a bare chat-completions gateway reads.
+  if (childEffort) {
+    routed.reasoning_effort = childEffort;
+    routed.reasoning = { ...(routed.reasoning || {}), effort: childEffort };
+  }
+  normalizeAutoToolChoice(routed, route);
+  // Native OpenAI traffic keeps client_metadata; routed providers do not
+  // consume it and the strict ones reject the unknown field.
+  delete routed.client_metadata;
+  // Codex sends reasoning as an object. LiteLLM's Ollama path tests that value
+  // for membership of a string set, which raises on a dict and fails the whole
+  // turn -- 210 of them here before this was caught. Ollama has no
+  // reasoning-effort concept to map it onto anyway, so drop it rather than
+  // translate it into something the model never asked for.
+  if (provider?.keyless) {
+    delete routed.reasoning;
+    delete routed.reasoning_effort;
+  }
+  if (provider?.id === "fireworks") delete routed.web_search_options;
+  routed.instructions = applyTokenMaxxingOverlay(routed.instructions, {
+    active: tokenMaxxing,
+  });
+  return {
+    body: Buffer.from(JSON.stringify(routed), "utf8"),
+    target: `${GATEWAY_BASE}/responses`,
+    headers: routedHeaders(),
+    namespacesFlattened,
+    flattenedNamespaces,
+    // Close finished children the parent left Working. Only when the
+    // collaboration toolset is actually available on this turn.
+    pendingInterrupts: pendingInterruptTargets(
+      needsZenFreeToolCompatibility(route) ? agedInput : input,
+      {
+        namespaces: flattenedNamespaces,
+      },
+    ),
+  };
+}
+
+// Normalize once, but decide pressure and age from that pristine normalized
+// input for every route that may actually serve the turn. Collaboration
+// payloads are still carried as `encrypted_content` in the caller's body and
+// become model-visible text during normalization, so estimating the original
+// bytes would discount precisely the payload the routed model will read.
+//
+// Pressure is route-specific as well: failover candidates can have very
+// different auto-compaction budgets. Re-running the deterministic aging pass
+// on a hop keeps the destination's threshold honest without ever shaping an
+// already-shaped copy.
+async function prepareRoutedRequest({
+  request,
+  payload,
+  route,
+  normalizedInput,
+  agingEnabled,
+}) {
+  const tokenMaxxing = agingEnabled && tokenMaxxingActive({
+    enabled: true,
+    estimatedTokens: estimateInputTokens(
+      JSON.stringify({ ...payload, input: normalizedInput }),
+      { contextWindow: route.contextWindow },
+    ),
+    autoCompact: route.autoCompact,
+  });
+  const aged = ageToolResults(normalizedInput, {
+    enabled: agingEnabled,
+    tokenMaxxing,
+  });
+  const built = await buildRoutedRequest({
+    request,
+    payload,
+    route,
+    agedInput: aged.input,
+    tokenMaxxing,
+  });
+  return {
+    ...built,
+    agedInput: aged.input,
+    toolResultAging: aged.stats,
+  };
+}
+
+// The models this turn could be moved to, best first. Deliberately computed
+// only after a failure is already known: `selectedConfiguredListedModels()`
+// probes every provider's credential synchronously and spawns
+// `/usr/bin/security` per keychain service on macOS, which would cost every
+// healthy turn about 250ms of blocked event loop for nothing.
+function failoverCandidates({ route, agedInput, flattenedNamespaces, chain }) {
+  const hidden = readHiddenModels();
+  return rankFailoverCandidates(
+    selectedConfiguredListedModels().filter((model) => !hidden.has(model.slug)),
+    {
+      from: route,
+      // Context fit is checked after rebuilding the request for each
+      // destination below. Using this route's body here can reject a candidate
+      // whose lower pressure threshold would shape that same conversation into
+      // its smaller window.
+      needsImage: inputHasImage(agedInput),
+      // Only a turn that can actually spawn children needs a model that has
+      // been through the collaboration proof. A child answering its own turn
+      // does not.
+      needsMultiAgentV2: collaborationToolAvailable(flattenedNamespaces),
+      chain,
+    },
+  );
+}
+
+function routedRequestFits(route, body) {
+  const estimatedTokens = estimateInputTokens(body);
+  return (
+    !Number.isFinite(estimatedTokens) ||
+    !Number.isFinite(route?.contextWindow) ||
+    route.contextWindow >= estimatedTokens
+  );
+}
+
+// `status` is always what the *asked-for* model said; `outcome` is what the
+// candidate did about it. Reporting one number for both was actively
+// misleading: a hop rejected with its own 400 printed
+// `reason=out_of_usage status=400`, which reads as the exhausted provider
+// having answered 400 and sent a reader looking for a quota bug that was not
+// there. They are two different events and now say so.
+//
+// Never gated on CODEX_ROUTER_QUIET, which a production LaunchAgent hard-sets.
+// A silent swap makes an exhausted provider look healthy and leaves the
+// operator wondering why the answers changed character.
+function logFailover(from, to, reason, status, outcome) {
+  console.error(
+    `[codex-router] failover model=${from.slug} status=${status} reason=${reason} -> ${
+      to ? to.slug : "none"
+    } outcome=${outcome}`,
+  );
+}
+
+// Moves a turn whose provider reported it has no usage left onto another model.
+//
+// Legal only because nothing has been relayed: this runs before `pipeResponse`,
+// and `nothingRelayed` is re-checked before every hop. Returns the state the
+// caller should switch to, or undefined to keep the original failure -- which
+// is the honest answer whenever no candidate can serve this conversation.
+async function attemptModelFailover({
+  request,
+  response,
+  payload,
+  route,
+  agedInput,
+  flattenedNamespaces,
+  verdict,
+  status,
+  signal,
+  normalizedInput,
+  agingEnabled,
+}) {
+  const settings = readFailoverSettings();
+  if (!settings.enabled) return undefined;
+  const candidates = failoverCandidates({
+    route,
+    agedInput,
+    flattenedNamespaces,
+    chain: settings.chain,
+  }).slice(0, MAX_FAILOVER_HOPS);
+  if (!candidates.length) {
+    logFailover(route, undefined, verdict.reason, status, "no-candidate");
+    return undefined;
+  }
+  const startedAt = Date.now();
+  for (const { model } of candidates) {
+    // The caller left, or something has been relayed since the last check.
+    // Either way this turn is over: a hop would be work for nobody, or a second
+    // response grafted onto a stream the client is already reading.
+    if (signal.aborted || !nothingRelayed(response)) return undefined;
+    // A turn that has already spent this long recovering is better off
+    // reporting the failure it started with than spending more of the user's
+    // time on another guess.
+    if (Date.now() - startedAt >= FAILOVER_BUDGET_MS) break;
+    let built;
+    let upstream;
+    try {
+      built = await prepareRoutedRequest({
+        request,
+        payload,
+        route: model,
+        normalizedInput,
+        agingEnabled,
+      });
+      if (!routedRequestFits(model, built.body)) {
+        logFailover(route, model, verdict.reason, status, "context-too-small");
+        continue;
+      }
+      upstream = await fetch(built.target, {
+        method: "POST",
+        headers: built.headers,
+        body: built.body,
+        signal,
+      });
+    } catch (error) {
+      if (signal.aborted) throw error;
+      logFailover(route, model, verdict.reason, status, `transport/${error?.name || "Error"}`);
+      continue;
+    }
+    if (upstream.ok) {
+      logFailover(route, model, verdict.reason, status, upstream.status);
+      return { route: model, built, upstream };
+    }
+    // The candidate failed too. If it failed the same way, believe it and take
+    // it out of the running for the next turn as well; anything else is that
+    // model's own problem and not evidence about the operator's chosen one.
+    const hopVerdict = classifyRoutedFailure({
+      status: upstream.status,
+      bodyText: await upstream.text().catch(() => ""),
+      retryAfterSeconds: Number(upstream.headers.get("retry-after")),
+    });
+    if (hopVerdict.swap) recordProviderCooldown(model.provider, hopVerdict);
+    logFailover(route, model, verdict.reason, status, upstream.status);
+  }
+  return undefined;
+}
+
+// The local answer an idle install gives instead of native forwarding. With
+// discovery disabled the native path is impossible by construction -- the
+// session fallback never reads auth.json -- so traffic that would leave for
+// chatgpt.com is refused before any upstream fetch, keeping the --no-discovery
+// promise that nothing leaves this machine.
+function writeIdleNoProviderError(response) {
+  writeJson(response, 503, {
+    error: {
+      type: "router_idle_no_provider",
+      message:
+        "This router was installed without providers and with credential discovery disabled " +
+        "(--no-provider --no-discovery), so no traffic leaves this machine. " +
+        "Re-run setup without those flags to enable a provider.",
+    },
+  });
+}
+
 async function handleResponses(request, response, requestUrl) {
   const startedAt = Date.now();
   const activity = beginRequestActivity();
@@ -1642,7 +2737,9 @@ async function handleResponses(request, response, requestUrl) {
   let requestedModel = "";
   let route;
   let upstreamRetries;
+  let upstreamStatus;
   let upstreamLatencyMs;
+  let firstTokenMs;
   let usageTransform;
   let emptyCompletionGuard;
   let retryUsageTransform;
@@ -1651,17 +2748,34 @@ async function handleResponses(request, response, requestUrl) {
   let usage;
   let estimatedInputTokens;
   let nativeAccountId;
+  let nativeCapacityFailure = false;
+  let toolResultAging;
+  let pendingInterrupts = [];
   let emptyCompletion = false;
   let emptyCompletionRetried = false;
-  let guardReleasedForBudget = false;
+  // The model the operator actually asked for, when this turn ended up being
+  // served by a different one. Present only on a turn the router rescued.
+  let failoverFrom;
+  // An empty turn the router could not repair because the attempt was already
+  // relayed. Distinct from `emptyCompletionRetried` in the meter: one is a
+  // failure the router absorbed, the other a failure it had to hand to the
+  // client, and only the second is visible to the user.
+  let emptyCompletionUnrepairable = false;
+  let emptyCompletionPreludeLimit;
+  let preludeLimitRetryable = false;
   let finalStatus;
   let activityStatus;
   let usageRecorded = false;
+  const controller = new AbortController();
+  bindClientAbort(request, response, () => {
+    clientGone = true;
+    controller.abort();
+  });
   try {
     if (!requireCodexTransport(request, response)) return;
     const encoded = await readRequestBody(request);
     const body = decodeBody(encoded, request.headers["content-encoding"]);
-    const payload = parseBody(body);
+    const payload = await parseBodyAsync(body);
     requestedModel = typeof payload.model === "string" ? payload.model : "";
     let registeredRoute =
       MODEL_BY_SLUG.get(requestedModel) ??
@@ -1691,6 +2805,13 @@ async function handleResponses(request, response, requestUrl) {
       });
       return;
     }
+    // Anything without a route from here on is native GPT traffic. An install
+    // that merely hid every provider keeps its native passthrough -- that has
+    // always worked -- but an idle --no-discovery install answers locally.
+    if (!route && discoveryDisabled()) {
+      writeIdleNoProviderError(response);
+      return;
+    }
     // Activity and usage attribute protocol variants to their canonical
     // family so the tray Island and graphs show one provider per subscription.
     activity.setRoute({
@@ -1704,18 +2825,6 @@ async function handleResponses(request, response, requestUrl) {
       Array.isArray(payload.input) &&
       payload.input.at(-1)?.type === "compaction_trigger";
 
-    const controller = new AbortController();
-    request.once("aborted", () => {
-      clientGone = true;
-      controller.abort();
-    });
-    response.once("close", () => {
-      if (!response.writableEnded) {
-        clientGone = true;
-        controller.abort();
-      }
-    });
-
     if (route && (compactV1 || compactV2)) {
       const compaction = await handleRoutedCompaction(
         request,
@@ -1725,23 +2834,23 @@ async function handleResponses(request, response, requestUrl) {
         controller.signal,
         compactV2,
       );
-      // Compaction used to return here without metering or logging, so neither
-      // a successful nor a failed one appeared anywhere in the router's own
-      // telemetry. Mirror the ordinary request path exactly.
-      recordUsageEvent({
-        model: route.slug,
-        provider: canonicalProviderId(route.provider),
-        status: compaction.status,
-        durationMs: Date.now() - startedAt,
-        ...compaction.usage,
-      });
+      const compacted = compaction.route || route;
+      recordCompactionUsage(compaction, route, startedAt);
       usage = compaction.usage;
       finalStatus = compaction.status;
       activityStatus = compaction.status;
       usageRecorded = true;
+      // The compaction chose its own model inside `summarize`, so the outer
+      // route still names the one the conversation is on. Adopt what actually
+      // served before returning, or the timing line emitted in `finally` would
+      // credit the exhausted provider with this turn's 200.
+      route = compacted;
+      failoverFrom ??= compaction.failoverFrom;
       if (!QUIET) {
         console.error(
-          `[codex-router] model=${requestedModel || "unknown"} provider=${route.provider} status=${compaction.status}`,
+          `[codex-router] model=${compacted.slug} provider=${compacted.provider} status=${compaction.status}${
+            compaction.failoverFrom ? ` failover-from=${compaction.failoverFrom}` : ""
+          }`,
         );
       }
       return;
@@ -1761,87 +2870,135 @@ async function handleResponses(request, response, requestUrl) {
     capacityAttempts = taskConfig.capacityRetry === false
       ? 1
       : Math.max(1, Number(taskConfig.capacityRetryAttempts) || 5);
+    // The route-independent half of the input, computed once. Failing the turn
+    // over to another model rebuilds pressure shaping from these pristine
+    // normalized items, so an encrypted-payload relay is paid for once while
+    // every destination gets its own auto-compaction threshold.
+    let normalizedInput;
+    let agingEnabled = false;
+    let agedInput;
+    // Adopts a rebuilt request for a different model. Everything downstream --
+    // the response transforms, the prompt-token estimate, the empty-completion
+    // retry -- reads these, so all of them have to move together or the turn
+    // would be relayed through one model's namespace map while another model
+    // answered it.
+    const adoptRoute = (nextRoute, built) => {
+      failoverFrom ??= route.slug;
+      route = nextRoute;
+      namespacesFlattened = built.namespacesFlattened;
+      flattenedNamespaces = built.flattenedNamespaces;
+      pendingInterrupts = built.pendingInterrupts;
+      agedInput = built.agedInput;
+      toolResultAging = built.toolResultAging;
+      target = built.target;
+      headers = built.headers;
+      routedBody = built.body;
+      // The tray Island has to name the model that is actually answering.
+      activity.setRoute({
+        provider: canonicalProviderId(route.provider),
+        model: route.slug,
+        ...activityMetadataFromHeaders(request.headers),
+      });
+    };
     if (route) {
-      const input = await bridgeVisionInput(
-        await normalizeRoutedAgentInput(request, payload.input, controller.signal),
-        route,
+      normalizedInput = await normalizeRoutedAgentInput(
         request,
+        payload.input,
+        controller.signal,
       );
-      // DeepSeek thinking mode requires the assistant's reasoning to be
-      // replayed on tool-call turns, but LiteLLM's Responses->chat translation
-      // drops `reasoning` input items entirely. Merge each reasoning summary
-      // into the following assistant function_call message's content so the
-      // translation carries it; the forwarder then attaches it as
-      // `reasoning_content` on the tool-call message.
-      carryReasoningThroughInput(input);
-      const provider = providerForModel(route);
-      // LiteLLM's Responses -> Chat Completions bridge drops namespace tools,
-      // which is how the client ships the collaboration runtime, the app
-      // toolset (threads, automations, navigation), and every MCP server
-      // (node_repl, peekaboo, github, ...). Chat-completions providers need
-      // every namespace flattened into ordinary functions; the response
-      // transform maps calls back to the client's native namespace shape.
-      if (provider?.protocol !== "openai-responses") {
-        // Relay the app's full native toolset (threads, automations, app
-        // navigation) to the provider. The client registers these tools with
-        // deferLoading and executes the calls natively, but only sends a
-        // reduced codex_app namespace on routed requests; merge the deferred
-        // definitions in so routed models see what native models see. The
-        // router never executes these calls -- the app owns thread, automation,
-        // and navigation state -- it only relays definitions and results.
-        const merged = mergeCodexAppTools(payload.tools);
-        if (merged.merged) payload.tools = merged.tools;
-        const flattened = flattenNamespaceTools(payload.tools);
-        namespacesFlattened = flattened.flattened;
-        if (namespacesFlattened) {
-          payload.tools = flattened.tools;
-          flattenedNamespaces = flattened.namespaces;
+      agingEnabled = toolResultAgingEnabled();
+      const built = await prepareRoutedRequest({
+        request,
+        payload,
+        route,
+        normalizedInput,
+        agingEnabled,
+      });
+      toolResultAging = built.toolResultAging;
+      agedInput = built.agedInput;
+      namespacesFlattened = built.namespacesFlattened;
+      flattenedNamespaces = built.flattenedNamespaces;
+      pendingInterrupts = built.pendingInterrupts;
+      target = built.target;
+      headers = built.headers;
+      routedBody = built.body;
+      // This provider has already said it would be empty until a named time.
+      // Sending anyway buys one guaranteed rejection per turn for as long as
+      // the window lasts, so move now and skip the dead round trip. The body
+      // just built is thrown away, which costs one local serialization -- far
+      // less than the request it avoids. The cooldown expires by itself, so
+      // the operator's chosen model comes back without anyone doing anything.
+      const settings = readFailoverSettings();
+      const cooled = settings.enabled ? providerCooldown(route.provider) : undefined;
+      if (cooled) {
+        const [next] = failoverCandidates({
+          route,
+          agedInput,
+          flattenedNamespaces,
+          chain: settings.chain,
+        });
+        if (next) {
+          const candidate = await prepareRoutedRequest({
+            request,
+            payload,
+            route: next.model,
+            normalizedInput,
+            agingEnabled,
+          });
+          if (routedRequestFits(next.model, candidate.body)) {
+            logFailover(route, next.model, `cooled_until_${cooled.until}`, "not-sent", "swapped");
+            adoptRoute(next.model, candidate);
+          } else {
+            logFailover(
+              route,
+              next.model,
+              `cooled_until_${cooled.until}`,
+              "not-sent",
+              "context-too-small",
+            );
+          }
         }
-      } else {
-        // Responses-native providers keep the namespace tools untouched, so
-        // nothing is flattened and the payload is left alone. The inventory is
-        // still built, because the response transform reads the exact
-        // spawn_agent model enum off it to drop an invented or stale optional
-        // override before Codex validates the call.
-        flattenedNamespaces = flattenNamespaceTools(payload.tools).namespaces;
       }
-      let routedInput = input;
-      // The stored call history must use the same tool names as the tool
-      // list, or the model copies the bare names out of its own transcript.
-      if (namespacesFlattened) {
-        routedInput = flattenNamespacedHistory(routedInput, flattenedNamespaces);
-      }
-      const routed = {
-        ...payload,
-        model: route.gatewayModel,
-        input: routedInput,
-      };
-      // Native OpenAI traffic keeps client_metadata; routed providers do not
-      // consume it and the strict ones reject the unknown field.
-      delete routed.client_metadata;
-      // Codex sends reasoning as an object. LiteLLM's Ollama path tests that
-      // value for membership of a string set, which raises on a dict and fails
-      // the whole turn -- 210 of them here before this was caught. Ollama has
-      // no reasoning-effort concept to map it onto anyway, so drop it rather
-      // than translate it into something the model never asked for.
-      if (provider?.keyless) {
-        delete routed.reasoning;
-        delete routed.reasoning_effort;
-      }
-      if (provider?.id === "fireworks") delete routed.web_search_options;
-      target = `${GATEWAY_BASE}/responses`;
-      headers = routedHeaders();
-      routedBody = Buffer.from(JSON.stringify(routed), "utf8");
     } else {
       const native = { ...payload };
+      // An extended-window variant is the model it was derived from, published
+      // under a second slug so the picker can offer a different context
+      // window (`src/native-context-variants.mjs`). chatgpt.com has never
+      // heard of that slug, so it is translated back here -- the last point
+      // before the turn leaves. Everything the operator reads keeps the slug
+      // they picked: `requestedModel` is untouched, so activity, usage, and
+      // the log still name the model the picker showed.
+      const variantBase = nativeContextVariantBase(native.model);
+      if (variantBase) native.model = variantBase;
+      normalizeNativePromptCacheCompatibility(native);
       if (Array.isArray(payload.input)) {
         native.input = normalizeNativeInput(payload.input);
+        // Native turns leave here as stateless full conversations (the
+        // previous_response_id below is stripped), so an old tool result costs
+        // its full size on every turn of this path too. Compaction turns are
+        // exempt: compactV1 keeps its chaining, and a summary should read the
+        // true content rather than a receipt.
+        if (!compactV1) {
+          const aged = ageToolResults(native.input, {
+            enabled: nativeToolResultAgingEnabled(),
+          });
+          native.input = aged.input;
+          toolResultAging = aged.stats;
+        }
       }
-      // The Codex client can send a prompt-cache retention hint, but the
-      // native upstream rejects it for models without cache retention support.
-      // It is only a caching hint, so dropping it never changes the response.
-      delete native.prompt_cache_retention;
+      // SF and other native multi-agent parents hit this path (model_provider
+      // openai). They have the same Working-badge bug, so inventory the tools
+      // and queue missing interrupt_agent closes the same way as routed turns.
+      flattenedNamespaces = flattenNamespaceTools(payload.tools, {
+        bridgeToolSearch: false,
+      }).namespaces;
+      pendingInterrupts = pendingInterruptTargets(native.input ?? payload.input, {
+        namespaces: flattenedNamespaces,
+      });
       if (!compactV1) delete native.previous_response_id;
+      if (callerBroughtNoUpstreamCredential(request)) {
+        normalizeNativeForSubstitutedCaller(native);
+      }
       target = nativeTarget(requestUrl.pathname);
 
       const fastAccounts = new Set(
@@ -1956,6 +3113,7 @@ async function handleResponses(request, response, requestUrl) {
           },
           {
             fetchImpl: fetchNative,
+            retryCapacity: false,
             canRetry: () => nothingRelayed(response),
             onRetry: (event) => logUpstreamRetry(event, requestedModel, requestUrl.pathname),
           },
@@ -1971,8 +3129,9 @@ async function handleResponses(request, response, requestUrl) {
           upstream = peek.response;
         }
         if (capacity) {
-          recordCapacityFailure(streamCapacity ? null : upstream.status);
+          recordCapacityFailure(streamCapacity ? null : upstream.status, nativeAccountId);
         }
+        nativeCapacityFailure = capacity;
         if (!capacity || attempt === nativeCapacityAttempts - 1) break;
         await upstream.body?.cancel().catch(() => {});
         // Let the model shed load before the next account tries again.
@@ -1994,6 +3153,7 @@ async function handleResponses(request, response, requestUrl) {
       }
     }
     upstreamRetries = retries;
+    upstreamStatus = upstream.status;
     // Time until the upstream chain answered the request. Everything before
     // this is router-side work (body read, normalization, flattening, vision
     // bridge) plus the upstream's own time to produce response headers. For a
@@ -2003,13 +3163,66 @@ async function handleResponses(request, response, requestUrl) {
     // A native 401/402/403/429 means the injected account stopped working. Let
     // the bridge mark it failed so the poller can switch to a healthy account
     // when failover is enabled; the current turn still relays the error.
-    if (!route) {
+    if (!route && !nativeCapacityFailure) {
       const quota =
         !upstream.ok &&
         upstream.status === 429 &&
         (await isQuotaExhaustedResponse(upstream));
-      notifyAccountFailure(upstream.status, false, quota);
+      notifyAccountFailure(upstream.status, false, quota, nativeAccountId);
     }
+    // The body of a failed routed attempt, read once: the failover classifier
+    // and the error translation below both need it, and it can only be read
+    // once. Nothing is relayed either way, so reading it is free.
+    let failedBodyText;
+    if (route && !upstream.ok) {
+      failedBodyText = await upstream.text().catch(() => "");
+      const verdict = classifyRoutedFailure({
+        status: upstream.status,
+        bodyText: failedBodyText,
+        retryAfterSeconds: Number(upstream.headers.get("retry-after")),
+      });
+      if (verdict.swap) {
+        // Believe the provider about when it will be back before trying anyone
+        // else, so the next turn skips it instead of paying for the same
+        // rejection again.
+        recordProviderCooldown(route.provider, verdict);
+        const moved = await attemptModelFailover({
+          request,
+          response,
+          payload,
+          route,
+          agedInput,
+          flattenedNamespaces,
+          verdict,
+          status: upstream.status,
+          signal: controller.signal,
+          normalizedInput,
+          agingEnabled,
+        });
+        if (moved) {
+          // The attempt that failed is still a turn that happened and still
+          // cost the provider something, so it is metered on its own row. The
+          // serving row below carries `failoverFrom`, which is what makes a
+          // rescued turn distinguishable from one that never failed.
+          recordUsageEvent({
+            model: route.slug,
+            provider: canonicalProviderId(route.provider),
+            status: upstream.status,
+            durationMs: Date.now() - startedAt,
+            responseStartMs: upstreamLatencyMs,
+          });
+          adoptRoute(moved.route, moved.built);
+          upstream = moved.upstream;
+          upstreamStatus = upstream.status;
+          failedBodyText = undefined;
+        }
+      }
+    }
+    // A provider that just answered is not out of usage, whatever this router
+    // recorded earlier: a quota that refilled early, a limit the operator
+    // raised, or a reset time the provider got wrong all end the same way, and
+    // a real answer is better evidence than anything on disk.
+    if (route && upstream.ok) clearProviderCooldown(route.provider);
     // Gateway error bodies leak LiteLLM's internal exception chain, which
     // reads like a router bug. Rewrite them to name the provider that failed.
     // Native traffic passes through untouched: OpenAI errors are already clear.
@@ -2017,16 +3230,26 @@ async function handleResponses(request, response, requestUrl) {
       const provider = providerForModel(route);
       const retryAfterHeader = upstream.headers.get("retry-after");
       const retryAfterSeconds = Number(retryAfterHeader);
+      const translatedStatus = gatewayErrorStatus({
+        status: upstream.status,
+        bodyText: failedBodyText,
+      });
       if (retryAfterHeader) response.setHeader("Retry-After", retryAfterHeader);
       writeJson(
         response,
-        upstream.status,
+        translatedStatus,
         translateGatewayError({
           status: upstream.status,
-          bodyText: await upstream.text(),
+          // Already drained above so the failover classifier could read it; a
+          // second `.text()` on the same response yields "".
+          bodyText: failedBodyText ?? (await upstream.text().catch(() => "")),
           modelName: route.displayName || route.slug,
-          providerName: provider?.ownedBy || provider?.displayName || route.provider,
+          providerName:
+            provider?.transport === "ollama"
+              ? "Ollama"
+              : provider?.ownedBy || provider?.displayName || route.provider,
           providerKind: provider?.kind,
+          providerAuthMode: provider?.authMode,
           retryAfterSeconds: Number.isFinite(retryAfterSeconds)
             ? retryAfterSeconds
             : undefined,
@@ -2037,9 +3260,12 @@ async function handleResponses(request, response, requestUrl) {
         provider: canonicalProviderId(route.provider),
         status: upstream.status,
         durationMs: Date.now() - startedAt,
+        responseStartMs: upstreamLatencyMs,
+        firstTokenMs,
       });
-      finalStatus = upstream.status;
-      activityStatus = upstream.status;
+      observeSubagentOutcome(request, route, upstream.status);
+      finalStatus = translatedStatus;
+      activityStatus = translatedStatus;
       usageRecorded = true;
       if (!QUIET) {
         console.error(
@@ -2068,50 +3294,141 @@ async function handleResponses(request, response, requestUrl) {
             : undefined,
       });
       const transforms = [usageObserver];
-      // Every attempt uses the same normal transform pipeline. In particular,
-      // a tool call recovered by the retry must still have its flattened
-      // namespace restored before Codex sees it.
-      if (route) {
+      let envelopeCompat = route
+        ? zaiResponsesCompatTransform(route.provider, contentType)
+        : undefined;
+      // LiteLLM's Ox Chat -> Responses bridge can start assistant text after
+      // reasoning without its message envelope. Keep that repair exact.
+      if (
+        !envelopeCompat &&
+        route?.provider === "opencode-free" &&
+        route.upstreamModel === "x-preview-f-free" &&
+        String(contentType).toLowerCase().includes("text/event-stream")
+      ) {
+        envelopeCompat = new ZaiResponsesCompatTransform();
+      }
+      if (envelopeCompat) transforms.push(envelopeCompat);
+      const deepseekToolMessageCompat = route
+        ? deepseekToolMessageCompatTransform(route.provider, contentType)
+        : undefined;
+      if (deepseekToolMessageCompat) transforms.push(deepseekToolMessageCompat);
+      // Restore flattened namespace calls for routed chat-completions providers,
+      // and inject missing finished-child interrupts for both routed and native
+      // multi-agent parents (San Francisco uses native GPT).
+      if (route || pendingInterrupts.length > 0) {
         transforms.push(
-          new NamespaceToolCallTransform(flattenedNamespaces, contentType, route.slug),
+          new NamespaceToolCallTransform(
+            flattenedNamespaces,
+            contentType,
+            route?.slug,
+            // A native stream is attached only for the injection, so it must
+            // not pick up the routed-provider rewrites on the way through.
+            { pendingInterrupts, injectOnly: !route },
+          ),
         );
       }
       const guard =
         route && EMPTY_COMPLETION_RETRY
-          ? new EmptyCompletionGuard(contentType)
+          ? new EmptyCompletionGuard(contentType, {
+              maxPreludeBytes: EMPTY_COMPLETION_PRELUDE_BYTES,
+              maxPreludeMs: EMPTY_COMPLETION_PRELUDE_MS,
+            })
           : undefined;
-      if (guard) transforms.push(guard);
+      if (guard) {
+        transforms.push(
+          guard,
+          new EmptyCompletionTerminalGuard(guard, contentType, {
+            maxHeldTerminalBytes: EMPTY_COMPLETION_PRELUDE_BYTES,
+          }),
+        );
+      }
       return { transforms, usageObserver, guard };
     };
     const firstPipeline = createResponsePipeline(upstreamContentType);
     usageTransform = firstPipeline.usageObserver;
     emptyCompletionGuard = firstPipeline.guard;
     const relayOpen = Boolean(emptyCompletionGuard);
-    await pipeResponse(upstream, response, HOP_BY_HOP_HEADERS, firstPipeline.transforms, {
-      leaveOpen: relayOpen,
-    });
+    let streamedPreludeFailureKind;
+    try {
+      await pipeResponse(
+        upstream,
+        response,
+        HOP_BY_HOP_HEADERS,
+        firstPipeline.transforms,
+        { leaveOpen: relayOpen },
+      );
+    } catch (error) {
+      if (isEmptyCompletionPreludeLimitError(error) && !clientGone) {
+        emptyCompletionPreludeLimit = error.kind;
+        if (nothingRelayed(response)) {
+          preludeLimitRetryable = true;
+        } else {
+          streamedPreludeFailureKind = error.kind;
+          emptyCompletionUnrepairable = true;
+          writeStreamErrorEvent(response, {
+            code: "precontent_limit",
+            message:
+              error.kind === "time"
+                ? "The model stopped producing output before the router's stream deadline."
+                : "The model exceeded the router's bounded stream parser before producing output.",
+          });
+        }
+      } else {
+        throw error;
+      }
+    }
     usage = usageTransform?.tokenUsage();
+    // Time to the first generated token, which is what an output-tokens-per-
+    // second figure has to divide by. `upstreamLatencyMs` stops at the response
+    // headers, and on a reasoning model the gap between the two is seconds of
+    // silent thinking that would otherwise be charged to the generation rate.
+    const firstTokenAt = usageTransform?.firstTokenAt?.();
+    if (firstTokenAt !== undefined) firstTokenMs = firstTokenAt - startedAt;
     estimatedInputTokens = usageTransform?.substitutedInputTokens();
     // The `close` listener above sets `clientGone` when the client's socket
     // goes away, but `pipeResponse` can resolve before that event fires: the
     // response socket is already destroyed at that point. Read the state
     // directly as well so a cancel that races the close event still meters 0.
+    const nativeCompletedBeforeClose =
+      !route && usageTransform?.completedResponseObserved() === true;
     const clientWalkedAway =
-      clientGone || (response.destroyed && !response.writableFinished);
+      (clientGone || (response.destroyed && !response.writableFinished)) &&
+      !nativeCompletedBeforeClose;
     finalStatus = clientWalkedAway ? 0 : upstream.status;
+    if (streamedPreludeFailureKind && !clientWalkedAway) finalStatus = 502;
     emptyCompletion = emptyCompletionGuard?.isEmpty() === true && !clientWalkedAway;
-    // The guard releases long turns at its byte/time budget without a verdict.
-    // Those turns may have been empty completions the router chose not to
-    // retry, which must stay distinguishable from healthy long turns in the
-    // meter — otherwise a 40-second reasoning-only empty completion reads as a
-    // successful 40-second turn.
-    guardReleasedForBudget =
-      emptyCompletionGuard?.releasedForBudget() === true && !clientWalkedAway;
-    if (emptyCompletion) {
-      // The upstream answered 200 with nothing. Retry the identical request
-      // once: same bytes, same headers, same signal. The guard discarded the
-      // whole first stream, so the retry supplies the only head, response id,
-      // sequence space, reasoning, and output the client ever receives.
+    emptyCompletionPreludeLimit ||=
+      emptyCompletionGuard?.preludeLimitKind?.();
+    // A pre-content limit used to release the staged bytes and stop parsing,
+    // which could turn an unknown stream into a successful-looking empty
+    // response. The byte limit now fails while every byte is replaceable so
+    // the retry below can recover it. The time limit still releases for
+    // latency, but keeps parsing so a terminal empty turn becomes a stated SSE
+    // error instead of a blank success.
+    // The turn produced nothing, but the guard had already released it: the
+    // upstream proved it was generating (reasoning), so the head, response id,
+    // and prologue are on the wire. A second attempt would graft a second
+    // response onto a stream the client is already reading. State the failure
+    // instead. This is the case the hold used to cover, priced honestly — the
+    // hold cost every reasoning turn up to its full budget of dead air, and
+    // bought a silent rescue on roughly one routed turn in a thousand.
+    if (emptyCompletion && emptyCompletionGuard?.suppressedPrologue() !== true) {
+      emptyCompletionUnrepairable = true;
+      writeStreamErrorEvent(response, {
+        code: emptyCompletionPreludeLimit
+          ? "precontent_limit"
+          : "empty_completion",
+        message: emptyCompletionPreludeLimit
+          ? "The model produced no output before the router's safety limit and then completed without output. The response had already started, so the router could not retry it safely."
+          : "The model streamed reasoning but produced no output. The router could not retry because the response had already started.",
+      });
+      finalStatus = 502;
+    } else if (emptyCompletion || preludeLimitRetryable) {
+      // The upstream answered 200 with nothing and never proved otherwise, so
+      // the guard still holds every byte. Retry the identical request once:
+      // same bytes, same headers, same signal. The discarded first stream means
+      // the retry supplies the only head, response id, sequence space,
+      // reasoning, and output the client ever receives.
       emptyCompletionRetried = true;
       let upstream2;
       try {
@@ -2139,8 +3456,12 @@ async function handleResponses(request, response, requestUrl) {
         );
         writeEmptyCompletionError(
           response,
-          "empty_completion_retry_failed",
-          "The model returned an empty completion and the router's retry failed upstream.",
+          emptyCompletionPreludeLimit
+            ? "precontent_limit_retry_failed"
+            : "empty_completion_retry_failed",
+          emptyCompletionPreludeLimit
+            ? "The model produced no output before the router's safety limit and the retry failed upstream."
+            : "The model returned an empty completion and the router's retry failed upstream.",
         );
         finalStatus = 502;
       }
@@ -2166,12 +3487,20 @@ async function handleResponses(request, response, requestUrl) {
           await rejectedResponse.body?.cancel().catch(() => {});
           writeEmptyCompletionError(
             response,
-            upstream2.ok
-              ? "empty_completion_retry_protocol_error"
-              : "empty_completion_retry_failed",
-            upstream2.ok
-              ? "The model returned an empty completion and the router's retry returned an incompatible response."
-              : "The model returned an empty completion and the router's retry failed upstream.",
+            emptyCompletionPreludeLimit
+              ? upstream2.ok
+                ? "precontent_limit_retry_protocol_error"
+                : "precontent_limit_retry_failed"
+              : upstream2.ok
+                ? "empty_completion_retry_protocol_error"
+                : "empty_completion_retry_failed",
+            emptyCompletionPreludeLimit
+              ? upstream2.ok
+                ? "The model produced no output before the router's safety limit and the retry returned an incompatible response."
+                : "The model produced no output before the router's safety limit and the retry failed upstream."
+              : upstream2.ok
+                ? "The model returned an empty completion and the router's retry returned an incompatible response."
+                : "The model returned an empty completion and the router's retry failed upstream.",
           );
           finalStatus = 502;
         } else {
@@ -2181,22 +3510,66 @@ async function handleResponses(request, response, requestUrl) {
           const secondPipeline = createResponsePipeline(retryContentType);
           retryUsageTransform = secondPipeline.usageObserver;
           retryEmptyCompletionGuard = secondPipeline.guard;
-          await pipeResponse(
-            upstream2,
-            response,
-            HOP_BY_HOP_HEADERS,
-            secondPipeline.transforms,
-            { leaveOpen: true },
-          );
+          let retryPreludeFailureKind;
+          let retryStreamedPreludeFailureKind;
+          try {
+            await pipeResponse(
+              upstream2,
+              response,
+              HOP_BY_HOP_HEADERS,
+              secondPipeline.transforms,
+              { leaveOpen: true },
+            );
+          } catch (error) {
+            if (isEmptyCompletionPreludeLimitError(error) && !clientGone) {
+              emptyCompletionPreludeLimit ||= error.kind;
+              if (nothingRelayed(response)) {
+                retryPreludeFailureKind = error.kind;
+              } else {
+                retryStreamedPreludeFailureKind = error.kind;
+                emptyCompletionUnrepairable = true;
+                writeStreamErrorEvent(response, {
+                  code: "precontent_limit",
+                  message:
+                    error.kind === "time"
+                      ? "The retry stopped producing output before the router's stream deadline."
+                      : "The retry exceeded the router's bounded stream parser before producing output.",
+                });
+              }
+            } else {
+              throw error;
+            }
+          }
           const retryClientWalkedAway =
             clientGone || (response.destroyed && !response.writableFinished);
-          guardReleasedForBudget =
-            guardReleasedForBudget ||
-            (retryEmptyCompletionGuard?.releasedForBudget() === true &&
-              !retryClientWalkedAway);
+          emptyCompletionPreludeLimit ||=
+            retryEmptyCompletionGuard?.preludeLimitKind?.();
           if (retryClientWalkedAway) {
             finalStatus = 0;
             if (secondPipeline.guard.hasContent()) emptyCompletion = false;
+          } else if (retryStreamedPreludeFailureKind) {
+            finalStatus = 502;
+          } else if (
+            retryEmptyCompletionGuard.isEmpty() &&
+            retryEmptyCompletionGuard.suppressedPrologue() !== true
+          ) {
+            emptyCompletionUnrepairable = true;
+            writeStreamErrorEvent(response, {
+              code: emptyCompletionPreludeLimit
+                ? "precontent_limit"
+                : "empty_completion",
+              message: emptyCompletionPreludeLimit
+                ? "The retry produced no output before the router's safety limit and then completed without output."
+                : "The retry streamed reasoning but completed without output.",
+            });
+            finalStatus = 502;
+          } else if (retryPreludeFailureKind) {
+            writeEmptyCompletionError(
+              response,
+              "precontent_limit",
+              "The model produced no output before the router's safety limit. The router retried once and the retry reached a safety limit again.",
+            );
+            finalStatus = 502;
           } else if (secondPipeline.guard.isEmpty()) {
             writeEmptyCompletionError(
               response,
@@ -2238,12 +3611,30 @@ async function handleResponses(request, response, requestUrl) {
       accountId: nativeAccountId,
       status: finalStatus,
       durationMs: Date.now() - startedAt,
-      retries: upstreamRetries,
+      responseStartMs: upstreamLatencyMs,
+      firstTokenMs,
       ...usage,
       estimatedInputTokens,
+      ...toolResultAging,
+      retries: (upstreamRetries || 0) + (usage?.retries || 0) || undefined,
       ...(emptyCompletion ? { emptyCompletion: true } : {}),
       ...(emptyCompletionRetried ? { emptyCompletionRetried: true } : {}),
-      ...(guardReleasedForBudget ? { emptyCompletionGuardReleased: true } : {}),
+      ...(usage?.progressOnlyRetried ? { progressOnlyRetried: true } : {}),
+      ...(emptyCompletionUnrepairable ? { emptyCompletionUnrepairable: true } : {}),
+      ...(emptyCompletionPreludeLimit
+        ? { emptyCompletionPreludeLimit }
+        : {}),
+      ...(failoverFrom ? { failoverFrom } : {}),
+    });
+    // The same usage this turn just metered, and the same two disqualifiers
+    // context-window-drift.mjs applies to it: a substituted estimate and a
+    // retry-doubled count are not measurements of what the child sent.
+    observeSubagentOutcome(request, route, finalStatus, {
+      emptyCompletion,
+      usage,
+      estimatedInputTokens,
+      emptyCompletionRetried,
+      progressOnlyRetried: usage?.progressOnlyRetried === true,
     });
     usageRecorded = true;
     activityStatus = finalStatus;
@@ -2251,25 +3642,28 @@ async function handleResponses(request, response, requestUrl) {
       // The substitution is named in the log line as well as the usage event:
       // a router that quietly invents token counts is its own trap.
       console.error(
-        `[codex-router] model=${requestedModel || "unknown"} provider=${route?.provider || "openai"} status=${finalStatus}${
+        `[codex-router] model=${route?.slug || requestedModel || "unknown"} provider=${route?.provider || "openai"} status=${finalStatus}${
           upstreamRetries ? ` retries=${upstreamRetries}` : ""
         }${estimatedInputTokens ? ` estimated-input-tokens=${estimatedInputTokens}` : ""}${
+          toolResultAging?.toolResultBytesSaved
+            ? ` aged-tool-results=${toolResultAging.toolResultsAged} saved-tool-bytes=${toolResultAging.toolResultBytesSaved}`
+            : ""
+        }${
           emptyCompletionRetried ? " empty-completion-retried=true" : ""
-        }${emptyCompletion ? " empty-completion=true" : ""}`,
+        }${
+          emptyCompletionUnrepairable ? " empty-completion-unrepairable=true" : ""
+        }${emptyCompletion ? " empty-completion=true" : ""}${
+          emptyCompletionPreludeLimit
+            ? ` empty-completion-prelude-limit=${emptyCompletionPreludeLimit}`
+            : ""
+        }${
+          failoverFrom ? ` failover-from=${failoverFrom}` : ""
+        }`,
       );
     }
   } catch (error) {
     upstreamLatencyMs ??= Date.now() - startedAt;
     if (retryEmptyCompletionGuard?.hasContent()) emptyCompletion = false;
-    if (!clientGone) {
-      // A pipeline can fail after either guard has released its held bytes but
-      // before the success path samples the accessor. Preserve that verdict in
-      // the failure event too.
-      guardReleasedForBudget =
-        guardReleasedForBudget ||
-        emptyCompletionGuard?.releasedForBudget() === true ||
-        retryEmptyCompletionGuard?.releasedForBudget() === true;
-    }
     if (usageTransform) {
       usage = mergeTokenUsage(
         usageTransform.tokenUsage(),
@@ -2279,6 +3673,37 @@ async function handleResponses(request, response, requestUrl) {
         usageTransform.substitutedInputTokens(),
         retryUsageTransform?.substitutedInputTokens(),
       );
+      const firstTokenAt = usageTransform.firstTokenAt?.();
+      if (firstTokenAt !== undefined) firstTokenMs = firstTokenAt - startedAt;
+    }
+    // Codex may close a native stream immediately after response.completed.
+    // That is a successful terminal turn, not a canceled generation.
+    if (!route && clientGone && usageTransform?.completedResponseObserved() === true) {
+      finalStatus = upstreamStatus ?? response.statusCode;
+      activityStatus = finalStatus;
+      if (!usageRecorded) {
+        recordUsageEvent({
+          model: requestedModel,
+          provider: "openai",
+          status: finalStatus,
+          durationMs: Date.now() - startedAt,
+          responseStartMs: upstreamLatencyMs,
+          firstTokenMs,
+          ...usage,
+          estimatedInputTokens,
+          ...toolResultAging,
+          retries: (upstreamRetries || 0) + (usage?.retries || 0) || undefined,
+        });
+        usageRecorded = true;
+      }
+      if (!QUIET) {
+        console.error(
+          `[codex-router] model=${requestedModel || "unknown"} provider=openai status=${finalStatus}${
+            upstreamRetries ? ` retries=${upstreamRetries}` : ""
+          }`,
+        );
+      }
+      return;
     }
     // A client that walked away (canceled generation, closed stream) is not
     // a router failure; only surface errors the router or upstream produced.
@@ -2296,9 +3721,12 @@ async function handleResponses(request, response, requestUrl) {
           accountId: nativeAccountId,
           status: 0,
           durationMs: Date.now() - startedAt,
+          responseStartMs: upstreamLatencyMs,
+        firstTokenMs,
           retries: upstreamRetries,
           ...usage,
           estimatedInputTokens,
+          ...toolResultAging,
           ...(emptyCompletion ? { emptyCompletion: true } : {}),
           ...(emptyCompletionRetried ? { emptyCompletionRetried: true } : {}),
         });
@@ -2319,13 +3747,18 @@ async function handleResponses(request, response, requestUrl) {
         accountId: nativeAccountId,
         status: finalStatus,
         durationMs: Date.now() - startedAt,
+        responseStartMs: upstreamLatencyMs,
+        firstTokenMs,
         retries: upstreamRetries,
         ...usage,
         estimatedInputTokens,
+        ...toolResultAging,
         ...(response.headersSent ? { streamAborted: true } : {}),
         ...(emptyCompletion ? { emptyCompletion: true } : {}),
         ...(emptyCompletionRetried ? { emptyCompletionRetried: true } : {}),
-        ...(guardReleasedForBudget ? { emptyCompletionGuardReleased: true } : {}),
+        ...(emptyCompletionPreludeLimit
+          ? { emptyCompletionPreludeLimit }
+          : {}),
       });
       usageRecorded = true;
     }
@@ -2337,10 +3770,15 @@ async function handleResponses(request, response, requestUrl) {
     // QUIET: the production LaunchAgent hard-sets CODEX_ROUTER_QUIET=1. A
     // missing provider count is logged as unknown, not zero; an explicit zero
     // remains zero so a real cache miss is distinguishable from absent data.
+    // `model` and `provider` always name the pair that actually served the
+    // turn, so the two never disagree. On a turn the router moved, that is the
+    // fallback -- and `failover_from` carries what was asked for. Reading them
+    // the other way round (the asked-for model beside the serving provider)
+    // describes a combination that never ran.
     console.error(
-      `[codex-router] timing at=${new Date().toISOString()} model=${requestedModel || "unknown"} provider=${route?.provider || "openai"} status=${status} total_ms=${Date.now() - startedAt} upstream_ms=${timingMetric(upstreamLatencyMs)} out_tokens=${timingMetric(usage?.outputTokens)} cached_tokens=${timingMetric(usage?.cachedInputTokens)}${
+      `[codex-router] timing at=${new Date().toISOString()} model=${route?.slug || requestedModel || "unknown"} provider=${route?.provider || "openai"} status=${status} total_ms=${Date.now() - startedAt} upstream_ms=${timingMetric(upstreamLatencyMs)} out_tokens=${timingMetric(usage?.outputTokens)} cached_tokens=${timingMetric(usage?.cachedInputTokens)}${
         estimatedInputTokens ? ` est_input=${estimatedInputTokens}` : ""
-      }`,
+      }${failoverFrom ? ` failover_from=${failoverFrom}` : ""}`,
     );
   }
 }
@@ -2349,12 +3787,24 @@ async function handleNativeRequest(request, response, requestUrl, defaultModel) 
   const startedAt = Date.now();
   const activity = beginRequestActivity();
   let clientGone = false;
+  let requestedModel = defaultModel;
+  const controller = new AbortController();
+  bindClientAbort(request, response, () => {
+    clientGone = true;
+    controller.abort();
+  });
   try {
     if (!requireCodexTransport(request, response)) return;
+    // Image and web-search turns are native-only; an idle install refuses
+    // them locally rather than forwarding to chatgpt.com.
+    if (discoveryDisabled()) {
+      writeIdleNoProviderError(response);
+      return;
+    }
     const encoded = await readRequestBody(request);
     const body = decodeBody(encoded, request.headers["content-encoding"]);
-    const payload = parseBody(body);
-    const requestedModel =
+    const payload = await parseBodyAsync(body);
+    requestedModel =
       typeof payload.model === "string" ? payload.model : defaultModel;
     activity.setRoute({
       provider: "openai",
@@ -2362,23 +3812,21 @@ async function handleNativeRequest(request, response, requestUrl, defaultModel) 
       ...activityMetadataFromHeaders(request.headers),
     });
 
-    const controller = new AbortController();
-    request.once("aborted", () => {
-      clientGone = true;
-      controller.abort();
-    });
-    response.once("close", () => {
-      if (!response.writableEnded) {
-        clientGone = true;
-        controller.abort();
-      }
-    });
-
     const headers = nativeHeaders(request);
     const nativeAccountId = injectedAccountId(headers);
+    // The same slug translation the turn path does, for the same reason: these
+    // endpoints normally carry their own model ("gpt-image-2", the search
+    // model), but nothing stops a client from naming the picked one, and an
+    // extended-window slug means nothing to chatgpt.com. The bytes are only
+    // re-encoded when a variant is actually present, so every other request on
+    // this path is forwarded exactly as it arrived.
+    const variantBase = nativeContextVariantBase(payload.model);
+    const outgoing = variantBase
+      ? Buffer.from(JSON.stringify({ ...payload, model: variantBase }), "utf8")
+      : body;
     // Same replayable-Buffer rule as the turn path: encode once, outside the
     // retry, so every attempt carries identical bytes under identical headers.
-    const imageBody = await compressedNativeBody(body, headers);
+    const imageBody = await compressedNativeBody(outgoing, headers);
     const { response: upstream, retries: upstreamRetries } = await fetchWithRetry(
       nativeTarget(requestUrl.pathname, nativeRequestSearch(requestUrl)),
       {
@@ -2402,7 +3850,7 @@ async function handleNativeRequest(request, response, requestUrl, defaultModel) 
         onRetry: (event) => logUpstreamRetry(event, requestedModel, requestUrl.pathname),
       },
     );
-    notifyAccountFailure(upstream.status);
+    notifyAccountFailure(upstream.status, false, false, nativeAccountId);
     await pipeResponse(upstream, response, HOP_BY_HOP_HEADERS);
     recordUsageEvent({
       model: requestedModel,
@@ -2418,11 +3866,29 @@ async function handleNativeRequest(request, response, requestUrl, defaultModel) 
       );
     }
   } catch (error) {
+    // A failure with no usage event is invisible to the diagnostic that
+    // separates "the upstream failed" from "the request died inside the
+    // router" — the distinction #171 turned on. Meter this path the way the
+    // turn path does: a departed client as 0, everything else by its status.
     if (clientGone) {
+      recordUsageEvent({
+        model: requestedModel,
+        provider: "openai",
+        status: 0,
+        durationMs: Date.now() - startedAt,
+      });
       activity.finish(0);
       return;
     }
-    activity.finish(500);
+    const status = response.headersSent ? 502 : httpErrorStatus(error);
+    recordUsageEvent({
+      model: requestedModel,
+      provider: "openai",
+      status,
+      durationMs: Date.now() - startedAt,
+      ...(response.headersSent ? { streamAborted: true } : {}),
+    });
+    activity.finish(status);
     throw error;
   } finally {
     activity.finish(response.statusCode);
@@ -2440,6 +3906,7 @@ async function handleRequest(request, response) {
       ok: health.ok,
       service: health.service,
       version: health.version,
+      degraded: health.degraded,
       activity: health.activity,
     });
     return;
@@ -2457,6 +3924,12 @@ async function handleRequest(request, response) {
   }
   requestUrl.pathname = route;
 
+  // Behind the caller capability, like every other local endpoint: the panel
+  // reads the same data the tray does, so it is gated the same way.
+  if (isPanelRoute(route) && (await handlePanelRequest(request, response, route, { writeJson }))) {
+    return;
+  }
+
   if (
     request.method === "GET" &&
     ["/health", "/v1/health"].includes(requestUrl.pathname)
@@ -2467,6 +3940,17 @@ async function handleRequest(request, response) {
   }
   if (request.method === "GET" && ["/models", "/v1/models"].includes(requestUrl.pathname)) {
     await handleModels(response);
+    return;
+  }
+  // Gemini CLI speaks nothing but the Gemini API, so it gets its own leaf
+  // behind the same capability. The handler translates and re-enters
+  // `/v1/responses` over the loopback rather than reaching a provider itself --
+  // there is still exactly one request path to keep correct.
+  if (isGeminiRoute(requestUrl.pathname)) {
+    await handleGeminiRequest(request, response, requestUrl.pathname, {
+      responsesUrl: `${callerBaseUrl(LISTEN_PORT, CALLER_KEY)}/responses`,
+      routedModels: geminiRoutedModels,
+    });
     return;
   }
   if (request.method === "OPTIONS") {
@@ -2500,25 +3984,38 @@ const server = http.createServer((request, response) => {
   handleRequest(request, response).catch((error) => {
     const status = httpErrorStatus(error);
     // The bare string this used to log made every mid-stream failure
-    // indistinguishable in production. The cause belongs in the log; response
-    // bodies never do, so only the error's own message and code are recorded.
-    console.error(
-      `[codex-router] request failed: ${
-        error instanceof Error ? `${error.name}: ${error.message}` : String(error)
-      }${error?.code ? ` (${error.code})` : ""}`,
-    );
+    // indistinguishable in production, and stopping at the top error was the
+    // second half of the same problem: a native connect failure logs
+    // `TypeError: fetch failed` with the socket-level code buried on its cause
+    // (#171). The whole chain belongs in the log; response bodies never do.
+    console.error(`[codex-router] request failed: ${formatErrorChain(error)}`);
+    // A socket-level failure is the one class of error whose cause is safe to
+    // state and useless to withhold: it names a host and a network condition,
+    // never a credential or an upstream body. Without it Codex reports only
+    // its own transport wording -- `stream disconnected before completion` --
+    // and an unreachable upstream is indistinguishable from a router bug.
+    const transport = describeTransportFailure(error);
     if (!response.headersSent) {
       writeJson(response, status, {
         error: {
           type: "local_router_error",
-          message: "The local router could not complete the request.",
+          code: transport?.code,
+          message: transport
+            ? `The local router could not complete the request: ${transport.cause}.${transport.hint}`
+            : "The local router could not complete the request.",
         },
       });
     } else {
       // The body is already streaming, so there is no status left to change.
       // Destroying here reset the socket and cost the chunked terminator,
-      // which the client reported only as a decode failure.
-      endStreamedResponse(response);
+      // which the client reported only as a decode failure. The event code
+      // stays `local_router_stream_failed`: a diagnosed cause is extra detail
+      // about the same failure, not a different one for a client to branch on.
+      endStreamedResponse(response, {
+        message: transport
+          ? `The local router lost the upstream response stream: ${transport.cause}.${transport.hint}`
+          : undefined,
+      });
     }
   });
 });
@@ -2553,14 +4050,30 @@ server.on("error", (error) => {
   );
   process.exit(96);
 });
+// One escaped error here takes native and routed traffic down together, and
+// the default crash leaves nothing in the service log but the supervisor's
+// exit line — #171 recorded `exited (code=4294967295)` on Windows with no way
+// to tell an in-process crash from an external kill. Name the failure and its
+// whole cause chain before exiting, and use exit codes distinct from the
+// listen-failure ones above so the supervisor's line alone classifies the
+// death. The exit itself stays: after an uncaught throw the process state is
+// unknowable, and the service manager owns the restart.
+process.on("uncaughtException", (error) => {
+  console.error(`[codex-router] uncaught exception: ${formatErrorChain(error)}`);
+  if (error?.stack) console.error(error.stack);
+  process.exit(95);
+});
+process.on("unhandledRejection", (reason) => {
+  console.error(`[codex-router] unhandled rejection: ${formatErrorChain(reason)}`);
+  if (reason?.stack) console.error(reason.stack);
+  process.exit(94);
+});
 server.requestTimeout = 0;
-server.headersTimeout = 65_000;
+applyKeepAliveTimeouts(server);
 startTaskManagerPoller();
 startTaskManagerUi();
 server.listen(LISTEN_PORT, LISTEN_HOST, () => {
   console.error("[codex-router] listening");
 });
 
-for (const signal of ["SIGINT", "SIGTERM"]) {
-  process.on(signal, () => server.close(() => process.exit(0)));
-}
+installGracefulShutdown(server, { label: "codex-router" });

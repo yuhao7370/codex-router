@@ -11,10 +11,7 @@ import {
 } from "node:fs";
 import path from "node:path";
 
-import {
-  cliSessionDescriptor,
-  readCliSessionCredential,
-} from "./cli-session-credential.mjs";
+import { discoveryDisabled } from "./discovery-mode.mjs";
 import { protectPrivateFile } from "./file-security.mjs";
 import { LEGACY_STATE_DIRS, STATE_DIR, TARGET } from "./paths.mjs";
 import { targetCli } from "./target-integration.mjs";
@@ -26,7 +23,11 @@ import {
 
 export function apiProvider(providerId) {
   const provider = PROVIDERS.get(providerId);
-  if (!provider || provider.kind !== "openai-compatible") {
+  if (
+    !provider ||
+    provider.kind !== "openai-compatible" ||
+    ["anonymous", "per-model"].includes(provider.authMode)
+  ) {
     throw new Error(`Unknown API-key provider: ${providerId}`);
   }
   return provider;
@@ -61,9 +62,9 @@ export function credentialPaths(provider) {
 //
 // So the spawn is memoized, and only the spawn. Scope is the point: the router
 // **never writes a Keychain item** -- `writeProviderCredential` below writes a
-// protected file in the state directory, `kimi login` and `grok login` write
-// their own OAuth files, and `command-code login` writes its own session file.
-// All three of those stay live on every call, and files are checked *before*
+// protected file in the state directory, while `kimi login` and `grok login`
+// write their own OAuth files. Both stay live on every call, and files are
+// checked *before*
 // the Keychain, so a key the operator adds through any documented path is
 // visible immediately. What can go stale is only a key some other tool put in
 // the login keychain behind the router's back, which nothing in this repository
@@ -137,7 +138,24 @@ function resolvedCredential(provider, value, source, persistent) {
 
 export function resolveProviderCredential(providerOrId, options = {}) {
   const provider =
-    typeof providerOrId === "string" ? apiProvider(providerOrId) : providerOrId;
+    typeof providerOrId === "string" ? PROVIDERS.get(providerOrId) : providerOrId;
+  if (!provider || provider.kind !== "openai-compatible") {
+    throw new Error(`Unknown API-key provider: ${typeof providerOrId === "string" ? providerOrId : "unknown"}`);
+  }
+  // Anonymous providers deliberately carry no secret. Returning a persistent
+  // marker makes them participate in the same configured/selected/catalog
+  // flow as local Ollama without ever creating a credential file or header.
+  if (provider.authMode === "anonymous") {
+    return { value: undefined, source: "official anonymous endpoint", persistent: true };
+  }
+  // A per-model-endpoint provider holds no credential of its own: each of its
+  // models resolves through this same function with its own endpoint
+  // descriptor. Answering "configured" here is what lets the container take
+  // part in selection, health, and the catalog; a model whose own endpoint
+  // needs a key still reports that against the key it actually wants.
+  if (provider.authMode === "per-model") {
+    return { value: undefined, source: "per-model endpoints", persistent: true };
+  }
   // Nothing to resolve for a loopback provider: it authenticates no one. The
   // placeholder keeps the forwarder's header shape uniform, and the registry
   // guarantees keyless providers are loopback-only, so it never leaves the
@@ -145,6 +163,11 @@ export function resolveProviderCredential(providerOrId, options = {}) {
   if (provider.keyless) {
     return { value: "local", source: "local endpoint (no key required)", persistent: true };
   }
+  // The --no-discovery promise: no environment sniffing, no credential files,
+  // no Keychain spawn, no other CLI's session file. The guard sits here, after
+  // the anonymous and keyless returns, because those two read nothing -- and
+  // before everything that does.
+  if (discoveryDisabled()) return undefined;
   if (!options.persistent) {
     for (const name of provider.credential.environment) {
       const value = process.env[name]?.trim();
@@ -172,34 +195,29 @@ export function resolveProviderCredential(providerOrId, options = {}) {
     const credential = resolvedCredential(provider, keychain.value, keychain.source, true);
     if (credential) return credential;
   }
-  // The provider CLI's own sign-in comes last: a key the user deliberately
-  // stored here, or exported into the environment, stays in charge, and the
-  // session only fills the gap for someone who never pasted one.
-  const session = readCliSessionCredential(provider);
-  return session
-    ? resolvedCredential(provider, session.value, session.label, true)
-    : undefined;
+  return undefined;
 }
 
-// Providers that support a CLI sign-in have two equally valid setup paths, and
-// naming only the key one would hide the OAuth flow from every surface that
-// prints this sentence (doctor, discovery errors, the enable gate).
 export function credentialSetupHint(provider) {
+  if (provider.authMode === "anonymous") return "No key needed; free models are rate limited by the provider.";
+  if (provider.authMode === "per-model") return "No key needed here; each model names its own endpoint.";
   if (provider.keyless) return "No key needed; it runs on this machine.";
   const keyCommand = targetCli(`provider-key ${provider.id} set`);
-  const session = cliSessionDescriptor(provider);
-  return session
-    ? `Run \`${session.loginCommand}\`, or run ${keyCommand}`
-    : `Run ${keyCommand}`;
+  return `Run ${keyCommand}`;
 }
 
 export function credentialLabel(provider) {
+  if (provider.authMode === "anonymous") return "No API key";
+  if (provider.authMode === "per-model") return "Per-model endpoints";
   return provider.credential?.label || "API key";
 }
 
 export function credentialStatus(providerOrId, options = {}) {
   const provider =
-    typeof providerOrId === "string" ? apiProvider(providerOrId) : providerOrId;
+    typeof providerOrId === "string" ? PROVIDERS.get(providerOrId) : providerOrId;
+  if (!provider || provider.kind !== "openai-compatible") {
+    throw new Error(`Unknown API-key provider: ${typeof providerOrId === "string" ? providerOrId : "unknown"}`);
+  }
   const credential = resolveProviderCredential(provider, options);
   return credential
     ? { configured: true, source: credential.source, persistent: credential.persistent }

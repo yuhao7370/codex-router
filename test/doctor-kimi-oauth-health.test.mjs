@@ -2,8 +2,10 @@ import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
 import {
+  existsSync,
   mkdirSync,
   mkdtempSync,
+  rmdirSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -37,9 +39,18 @@ before(async () => {
   routerPort = Number(chunk);
 });
 
-after(() => {
-  healthServer?.kill();
+after(async () => {
+  if (!healthServer) return;
+  // Kill without waiting can race the next test file for the port bookkeeping
+  // and, on Windows, leave the child holding its stdout pipe. Wait for exit.
+  healthServer.kill();
+  await once(healthServer, "exit");
+  healthServer = undefined;
 });
+
+function removeDirectoryIfPresent(directory) {
+  if (existsSync(directory)) rmdirSync(directory);
+}
 
 function doctorKimiCheck({ selected, credential }) {
   const testRoot = mkdtempSync(path.join(os.tmpdir(), "doctor-kimi-health-"));
@@ -70,11 +81,20 @@ function doctorKimiCheck({ selected, credential }) {
       {
         cwd: root,
         encoding: "utf8",
-        env: {
-          ...process.env,
-          HOME: testRoot,
-          USERPROFILE: testRoot,
-          CODEX_HOME: path.join(testRoot, "codex"),
+          env: {
+            ...process.env,
+            HOME: testRoot,
+            USERPROFILE: testRoot,
+            // Windows shells spawned by doctor's probes derive their AppData
+            // locations from HOME/USERPROFILE, not from LOCALAPPDATA -- an
+            // interactive-less PowerShell run writes
+            // AppData/Local/Microsoft/PowerShell/StartupProfileData-NonInteractive
+            // into whatever profile it is handed. Pointing the variable at the
+            // fixture tree keeps that side-effect inside the directory this
+            // test owns instead of spraying it across the real temp root's
+            // siblings.
+            LOCALAPPDATA: path.join(testRoot, "AppData", "Local"),
+            CODEX_HOME: path.join(testRoot, "codex"),
           CODEX_BIN: process.execPath,
           KIMI_CODE_HOME: kimiHome,
           MODEL_ROUTER_TARGET: "codex",
@@ -92,6 +112,21 @@ function doctorKimiCheck({ selected, credential }) {
     assert.ok(check, "doctor must include the Kimi OAuth check");
     return check;
   } finally {
+    rmSync(credentialsPath, { force: true });
+    removeDirectoryIfPresent(credentialsDir);
+    removeDirectoryIfPresent(kimiHome);
+    rmSync(selectionPath, { force: true });
+    removeDirectoryIfPresent(stateDir);
+    // Node's Windows profile resolver may create these empty profile
+    // directories while doctor probes the Codex account, and shells spawned
+    // by the probes write their own state under AppData/Local (see the
+    // LOCALAPPDATA override above). All of that is fixture scaffolding, not
+    // router state, so the whole tree goes recursively.
+    rmSync(path.join(testRoot, "AppData"), { recursive: true, force: true });
+    // The precise teardown above documents what the fixture expects to own;
+    // anything a probe left beyond it (a PowerShell profile write landing one
+    // directory deeper than usual, for instance) must still not leak a temp
+    // root per run, so fall back to a recursive sweep of what remains.
     rmSync(testRoot, { recursive: true, force: true });
   }
 }

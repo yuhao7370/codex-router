@@ -174,6 +174,7 @@ test("a gateway that dies mid-stream ends the routed body and logs the cause", a
     CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${gateway.port}/v1`,
     CODEX_ROUTER_OAUTH_HEALTH_URL: `http://127.0.0.1:${gateway.port}/health`,
     CODEX_ROUTER_API_HEALTH_URL: `http://127.0.0.1:${gateway.port}/health`,
+    CODEX_ROUTER_GROK_OAUTH_HEALTH_URL: `http://127.0.0.1:${gateway.port}/health`,
     CODEX_ROUTER_GATEWAY_HEALTH_URL: `http://127.0.0.1:${gateway.port}/health`,
   });
 
@@ -197,10 +198,19 @@ test("a gateway that dies mid-stream ends the routed body and logs the cause", a
     assert.match(result.body, /event: response\.created/);
     assert.match(result.body, /event: error/);
     assert.match(result.body, /local_router_stream_failed/);
+    // The terminal event is the only place a cause can still reach the client
+    // once the head is committed. Without it Codex reports a stream that just
+    // stopped as `stream disconnected before completion`, which names nothing.
+    assert.match(result.body, /closed early|reset the connection/);
 
     // The log has to name the cause; the bare string it used to write is why
     // this was undiagnosable in production.
-    const deadline = Date.now() + 2_000;
+    // A wait, not a bound: nothing here is asserting how *fast* the router
+    // logs, only that it does, and 2s was short enough that a loaded machine
+    // could still be scheduling the write. Wait as long as the rest of this
+    // file waits for anything else. A router that never logs the cause still
+    // fails on the assertion below, which is the property under test.
+    const deadline = Date.now() + 10_000;
     while (!/request failed: /.test(router.testErrors()) && Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, 25));
     }
@@ -243,6 +253,7 @@ test("a client cancel mid-stream meters 0 and never claims an upstream failure",
     CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${gateway.port}/v1`,
     CODEX_ROUTER_OAUTH_HEALTH_URL: `http://127.0.0.1:${gateway.port}/health`,
     CODEX_ROUTER_API_HEALTH_URL: `http://127.0.0.1:${gateway.port}/health`,
+    CODEX_ROUTER_GROK_OAUTH_HEALTH_URL: `http://127.0.0.1:${gateway.port}/health`,
     CODEX_ROUTER_GATEWAY_HEALTH_URL: `http://127.0.0.1:${gateway.port}/health`,
   });
 
@@ -350,6 +361,7 @@ test("a selection file naming an unknown provider does not wedge the router", as
     CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${gateway.port}/v1`,
     CODEX_ROUTER_OAUTH_HEALTH_URL: `http://127.0.0.1:${gateway.port}/health`,
     CODEX_ROUTER_API_HEALTH_URL: `http://127.0.0.1:${gateway.port}/health`,
+    CODEX_ROUTER_GROK_OAUTH_HEALTH_URL: `http://127.0.0.1:${gateway.port}/health`,
     CODEX_ROUTER_GATEWAY_HEALTH_URL: `http://127.0.0.1:${gateway.port}/health`,
   });
 
@@ -373,5 +385,93 @@ test("a selection file naming an unknown provider does not wedge the router", as
     await stopChild(router);
     await closeServer(gateway.server);
     rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+// Codex's HTTP client pools idle connections for 90 seconds and ignores the
+// `Keep-Alive: timeout=` header the router advertises, so Node's 5-second
+// default made the server close sockets the client still believed were live.
+// Reusing one of those answered the next turn with a FIN instead of a
+// response, which reqwest reports as "error sending request for url" and
+// Codex surfaces as "stream disconnected before completion". The idle gap
+// here is longer than that old default and shorter than the pool it has to
+// outlast.
+test("an idle keep-alive connection survives past Node's default timeout", async () => {
+  const gateway = await mockServer((request, response) => {
+    const payload = Buffer.from(JSON.stringify({ ok: true }), "utf8");
+    response.writeHead(200, {
+      "Content-Type": "application/json",
+      "Content-Length": String(payload.length),
+    });
+    response.end(payload);
+  });
+  const routerPort = await openPort();
+  const router = run({
+    CODEX_ROUTER_PORT: String(routerPort),
+    CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${gateway.port}/v1`,
+    CODEX_ROUTER_OAUTH_HEALTH_URL: `http://127.0.0.1:${gateway.port}/health`,
+    CODEX_ROUTER_API_HEALTH_URL: `http://127.0.0.1:${gateway.port}/health`,
+    CODEX_ROUTER_GROK_OAUTH_HEALTH_URL: `http://127.0.0.1:${gateway.port}/health`,
+    CODEX_ROUTER_GATEWAY_HEALTH_URL: `http://127.0.0.1:${gateway.port}/health`,
+  });
+  const IDLE_MS = 6_500;
+
+  try {
+    await waitFor(`http://127.0.0.1:${routerPort}/health`, router);
+
+    const socket = net.connect(routerPort, "127.0.0.1");
+    try {
+      const request =
+        "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: keep-alive\r\n\r\n";
+      // A raw socket is the only way to hold one connection across the idle
+      // gap; an agent would be free to open a second one and hide the bug.
+      const exchange = () =>
+        new Promise((resolve, reject) => {
+          let text = "";
+          const onData = (chunk) => {
+            text += chunk.toString("utf8");
+            if (text.includes("\r\n\r\n") && text.trimEnd().endsWith("}")) done(resolve, text);
+          };
+          const onEnd = () =>
+            done(reject, undefined, new Error("server closed the idle connection"));
+          const onError = (error) => done(reject, undefined, error);
+          function done(settle, value, error) {
+            socket.off("data", onData);
+            socket.off("end", onEnd);
+            socket.off("error", onError);
+            clearTimeout(timer);
+            error ? settle(error) : settle(value);
+          }
+          const timer = setTimeout(
+            () => done(reject, undefined, new Error("no response on the reused connection")),
+            5_000,
+          );
+          socket.on("data", onData);
+          socket.once("end", onEnd);
+          socket.once("error", onError);
+          socket.write(request);
+        });
+
+      const first = await exchange();
+      assert.match(first, /^HTTP\/1\.1 200/);
+      // The advertised timeout is what a client that does read the header
+      // (undici, curl) paces itself by, so it has to move with the setting.
+      assert.match(first, /Keep-Alive: timeout=120/);
+
+      await new Promise((resolve) => setTimeout(resolve, IDLE_MS));
+      assert.equal(
+        socket.destroyed,
+        false,
+        `the router closed an idle connection within ${IDLE_MS}ms`,
+      );
+
+      const second = await exchange();
+      assert.match(second, /^HTTP\/1\.1 200/);
+    } finally {
+      socket.destroy();
+    }
+  } finally {
+    await stopChild(router);
+    await closeServer(gateway.server);
   }
 });

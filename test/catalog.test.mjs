@@ -1,24 +1,31 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import {
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 import {
   AUTO_ANNOUNCE_WINDOW_MS,
   annotateNewModelAnnouncements,
-  applyAllMultiAgent,
   buildMergedCatalog,
   buildLoginFreeCatalog,
   clampModelEfforts,
   codexEffortVocabulary,
+  effectivePickerHiddenModels,
   nativeCatalogIsReusable,
   normalizeNativeContextWindows,
+  deriveBaseInstructions,
+  mergeNativeCatalogs,
+  mergeNativeModel,
+  nativeSubagentCertification,
   promoteNativeMultiAgent,
   routedCatalogConfigured,
   routedModel,
@@ -56,6 +63,21 @@ const grok = {
   compHash: "grok-oauth-grok-4-5-v1",
   multiAgentVersion: "v2",
 };
+
+test("signed-in picker overlay cannot hide Codex native base entries", () => {
+  const hidden = new Set(["gpt-5.6-luna", "gpt-5.6-sol-1m", "grok-oauth/grok-4.5"]);
+  const native = new Set(["gpt-5.6-luna", "gpt-5.6-sol"]);
+  assert.deepEqual(
+    [...effectivePickerHiddenModels(hidden, native)].sort(),
+    ["gpt-5.6-sol-1m", "grok-oauth/grok-4.5"],
+  );
+  // Login-free aliases deliberately reuse native slugs, so the router policy
+  // applies to every entry in that mode.
+  assert.deepEqual(
+    [...effectivePickerHiddenModels(hidden, native, { loginFree: true })].sort(),
+    [...hidden].sort(),
+  );
+});
 
 test("routed catalog is exposed only when the active provider reaches the router", () => {
   // An absent base URL is the first-install case: setup has not written the
@@ -151,6 +173,84 @@ test("routed models rewrite GPT identity text to the external model name", () =>
   assert.equal(model.multi_agent_version, "v2");
 });
 
+test("routed models can borrow native behavior instructions without inheriting capabilities", () => {
+  const behaviorTemplate = {
+    ...template,
+    slug: "gpt-5.6-sol",
+    base_instructions: "You are Codex, an agent based on GPT-5. SOL_BEHAVIOR",
+    model_messages: {
+      instructions_template: "You are Codex, an agent based on GPT-5. SOL_TEMPLATE {{ personality }}",
+      instructions_variables: { personality_default: "" },
+    },
+    tool_mode: "code_mode_only",
+    use_responses_lite: true,
+  };
+  const model = routedModel(template, { ...grok, behaviorTemplate: "gpt-5.6-sol" }, behaviorTemplate);
+
+  assert.match(model.base_instructions, /based on Grok 4\.5/);
+  assert.match(model.base_instructions, /SOL_BEHAVIOR/);
+  assert.match(model.model_messages.instructions_template, /SOL_TEMPLATE/);
+  assert.equal(model.tool_mode, undefined);
+  assert.equal(model.use_responses_lite, false);
+});
+
+test("routed behavior identity rewriting consumes versioned native GPT names", () => {
+  const behaviorTemplate = {
+    ...template,
+    base_instructions: "You are Codex, an agent based on GPT-5.6-Sol.",
+    model_messages: {
+      instructions_template: "You are Codex, an agent based on GPT-5.6-Sol.",
+    },
+  };
+  const model = routedModel(template, grok, behaviorTemplate);
+
+  assert.match(model.base_instructions, /based on Grok 4\.5\./);
+  assert.doesNotMatch(model.base_instructions, /GPT-5/);
+  assert.doesNotMatch(model.base_instructions, /Grok 4\.5\.6-Sol/);
+  assert.match(model.model_messages.instructions_template, /based on Grok 4\.5\./);
+  assert.doesNotMatch(model.model_messages.instructions_template, /GPT-5/);
+});
+
+test("routed models can opt into a concise execution overlay", () => {
+  const model = routedModel(template, {
+    ...grok,
+    instructionOverlay: "efficient-agentic",
+  });
+  const plain = routedModel(template, grok);
+
+  assert.match(model.base_instructions, /Routed execution discipline/);
+  assert.match(model.base_instructions, /without narrating each routine tool step/);
+  assert.match(model.model_messages.instructions_template, /Routed execution discipline/);
+  assert.doesNotMatch(plain.base_instructions, /Routed execution discipline/);
+});
+
+test("efficient routed execution keeps persistent tool output bounded", () => {
+  const model = routedModel(template, { ...grok, instructionOverlay: "efficient-agentic" });
+  assert.match(model.base_instructions, /minimum sufficient tool output/i);
+  assert.match(model.base_instructions, /large file/i);
+  assert.match(model.base_instructions, /bounded sections/i);
+});
+
+test("efficient routed execution keeps secret-bearing CLI output out of history", () => {
+  const model = routedModel(template, { ...grok, instructionOverlay: "efficient-agentic" });
+  assert.match(model.base_instructions, /credentials/i);
+  assert.match(model.base_instructions, /capture.*output/i);
+  assert.match(model.base_instructions, /safe fields/i);
+});
+
+test("efficient routed execution preflights unfamiliar command and test APIs", () => {
+  const model = routedModel(template, { ...grok, instructionOverlay: "efficient-agentic" });
+  assert.match(model.base_instructions, /unfamiliar.*CLI.*test API/i);
+  assert.match(model.base_instructions, /help.*signatures.*documentation/i);
+});
+
+test("efficient routed execution avoids fragile Windows nested quoting", () => {
+  const model = routedModel(template, { ...grok, instructionOverlay: "efficient-agentic" });
+  assert.match(model.base_instructions, /Windows/i);
+  assert.match(model.base_instructions, /PowerShell.*SQL.*JSON/i);
+  assert.match(model.base_instructions, /here-string.*temporary script/i);
+});
+
 test("routed models are native v2 spawn-agent model overrides", () => {
   const model = routedModel(template, grok);
   assert.equal(model.visibility, "list");
@@ -194,6 +294,25 @@ test("routed models advertise search and image detail only when the registry opt
   });
   assert.equal(capable.supports_search_tool, true);
   assert.equal(capable.supports_image_detail_original, true);
+  const standalone = routedModel(template, {
+    ...grok,
+    searchTool: { mode: "standalone" },
+  });
+  assert.equal(standalone.supports_search_tool, true);
+});
+
+test("routed models can explicitly narrow inherited tool capabilities", () => {
+  const plain = routedModel(template, grok);
+  assert.equal(plain.supports_parallel_tool_calls, false);
+  assert.equal("experimental_supported_tools" in plain, false);
+
+  const narrowed = routedModel(template, {
+    ...grok,
+    supportsParallelToolCalls: false,
+    experimentalSupportedTools: [],
+  });
+  assert.equal(narrowed.supports_parallel_tool_calls, false);
+  assert.deepEqual(narrowed.experimental_supported_tools, []);
 });
 
 test("routed service tiers are explicit and never inherit a paid default", () => {
@@ -304,19 +423,6 @@ test("unverified routed models retain conservative v1 collaboration", () => {
   assert.equal(model.multi_agent_version, "v1");
 });
 
-test("all-models multi-agent mode promotes every selected model to v2", () => {
-  const models = [
-    { slug: "opencode-go/deepseek-v4-flash" },
-    { slug: "qwen-plan/qwen3.8-max", multiAgentVersion: "v1" },
-  ];
-  const promoted = applyAllMultiAgent(models, true);
-  assert.deepEqual(
-    promoted.map((model) => model.multiAgentVersion),
-    ["v2", "v2"],
-  );
-  assert.equal(applyAllMultiAgent(models, false), models);
-});
-
 test("merged catalog preserves native GPT identity while rewriting routed models", () => {
   const merged = buildMergedCatalog({ models: [template] }, [grok]);
   const bySlug = new Map(merged.map((model) => [model.slug, model]));
@@ -324,6 +430,111 @@ test("merged catalog preserves native GPT identity while rewriting routed models
   assert.equal(bySlug.get("gpt-5.5").supports_reasoning_summaries, false);
   assert.match(bySlug.get("grok-oauth/grok-4.5").base_instructions, /based on Grok 4\.5/);
   assert.doesNotMatch(bySlug.get("grok-oauth/grok-4.5").base_instructions, /GPT-5/);
+});
+
+test("merged catalog gives native models first and keeps routed providers contiguous", () => {
+  const nativeOlder = {
+    ...template,
+    slug: "gpt-5.4",
+    display_name: "GPT-5.4",
+    priority: 29,
+  };
+  const routed = [
+    { ...grok, slug: "opencode-go/glm-5.3", provider: "opencode-go", priority: 7 },
+    { ...grok, slug: "deepseek/deepseek-v4-pro", provider: "deepseek", priority: 1 },
+    { ...grok, slug: "antigravity-oauth/gemini-3.7-flash", provider: "antigravity-oauth", priority: 9 },
+    { ...grok, slug: "opencode-zen/zen-r1", provider: "opencode-zen", priority: 4 },
+    { ...grok, slug: "opencode-go-responses/gpt-5.6-luna", provider: "opencode-go-responses", priority: 2 },
+    { ...grok, slug: "grok-oauth/grok-4.5", provider: "grok-oauth", priority: 0 },
+    { ...grok, slug: "antigravity-oauth/gemini-3.1-pro", provider: "antigravity-oauth", priority: 3 },
+  ];
+  const merged = buildMergedCatalog({ models: [nativeOlder, template] }, routed);
+
+  // Routed models stay grouped by the named vendor policy, and each model
+  // keeps the `priority` the operator chose. Picker grouping must not renumber
+  // every routed route past the native maximum, or the low priorities on
+  // certified native v2 spawn routes get crowded out of Codex's override
+  // window.
+  assert.deepEqual(merged.map((model) => model.slug), [
+    "gpt-5.5",
+    "gpt-5.4",
+    "antigravity-oauth/gemini-3.1-pro",
+    "antigravity-oauth/gemini-3.7-flash",
+    "deepseek/deepseek-v4-pro",
+    "opencode-go-responses/gpt-5.6-luna",
+    "opencode-zen/zen-r1",
+    "opencode-go/glm-5.3",
+    "grok-oauth/grok-4.5",
+  ]);
+  assert.deepEqual(
+    merged.map((model) => model.priority),
+    [10, 29, 3, 9, 1, 2, 4, 7, 0],
+  );
+});
+
+test("native gpt-5.2 stays parseable by older Codex catalog readers", () => {
+  const native52 = { ...template, slug: "gpt-5.2" };
+  delete native52.supports_parallel_tool_calls;
+  const merged = buildMergedCatalog({ models: [native52] }, []);
+  assert.equal(merged[0].supports_parallel_tool_calls, true);
+});
+
+test("merged catalog resolves a routed behavior template without inheriting its capabilities", () => {
+  const sol = {
+    ...template,
+    slug: "gpt-5.6-sol",
+    base_instructions: "You are Codex, an agent based on GPT-5. SOL_BEHAVIOR",
+    model_messages: {
+      instructions_template: "You are Codex, an agent based on GPT-5. SOL_TEMPLATE {{ personality }}",
+      instructions_variables: { personality_default: "" },
+    },
+    tool_mode: "code_mode_only",
+    use_responses_lite: true,
+  };
+  const merged = buildMergedCatalog(
+    { models: [template, sol] },
+    [{ ...grok, behaviorTemplate: "gpt-5.6-sol" }],
+  );
+  const routed = merged.find((model) => model.slug === grok.slug);
+
+  assert.match(routed.base_instructions, /SOL_BEHAVIOR/);
+  assert.match(routed.model_messages.instructions_template, /SOL_TEMPLATE/);
+  assert.equal(routed.tool_mode, undefined);
+  assert.equal(routed.use_responses_lite, false);
+});
+
+test("merged catalog derives a missing behavior base instruction from its template", () => {
+  const sol = {
+    slug: "gpt-5.6-sol",
+    model_messages: {
+      instructions_template: "You are Codex, an agent based on GPT-5.6-Sol.",
+    },
+  };
+  const merged = buildMergedCatalog(
+    { models: [template, sol] },
+    [{ ...grok, behaviorTemplate: "gpt-5.6-sol" }],
+  );
+  const routed = merged.find((model) => model.slug === grok.slug);
+
+  assert.match(routed.base_instructions, /based on Grok 4\.5\./);
+  assert.doesNotMatch(routed.base_instructions, /GPT-5/);
+});
+
+test("merged catalog does not inherit native tool mode from a fallback template", () => {
+  const sol = {
+    ...template,
+    slug: "gpt-5.6-sol",
+    tool_mode: "code_mode_only",
+    use_responses_lite: true,
+  };
+  const merged = buildMergedCatalog(
+    { models: [sol] },
+    [{ ...grok, behaviorTemplate: "gpt-5.6-sol" }],
+  );
+  const routed = merged.find((model) => model.slug === grok.slug);
+
+  assert.equal(routed.tool_mode, undefined);
+  assert.equal(routed.use_responses_lite, false);
 });
 
 test("merged catalog preserves an explicit native reasoning summary capability", () => {
@@ -554,10 +765,23 @@ test("models stay untouched when the installed build understands their efforts",
 });
 
 test("native catalog cache is reusable only for the codex build that captured it", () => {
-  const captured = { captured_with: "codex-cli 0.142.5", models: [template] };
+  const captured = {
+    captured_with: "codex-cli 0.142.5",
+    native_source_fingerprint: "account-a",
+    models: [template],
+  };
 
   assert.equal(nativeCatalogIsReusable(captured, "codex-cli 0.142.5"), true);
   assert.equal(nativeCatalogIsReusable(captured, "codex-cli 0.146.1"), false);
+  // Account catalogs change independently of the binary version.
+  assert.equal(
+    nativeCatalogIsReusable(captured, "codex-cli 0.142.5", "account-b"),
+    false,
+  );
+  assert.equal(
+    nativeCatalogIsReusable(captured, "codex-cli 0.142.5", "account-a"),
+    true,
+  );
   // Unknown current version: no binary to re-ask, so keep what we have.
   assert.equal(nativeCatalogIsReusable(captured, undefined), true);
   // Un-stamped caches predate version tracking; re-capture when we can ask.
@@ -585,7 +809,214 @@ test("native GPT-5.6 context windows use the official 1.05M limit", () => {
   assert.equal(models[3], unrelated);
 });
 
-test("native listed models follow the local subagent opt-in", () => {
+test("native catalog merge preserves account visibility and bundled-only models", () => {
+  const accountMini = {
+    slug: "gpt-mini",
+    visibility: "list",
+    source: "account",
+    model_messages: { instructions_template: "account instructions" },
+  };
+  const merged = mergeNativeCatalogs(
+    {
+      models: [
+        accountMini,
+        {
+          slug: "gpt-spark",
+          visibility: "list",
+          model_messages: { instructions_template: "spark instructions" },
+        },
+      ],
+    },
+    {
+      models: [
+        {
+          slug: "gpt-mini",
+          visibility: "hide",
+          source: "bundled",
+          base_instructions: "bundled instructions",
+        },
+        { slug: "gpt-bundled-only", visibility: "list" },
+      ],
+    },
+  );
+  assert.deepEqual(merged.models, [
+    {
+      ...accountMini,
+      base_instructions: "bundled instructions",
+    },
+    {
+      slug: "gpt-spark",
+      visibility: "list",
+      model_messages: { instructions_template: "spark instructions" },
+      base_instructions: "spark instructions",
+    },
+    { slug: "gpt-bundled-only", visibility: "list" },
+  ]);
+});
+
+test("native catalog merge never loses non-empty bundled metadata", () => {
+  const merged = mergeNativeModel(
+    {
+      slug: "gpt-5.6-luna",
+      additional_speed_tiers: [],
+      service_tiers: [],
+      input_modalities: [],
+      experimental_supported_tools: [],
+      include_apps_usage_instructions: undefined,
+      model_messages: {},
+    },
+    {
+      slug: "gpt-5.6-luna",
+      additional_speed_tiers: ["fast"],
+      service_tiers: [
+        { id: "priority", name: "Fast", description: "1.5x speed" },
+      ],
+      input_modalities: ["text", "image"],
+      experimental_supported_tools: ["web_search"],
+      include_apps_usage_instructions: true,
+      model_messages: { instructions_template: "bundled instructions" },
+    },
+  );
+  assert.deepEqual(merged.additional_speed_tiers, ["fast"]);
+  assert.deepEqual(merged.service_tiers, [
+    { id: "priority", name: "Fast", description: "1.5x speed" },
+  ]);
+  assert.deepEqual(merged.input_modalities, ["text", "image"]);
+  assert.deepEqual(merged.experimental_supported_tools, ["web_search"]);
+  assert.equal(merged.include_apps_usage_instructions, true);
+  assert.deepEqual(merged.model_messages, {
+    instructions_template: "bundled instructions",
+  });
+  assert.equal(
+    mergeNativeModel(
+      { slug: "gpt-5.6-luna", visibility: "list" },
+      { slug: "gpt-5.6-luna", visibility: "hide" },
+    ).visibility,
+    "list",
+  );
+});
+
+test("bundled backfill is an allowlist, not every empty account field", () => {
+  const merged = mergeNativeModel(
+    {
+      slug: "gpt-5.6-luna",
+      // An account that lost its effort ladder is expressing exactly that;
+      // resurrecting bundled's ladder would offer efforts it cannot spend.
+      supported_reasoning_levels: [],
+      // Unknown fields never backfill: the allowlist is the whole contract,
+      // so a future schema field starts account-authoritative by default.
+      some_future_field: "",
+      // Empty on both sides stays empty rather than inventing a value.
+      additional_speed_tiers: [],
+    },
+    {
+      slug: "gpt-5.6-luna",
+      supported_reasoning_levels: ["low", "high"],
+      some_future_field: "bundled-value",
+      additional_speed_tiers: [],
+    },
+  );
+  assert.deepEqual(merged.supported_reasoning_levels, []);
+  assert.equal(merged.some_future_field, "");
+  assert.deepEqual(merged.additional_speed_tiers, []);
+});
+
+test("account-only models satisfy the strict custom-catalog instruction schema", () => {
+  const [spark] = mergeNativeCatalogs(
+    {
+      models: [
+        {
+          slug: "gpt-spark",
+          visibility: "list",
+          model_messages: { instructions_template: "spark instructions" },
+        },
+      ],
+    },
+    { models: [{ slug: "other", base_instructions: "other instructions" }] },
+  ).models;
+  assert.equal(spark.base_instructions, "spark instructions");
+});
+
+// The bundled catalog's base_instructions equals the account template with
+// `{{ personality }}` replaced by `instructions_variables.personality_default`
+// (verified against codex-cli for gpt-5.4, gpt-5.4-mini, and gpt-5.5).
+// Account-only models must get the same treatment: the literal placeholder
+// must never reach a system prompt.
+test("derived base_instructions substitutes template variable defaults", () => {
+  assert.equal(
+    deriveBaseInstructions({
+      instructions_template: "You are Codex.\n{{ personality }}\nBe fast.",
+      instructions_variables: {
+        personality_default: "# Personality\nStay neutral.",
+        personality_friendly: "# Personality\nBe warm.",
+      },
+    }),
+    "You are Codex.\n# Personality\nStay neutral.\nBe fast.",
+  );
+  // No default for the placeholder: strip it rather than leaking the token.
+  assert.equal(
+    deriveBaseInstructions({
+      instructions_template: "Intro {{ tone }} outro.",
+      instructions_variables: {},
+    }),
+    "Intro  outro.",
+  );
+  assert.equal(
+    deriveBaseInstructions({ instructions_template: "plain" }),
+    "plain",
+  );
+  assert.equal(deriveBaseInstructions(undefined), undefined);
+});
+
+test("no template placeholder survives into any merged base_instructions", () => {
+  const merged = mergeNativeCatalogs(
+    {
+      models: [
+        {
+          slug: "gpt-spark",
+          model_messages: {
+            instructions_template: "Spark. {{ personality }} End.",
+            instructions_variables: { personality_default: "Calm." },
+          },
+        },
+        {
+          slug: "gpt-undefaulted",
+          model_messages: {
+            instructions_template: "Head {{ mystery }} tail.",
+            instructions_variables: {
+              // A default may itself carry a placeholder; it must be stripped,
+              // not substituted recursively.
+              mystery_default: "nested {{ personality }} token",
+            },
+          },
+        },
+      ],
+    },
+    undefined,
+  );
+  for (const model of merged.models) {
+    assert.equal(typeof model.base_instructions, "string");
+    assert.doesNotMatch(model.base_instructions, /\{\{[\s\S]*?\}\}/);
+  }
+  assert.equal(merged.models[0].base_instructions, "Spark. Calm. End.");
+});
+
+test("duplicate account slugs collapse to the first occurrence", () => {
+  const merged = mergeNativeCatalogs(
+    {
+      models: [
+        { slug: "gpt-dupe", visibility: "list", base_instructions: "first" },
+        { slug: "gpt-dupe", visibility: "hide", base_instructions: "second" },
+      ],
+    },
+    { models: [{ slug: "gpt-dupe", base_instructions: "bundled" }] },
+  );
+  assert.equal(merged.models.length, 1);
+  assert.equal(merged.models[0].base_instructions, "first");
+  assert.equal(merged.models[0].visibility, "list");
+});
+
+test("native listed models retain only repository-certified v2 capability", () => {
   // Upstream still ships gpt-5.6-luna as v1 while it runs fine on the v2
   // backend, and spawn_agent filters child models on that static value.
   const native = [
@@ -603,6 +1034,20 @@ test("native listed models follow the local subagent opt-in", () => {
   assert.equal(promoted[2].multi_agent_version, "v1");
 });
 
+test("native context variants are never advertised as subagent models", () => {
+  const native = [
+    { slug: "gpt-5.6-sol", visibility: "list", multi_agent_version: "v2" },
+    { slug: "gpt-5.6-sol-1m", visibility: "list", multi_agent_version: "v2" },
+  ];
+  const promoted = promoteNativeMultiAgent(native, {
+    mode: "all",
+    enabled: ["gpt-5.6-sol-1m"],
+    disabled: [],
+  });
+  assert.equal(promoted[0].multi_agent_version, "v2");
+  assert.equal(promoted[1].multi_agent_version, "v1");
+});
+
 test("native promotion honours disabled models and picker-hidden slugs", () => {
   const native = [
     { slug: "gpt-5.6-luna", visibility: "list", multi_agent_version: "v1" },
@@ -617,28 +1062,51 @@ test("native promotion honours disabled models and picker-hidden slugs", () => {
   assert.equal(promoted[1].multi_agent_version, "v1");
 });
 
-test("selected subagent mode only promotes the chosen native models", () => {
+test("selected subagent mode does not promote unreviewed native models", () => {
+  const native = [
+    { slug: "gpt-5.4", visibility: "list", multi_agent_version: "v1" },
+    { slug: "gpt-5.3", visibility: "list", multi_agent_version: "v1" },
+  ];
+  const promoted = promoteNativeMultiAgent(native, {
+    mode: "selected",
+    enabled: ["gpt-5.4"],
+    disabled: [],
+  });
+  assert.equal(promoted[0].multi_agent_version, "v1");
+  assert.equal(promoted[1].multi_agent_version, "v1");
+});
+
+test("proven subagent mode still promotes upstream-verified v2-backend slugs", () => {
+  // gpt-5.6-luna is shipped as v1 by upstream but runs on the v2 backend, so
+  // it must be promoted even in the conservative proven mode; an unverified
+  // native slug keeps its upstream value.
   const native = [
     { slug: "gpt-5.6-luna", visibility: "list", multi_agent_version: "v1" },
     { slug: "gpt-5.4", visibility: "list", multi_agent_version: "v1" },
   ];
   const promoted = promoteNativeMultiAgent(native, {
-    mode: "selected",
-    enabled: ["gpt-5.6-luna"],
+    mode: "proven",
+    enabled: [],
     disabled: [],
   });
   assert.equal(promoted[0].multi_agent_version, "v2");
   assert.equal(promoted[1].multi_agent_version, "v1");
 });
 
-test("proven subagent mode leaves the native catalog untouched", () => {
+test("an upstream-verified slug still honours disabled and picker-hidden", () => {
   const native = [{ slug: "gpt-5.6-luna", visibility: "list", multi_agent_version: "v1" }];
-  const promoted = promoteNativeMultiAgent(native, {
-    mode: "proven",
-    enabled: [],
-    disabled: [],
-  });
-  assert.deepEqual(promoted, native);
+  assert.equal(nativeSubagentCertification(native[0]), "v2");
+  const promoted = promoteNativeMultiAgent(
+    native,
+    { mode: "proven", enabled: [], disabled: ["gpt-5.6-luna"] },
+  );
+  assert.equal(promoted[0].multi_agent_version, "v1");
+  const hidden = promoteNativeMultiAgent(
+    native,
+    { mode: "proven", enabled: [], disabled: [] },
+    new Set(["gpt-5.6-luna"]),
+  );
+  assert.equal(hidden[0].multi_agent_version, "v1");
 });
 
 test("a ChatGPT-plan model drives the same advertisement as a routed engine", async () => {
@@ -709,3 +1177,143 @@ test("a bridged text-only model advertises image input, and only through the bri
   // Advertising image input is not a claim about detail handling.
   assert.equal(entry.supports_image_detail_original, false);
 });
+
+
+test("efficient routed execution closes a RED behavior area before switching", () => {
+  const model = routedModel(template, { ...grok, instructionOverlay: "efficient-agentic" });
+  assert.match(model.base_instructions, /RED.*suite.*green.*blocker/i);
+});
+
+test("efficient routed execution invalidates contradicted debugging hypotheses", () => {
+  const model = routedModel(template, { ...grok, instructionOverlay: "efficient-agentic" });
+  assert.match(model.base_instructions, /runtime evidence.*contradict.*hypothesis/i);
+  assert.match(model.base_instructions, /re-?trace.*production.*call path/i);
+});
+
+test("efficient routed execution stops patching after two failed hypotheses", () => {
+  const model = routedModel(template, { ...grok, instructionOverlay: "efficient-agentic" });
+  assert.match(model.base_instructions, /two.*failed hypotheses.*production call path/i);
+});
+
+test("efficient routed execution bounds large reads and defers future-stage research", () => {
+  const model = routedModel(template, { ...grok, instructionOverlay: "efficient-agentic" });
+  assert.match(model.base_instructions, /32 KiB|400 lines/i);
+  assert.match(model.base_instructions, /defer.*research.*stage.*consume/i);
+});
+test("efficient routed execution grounds unfamiliar fixtures in canonical contracts", () => {
+  const model = routedModel(template, { ...grok, instructionOverlay: "efficient-agentic" });
+  assert.match(model.base_instructions, /fixture.*canonical.*schema.*type.*known-good/i);
+});
+
+
+test("efficient routed execution silently substitutes routine missing tools", () => {
+  const model = routedModel(template, { ...grok, instructionOverlay: "efficient-agentic" });
+  assert.match(model.base_instructions, /optional helper.*unavailable.*switch silently/i);
+  assert.match(model.base_instructions, /do not send.*progress message.*fallback/i);
+});
+
+// One whole catalog publication, from a `model-picker.json` in the shape a
+// build older than the allowlist left behind, to the file Codex reads at
+// startup. The unit tests above cover the state transition; this covers the
+// only thing the operator sees, which is whether the models are still in the
+// picker after an update (issue #338).
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+
+function writeCatalogCodexStub(directory) {
+  const windows = process.platform === "win32";
+  const target = path.join(directory, windows ? "codex-picker.cmd" : "codex-picker");
+  const models = JSON.stringify({
+    models: [
+      { slug: "gpt-5.6-sol", display_name: "GPT-5.6 Sol", visibility: "list", priority: 10 },
+    ],
+  });
+  writeFileSync(
+    target,
+    windows
+      ? `@echo off\r\nif "%1"=="--version" (echo codex-cli 99.0.0& exit /b 0)\r\nif "%1"=="login" exit /b 0\r\nif "%1"=="debug" (echo ${models}& exit /b 0)\r\nexit /b 1\r\n`
+      : `#!/bin/sh
+case "$1" in
+  --version) echo 'codex-cli 99.0.0' ;;
+  login) exit 0 ;;
+  debug) printf '%s\\n' '${models}' ;;
+  *) exit 1 ;;
+esac
+`,
+    { mode: 0o755 },
+  );
+  return target;
+}
+
+test(
+  "an update publishes the models a pre-allowlist picker was already showing",
+  { timeout: 30_000 },
+  () => {
+    const codexHome = mkdtempSync(path.join(os.tmpdir(), "codex-router-picker-migration-"));
+    const stateDir = path.join(codexHome, "router-state");
+    mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+    writeFileSync(path.join(codexHome, "config.toml"), 'model = "gpt-5.6-sol"\n', {
+      mode: 0o600,
+    });
+    writeFileSync(
+      path.join(stateDir, "enabled-providers.json"),
+      `${JSON.stringify({ version: 1, providers: ["deepseek"] })}\n`,
+      { mode: 0o600 },
+    );
+    writeFileSync(path.join(stateDir, "deepseek-api-key.secret"), "test-key\n", {
+      mode: 0o600,
+    });
+    // What the previous build wrote: the extended-window variant it seeded
+    // hidden, one model this operator switched off, and no `visible` key --
+    // so the two DeepSeek models absent from the file were the ones showing.
+    writeFileSync(
+      path.join(stateDir, "model-picker.json"),
+      `${JSON.stringify({
+        version: 1,
+        hidden: ["gpt-5.6-sol-1m", "deepseek/deepseek-v4-pro"],
+        seeded: ["gpt-5.6-sol-1m", "deepseek/deepseek-v4-pro"],
+      })}\n`,
+      { mode: 0o600 },
+    );
+
+    try {
+      const catalog = spawnSync(
+        process.execPath,
+        [path.join(repoRoot, "src", "catalog.mjs"), "--refresh-native"],
+        {
+          cwd: repoRoot,
+          encoding: "utf8",
+          env: {
+            ...process.env,
+            CODEX_BIN: writeCatalogCodexStub(codexHome),
+            CODEX_HOME: codexHome,
+            CODEX_ROUTER_STATE_DIR: stateDir,
+            MODEL_ROUTER_STATE_DIR: stateDir,
+            MODEL_ROUTER_TARGET: "codex",
+          },
+        },
+      );
+      assert.equal(catalog.status, 0, catalog.stderr);
+
+      const merged = JSON.parse(
+        readFileSync(path.join(stateDir, "merged-models.json"), "utf8"),
+      );
+      const visibility = new Map(
+        merged.models.map((model) => [String(model.slug), model.visibility]),
+      );
+      assert.equal(visibility.get("deepseek/deepseek-v4-flash"), "list");
+      assert.equal(visibility.get("deepseek/deepseek-v4-flash-vision-exp"), "list");
+      assert.equal(visibility.get("deepseek/deepseek-v4-pro"), "hide");
+      assert.equal(visibility.get("gpt-5.6-sol-1m"), "hide");
+
+      const picker = JSON.parse(
+        readFileSync(path.join(stateDir, "model-picker.json"), "utf8"),
+      );
+      assert.deepEqual(picker.visible, [
+        "deepseek/deepseek-v4-flash",
+        "deepseek/deepseek-v4-flash-vision-exp",
+      ]);
+    } finally {
+      rmSync(codexHome, { recursive: true, force: true });
+    }
+  },
+);

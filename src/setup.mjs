@@ -3,28 +3,36 @@ import { closeSync, openSync, readSync, writeSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { cliSessionDescriptor } from "./cli-session-credential.mjs";
 import { detectLegacyInstallations, applyKnownMigrations, rollbackLatestMigration } from "./legacy-migration.mjs";
 import { grokOAuthStatus } from "./grok-oauth-status.mjs";
-import { PROVIDERS } from "./model-registry.mjs";
+import { antigravityOAuthStatus } from "./antigravity-oauth-status.mjs";
+import { LISTED_MODELS, PROVIDERS, providerNeedsNoKey } from "./model-registry.mjs";
+import { ensureNodeDependencies, isNodeDependencyFailure } from "./node-dependency-install.mjs";
+import { effectiveVisibleModels, setModelSelection } from "./model-picker-state.mjs";
 import { kimiOAuthStatus } from "./oauth-status.mjs";
-import { SOURCE_ROOT } from "./paths.mjs";
+import { SOURCE_ROOT, TARGET } from "./paths.mjs";
 import { credentialStatus } from "./provider-credentials.mjs";
 import {
-  hasSignInCli,
   installOauthCli,
   oauthCliPath,
   oauthLoginArgs,
   providerOnboardingSnapshot,
 } from "./provider-onboarding.mjs";
-import { renderProviderChoices, stepHeader, toggleSelection } from "./setup-ui.mjs";
 import {
-  configuredProviderIds,
+  renderModelChoices,
+  renderProviderChoices,
+  stepHeader,
+  toggleSelection,
+} from "./setup-ui.mjs";
+import {
+  canonicalProviderId,
+  defaultProviderIds,
   selectedConfiguredListedModels,
   validateProviderIds,
   writeProviderSelection,
 } from "./provider-selection.mjs";
-import { trayBundleDir, trayDecision } from "./tray-install.mjs";
+import { writeDiscoveryMode } from "./discovery-mode.mjs";
+import { trayDecision } from "./tray-install.mjs";
 import { resolveVisionEngine } from "./vision-bridge.mjs";
 import {
   readVisionBridgeSettings,
@@ -39,6 +47,8 @@ const runSmoke = args.includes("--smoke-test");
 const selectionOnly = args.includes("--selection-only");
 const withTray = args.includes("--with-tray");
 const noTray = args.includes("--no-tray");
+const noProvider = args.includes("--no-provider");
+const noDiscovery = args.includes("--no-discovery");
 
 const flagOptions = new Set([
   "--guided",
@@ -49,6 +59,8 @@ const flagOptions = new Set([
   "--selection-only",
   "--with-tray",
   "--no-tray",
+  "--no-provider",
+  "--no-discovery",
   "--help",
 ]);
 let setupArgumentError;
@@ -68,6 +80,31 @@ for (let index = 0; index < args.length; index += 1) {
 if (!setupArgumentError && migrateKnown && adoptNativeCatalog) {
   setupArgumentError =
     "--adopt-native-catalog cannot be combined with --migrate-known.";
+}
+// An idle install is exactly "no providers": naming providers, answering the
+// guided picker, or pasting keys alongside it is a contradiction to report,
+// not to guess about. And --no-discovery without --no-provider would select
+// providers that can never authenticate, so the narrower flag requires the
+// wider one.
+if (!setupArgumentError && noProvider && (guided || args.includes("--providers"))) {
+  setupArgumentError = `--no-provider cannot be combined with ${
+    guided ? "--guided" : "--providers"
+  }.`;
+}
+if (!setupArgumentError && noDiscovery && !noProvider) {
+  setupArgumentError = "--no-discovery requires --no-provider.";
+}
+// Children (bin/install, the catalog build, the doctor) must honor the choice
+// before the marker file exists -- and a re-run without the flag must clear a
+// stale environment value just as writeDiscoveryMode clears the marker.
+process.env.CODEX_ROUTER_NO_DISCOVERY = noDiscovery ? "1" : "0";
+// Both act on Codex's own configuration: one replaces an older router's
+// managed block, the other adopts the ChatGPT-plan catalog Codex reads. The
+// harness integration is one settings section and has neither.
+if (!setupArgumentError && TARGET !== "codex" && (migrateKnown || adoptNativeCatalog)) {
+  setupArgumentError = `${
+    migrateKnown ? "--migrate-known" : "--adopt-native-catalog"
+  } applies only to the Codex target.`;
 }
 
 function option(name) {
@@ -106,6 +143,9 @@ Options:
   --selection-only     Save provider selection without installing (development)
   --with-tray          Also build and launch the desktop companion app
   --no-tray            Never offer the desktop companion app
+  --no-provider        Install idle, with no provider selected or configured
+  --no-discovery       With --no-provider: never read credentials, the
+                       Keychain, or other CLIs' sessions; refuse traffic locally
   --help               Show this help
 
 Providers: ${[...PROVIDERS.values()].filter((provider) => !provider.variantOf).map((provider) => provider.id).join(", ")}
@@ -167,9 +207,12 @@ function providerConfigured(provider) {
   if (provider.kind === "oauth") {
     if (provider.id === "kimi-oauth") return kimiOAuthStatus().configured;
     if (provider.id === "grok-oauth") return grokOAuthStatus().configured;
+    if (provider.id === "antigravity-oauth") return antigravityOAuthStatus().configured;
     return false;
   }
-  return credentialStatus(provider, { persistent: true }).configured;
+  return providerNeedsNoKey(provider)
+    ? true
+    : credentialStatus(provider, { persistent: true }).configured;
 }
 
 const colorEnabled = Boolean(process.stdout.isTTY) && !process.env.NO_COLOR;
@@ -200,13 +243,60 @@ function guidedSelection() {
 }
 
 function requestedSelection() {
+  // The idle install asks for nothing, so nothing is scanned to find it: the
+  // defaultProviderIds() fallback below is itself a full credential sweep.
+  if (noProvider) return [];
   const requested = option("--providers");
   if (requested) {
-    if (requested === "configured") return configuredProviderIds();
+    if (requested === "configured") return defaultProviderIds();
     if (requested === "all") return [...PROVIDERS.keys()];
     return validateProviderIds(requested.split(","));
   }
-  return guided ? guidedSelection() : configuredProviderIds();
+  return guided ? guidedSelection() : defaultProviderIds();
+}
+
+function guidedModelSelection(providers) {
+  const selectedProviders = new Set(providers);
+  const models = LISTED_MODELS.filter((model) =>
+    selectedProviders.has(canonicalProviderId(model.provider))
+  );
+  if (models.length === 0) {
+    process.stdout.write("\nThe selected providers have no preselected models.\n");
+    return { models, selectedSlugs: [] };
+  }
+
+  // Pre-check what the picker is showing right now, which on a machine that
+  // has never had one is nothing: router models are opt-in, and enabling a
+  // provider must not put its whole catalog in the picker on one keystroke
+  // (the policy `src/catalog.mjs` states at its `seedModelsHidden` call). On a
+  // re-run this is instead the operator's existing picker, so pressing Enter
+  // through this step changes nothing.
+  const visible = effectiveVisibleModels(models.map((model) => model.slug));
+  let selected = new Set(
+    models
+      .map((model, index) => (visible.has(model.slug) ? index + 1 : undefined))
+      .filter(Boolean),
+  );
+  process.stdout.write("\nChoose models from the selected providers:\n");
+  for (;;) {
+    process.stdout.write(`${renderModelChoices(models, selected)}\n`);
+    const raw = promptLine(
+      "Toggle model numbers (comma-separated), a=all, n=none; Enter to continue",
+    );
+    const result = toggleSelection(selected, raw, models.length, { allowEmpty: true });
+    selected = result.selected;
+    if (result.error) {
+      process.stdout.write(`${result.error}\n`);
+    } else if (result.done) {
+      break;
+    }
+  }
+  return {
+    models,
+    selectedSlugs: [...selected]
+      .sort((a, b) => a - b)
+      .map((position) => models[position - 1].slug),
+  };
 }
 
 function run(command, commandArgs, options = {}) {
@@ -222,19 +312,38 @@ function run(command, commandArgs, options = {}) {
   return result.status ?? 1;
 }
 
-function configureProvider(provider) {
+function oauthSetupHint(provider) {
+  if (provider.id === "grok-oauth") return "run `grok login --oauth`";
+  if (provider.id === "antigravity-oauth") {
+    const command = process.platform === "win32"
+      ? ".\\codex-router.ps1 providers login antigravity-oauth"
+      : "./bin/providers login antigravity-oauth";
+    return `run \`${command}\``;
+  }
+  return "run `kimi login`";
+}
+
+async function configureProvider(provider) {
   if (providerConfigured(provider)) return;
-  const session = cliSessionDescriptor(provider);
   if (!guided) {
     const setup =
       provider.kind === "oauth"
-        ? "sign in with the provider's official CLI"
-        : session
-          ? `run \`${session.loginCommand}\` or \`./bin/provider-key ${provider.id} set\``
-          : `run \`./bin/provider-key ${provider.id} set\``;
+        ? oauthSetupHint(provider)
+        : `run \`./bin/provider-key ${provider.id} set\``;
     throw incomplete(`${provider.displayName} is selected but not configured; ${setup} first.`);
   }
   if (provider.kind === "oauth") {
+    if (provider.id === "antigravity-oauth") {
+      if (!confirm(`Open a browser to sign in to ${provider.displayName} now?`)) {
+        throw incomplete(`${provider.displayName} sign-in was cancelled.`);
+      }
+      const { signInAntigravity } = await import("./antigravity-oauth-onboarding.mjs");
+      await signInAntigravity();
+      if (!providerConfigured(provider)) {
+        throw incomplete(`${provider.displayName} sign-in did not produce a usable credential.`);
+      }
+      return;
+    }
     let cli = oauthCliPath(provider.id);
     if (!cli) {
       if (!confirm(`Install the official ${provider.displayName} CLI with npm now?`)) {
@@ -253,31 +362,14 @@ function configureProvider(provider) {
       throw incomplete(`${provider.displayName} sign-in did not produce a usable credential.`);
     }
   } else {
-    // A provider whose CLI mints its key in the browser gets that offer first,
-    // because most people have an account long before they have a key. Saying
-    // no falls through to the key prompt rather than failing the install.
-    if (session && hasSignInCli(provider.id) && signInToProvider(provider)) return;
+    if (["anonymous", "per-model"].includes(provider.authMode)) return;
     const prompt = provider.credential?.prompt || `${provider.displayName} API key`;
     if (!confirm(`Enter ${prompt} securely now?`)) {
       throw incomplete(`${provider.displayName} setup was cancelled.`);
     }
+    ensureNodeDependencies();
     run(process.execPath, [path.join(SOURCE_ROOT, "src", "provider-key.mjs"), provider.id, "set"]);
   }
-}
-
-// Returns true only when the sign-in actually produced a usable credential, so
-// the caller can fall back to the API key path for every other outcome.
-function signInToProvider(provider) {
-  if (!confirm(`Sign in to ${provider.displayName} in your browser now?`)) return false;
-  let cli = oauthCliPath(provider.id);
-  if (!cli) {
-    if (!confirm(`Install the official ${provider.displayName} CLI with npm now?`)) return false;
-    installOauthCli(provider.id);
-    cli = oauthCliPath(provider.id);
-    if (!cli) return false;
-  }
-  run(cli, oauthLoginArgs(provider.id));
-  return providerConfigured(provider);
 }
 
 // Best-effort: the router install has already succeeded, so a companion-app
@@ -293,10 +385,28 @@ function installTray() {
         );
         return;
       }
-      const bundleDir = trayBundleDir("darwin", os.homedir());
-      run(path.join(SOURCE_ROOT, "scripts", "build-macos-tray-app.sh"), [bundleDir]);
-      run("open", [bundleDir]);
-      process.stdout.write(`Menu-bar companion installed at ${bundleDir} and opened.\n`);
+      // One canonical transaction stages the signed bundle, drains any
+      // running embedded Control Center, swaps atomically, stamps the build,
+      // and hands the native host to launchd.
+      run(path.join(SOURCE_ROOT, "bin", "model-router-tray"), []);
+      process.stdout.write("Codex Router installed with its native menu-bar tray and Control Center.\n");
+    } else if (process.platform === "win32") {
+      // Windows had no path through here at all: the tray was built by hand or
+      // not at all, and nothing brought it back after a reboot. `tray install`
+      // builds when the sources moved, stamps the build, and registers the
+      // logon task that starts it now and at every logon -- the same entry
+      // point a user runs by hand, so the sequence exists once instead of
+      // drifting between the installer and the CLI.
+      run("powershell.exe", [
+        "-NoLogo",
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        path.join(SOURCE_ROOT, "codex-router.ps1"),
+        "tray",
+        "install",
+      ]);
     } else {
       run(path.join(SOURCE_ROOT, "bin", "model-router-tray"), []);
       process.stdout.write("Desktop companion built and launched.\n");
@@ -307,7 +417,12 @@ function installTray() {
         (process.platform === "darwin"
           ? "Recent macOS SDKs need the full Xcode app (not only the Command Line Tools) to build the menu-bar companion's SwiftUI macros.\n"
           : "") +
-        "The router itself is installed; retry later with ./bin/model-router-tray.\n",
+        (process.platform === "win32"
+          ? "The router itself is installed; retry later with .\\codex-router.ps1 tray.\n"
+          : "The router itself is installed; retry later with ./bin/model-router-tray.\n") +
+        // Nothing to build and nothing to download, so it is the one suggestion
+        // that cannot fail for the same reason this just did.
+        "The companion also runs in a browser: .\\codex-router.ps1 panel (./bin/panel on macOS and Linux).\n",
     );
   }
 }
@@ -323,7 +438,9 @@ async function main() {
       `An unknown model router owns ${legacy.config.modelCatalogJson}; automatic setup will not replace it.`,
     );
   }
-  const stepTitles = ["Choose providers", "Connect credentials"];
+  const stepTitles = ["Choose providers"];
+  if (guided) stepTitles.push("Choose models");
+  stepTitles.push("Connect credentials");
   if (legacy.installations.length) stepTitles.push("Migrate older router");
   stepTitles.push("Review and install");
   let stepIndex = 0;
@@ -343,10 +460,17 @@ async function main() {
       ? error
       : incomplete(error instanceof Error ? error.message : String(error));
   }
-  if (providers.length === 0) {
+  if (providers.length === 0 && !noProvider) {
     throw incomplete(
       "No configured provider was found. Run `./bin/setup --guided` or pass `--providers` after configuring credentials.",
     );
+  }
+  let modelChoices = [];
+  let selectedModelSlugs = [];
+  if (guided) {
+    nextStep("Choose models");
+    ({ models: modelChoices, selectedSlugs: selectedModelSlugs } =
+      guidedModelSelection(providers));
   }
   nextStep("Connect credentials");
   // Credentials are addable after the install, and the router already reports
@@ -359,15 +483,25 @@ async function main() {
   for (const id of providers) {
     const provider = PROVIDERS.get(id);
     try {
-      configureProvider(provider);
+      await configureProvider(provider);
     } catch (error) {
       if (!guided) throw error;
+      // The leniency above is about credential prompts. A dependency install
+      // that failed has emptied node_modules, so nothing later in this run
+      // works and no key the user could add afterwards would fix it; reporting
+      // it as "this provider still needs a credential" sends them after the
+      // wrong thing. Let it out so the installer restores the checkout.
+      if (isNodeDependencyFailure(error)) throw error;
       const reason = error instanceof Error ? error.message : String(error);
       pendingCredentials.push({ provider, reason });
       process.stderr.write(`\nWarning: ${provider.displayName} was not configured (${reason})\n`);
     }
   }
   writeProviderSelection(providers);
+  // Written on every run, not only idle ones: re-running setup without
+  // --no-discovery is the exit path from idle mode, so a normal install must
+  // clear the marker just as an idle install sets it.
+  writeDiscoveryMode(noDiscovery);
 
   // Pasted images just work for text-only models: the bridge is on by default,
   // so the installer no longer writes anything here. It used to auto-enable
@@ -401,22 +535,42 @@ async function main() {
   }
 
   if (selectionOnly) {
-    process.stdout.write(`${JSON.stringify({ providers, migration }, null, 2)}\n`);
+    process.stdout.write(
+      `${JSON.stringify({ providers, ...(guided ? { models: selectedModelSlugs } : {}), migration }, null, 2)}\n`,
+    );
     return;
   }
 
   nextStep("Review and install");
+  const dshTarget = TARGET === "dsh";
+  // Like the harness, Gemini CLI has no native catalog to adopt: that list is
+  // the ChatGPT-plan model set Codex publishes for itself.
+  const geminiTarget = TARGET === "gemini";
   if (guided) {
     process.stdout.write(
       `\nReady to install:\n` +
-        `  Providers: ${providers.join(", ")}\n` +
+        `  Providers: ${providers.length ? providers.join(", ") : "none (idle install)"}\n` +
+        `  Models: ${selectedModelSlugs.length ? selectedModelSlugs.join(", ") : "none"}\n` +
         `  Migration: ${migration ? "recognized older router (rollback snapshot kept)" : "none needed"}\n` +
-        `  Native catalog: ${adoptNativeCatalog ? "adopt existing user catalog" : "capture from Codex"}\n` +
-        `  Changes: per-user background service and the managed Codex config block\n`,
+        (dshTarget
+          ? `  Changes: per-user background service and one provider route in the harness settings document\n`
+          : geminiTarget
+            ? `  Changes: per-user background service and one managed block in Gemini CLI's environment file\n`
+            : `  Native catalog: ${adoptNativeCatalog ? "adopt existing user catalog" : "capture from Codex"}\n` +
+              `  Changes: per-user background service and the managed Codex config block\n`),
     );
     if (!confirm("Proceed?")) {
       throw incomplete("Setup was cancelled before installing the service.");
     }
+  }
+
+  // Below the confirmation, and below the `--selection-only` return above it:
+  // model visibility is the operator's existing configuration, so a cancelled
+  // setup and a selection-only run must both leave `model-picker.json` exactly
+  // as they found it. Steps that only report a choice may run before the
+  // answer; the step that rewrites protected state may not.
+  if (guided) {
+    setModelSelection(modelChoices.map((model) => model.slug), selectedModelSlugs);
   }
 
   try {
@@ -453,8 +607,20 @@ async function main() {
     run(process.execPath, [path.join(SOURCE_ROOT, "src", "smoke-test.mjs"), "--yes"]);
   }
   run(process.execPath, [path.join(SOURCE_ROOT, "src", "doctor.mjs")]);
+  const providerSummary = providers.length
+    ? providers.join(", ")
+    : "no providers (idle install; traffic gets a local error until one is enabled)";
   process.stdout.write(
-    `\nCodex Router is ready with: ${providers.join(", ")}\nFully quit Codex, reopen it, and start a new task.\n`,
+    dshTarget
+      ? `\nDeepSeek Harness is ready with: ${providerSummary}\n` +
+        `It reloads its settings document on the next request, so there is nothing to restart.\n` +
+        `For native GPT models, run \`codex login\`, then \`./bin/model-router codex chatgpt-session enable\` once; that authorization is shared by every local client.\n`
+      : geminiTarget
+        ? `\nGemini CLI is ready with: ${providerSummary}\n` +
+          `It reads its environment at startup, so the next \`gemini\` run picks this up.\n` +
+          `If it asks how to authenticate, choose "Use Gemini API key" once -- the key is this router's local caller capability.\n` +
+          `For native GPT models, run \`codex login\`, then \`./bin/model-router codex chatgpt-session enable\` once; that authorization is shared by every local client.\n`
+        : `\nCodex Router is ready with: ${providerSummary}\nFully quit Codex, reopen it, and start a new task.\n`,
   );
   if (visionBridge?.enabled && visionBridge.engine) {
     process.stdout.write(
@@ -474,13 +640,10 @@ async function main() {
         pendingCredentials
           .map(({ provider }) => {
             if (provider.kind === "oauth") {
-              return `  ${provider.displayName}: sign in with the provider's official CLI\n`;
+              return `  ${provider.displayName}: ${oauthSetupHint(provider)}\n`;
             }
-            const session = cliSessionDescriptor(provider);
             const key = `./bin/provider-key ${provider.id} set`;
-            return session
-              ? `  ${provider.displayName}: ${session.loginCommand}, or ${key}\n`
-              : `  ${provider.displayName}: ${key}\n`;
+            return `  ${provider.displayName}: ${key}\n`;
           })
           .join("") +
         `These providers stay selected and start working as soon as a key is stored.\n`,

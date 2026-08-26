@@ -26,7 +26,6 @@ function isolatedEnvironment(testRoot, extra = {}) {
     CODEX_ROUTER_SKIP_LAUNCHCTL: "1",
     KIMI_CODE_HOME: path.join(testRoot, "kimi-code"),
     GROK_AUTH_PATH: path.join(testRoot, "grok", "auth.json"),
-    COMMANDCODE_CLI_HOME: path.join(testRoot, "commandcode"),
     CHUTES_API_KEY: "",
     CHUTES_API_BASE_URL: "",
     ...extra,
@@ -58,7 +57,7 @@ test("the macOS tray labels Chutes as a metered API route", () => {
   );
   assert.match(
     sourceLabel,
-    /\["deepseek", "chutes"\]\.contains\(provider\)[\s\S]*return "METERED API"/,
+    /\["deepseek", "chutes", "orca"\]\.contains\(provider\)[\s\S]*return "METERED API"/,
   );
 });
 
@@ -139,7 +138,9 @@ test("Chutes public-catalog fixtures drive discovery, deterministic curation, an
     const fixture = path.join(testRoot, "models.json");
     writeFileSync(fixture, JSON.stringify({
       data: [
-        { id: "moonshotai/Kimi-K3-TEE", object: "model" },
+        { id: "moonshotai/Kimi-K3-TEE", object: "model", context_length: 262144 },
+        // A record the catalog sizes in silence: curation falls back rather
+        // than inventing a window for it.
         { id: "zai-org/GLM-5.2-TEE", object: "model" },
       ],
     }));
@@ -149,13 +150,25 @@ test("Chutes public-catalog fixtures drive discovery, deterministic curation, an
       env,
     );
     assert.equal(discovery.status, 0, discovery.stderr);
-    assert.deepEqual(JSON.parse(discovery.stdout), {
+    const discovered = JSON.parse(discovery.stdout);
+    // A fixture comparison is not what the provider serves, so it is answered
+    // live and never stored.
+    assert.equal(discovered.cached, false);
+    assert.equal(discovered.stale, false);
+    assert.ok(discovered.fetchedAt);
+    assert.deepEqual({ ...discovered, cached: undefined, stale: undefined, fetchedAt: undefined }, {
       provider: "chutes",
       discovered: ["moonshotai/Kimi-K3-TEE", "zai-org/GLM-5.2-TEE"],
       metadataById: {},
       registered: [],
       unregistered: ["moonshotai/Kimi-K3-TEE", "zai-org/GLM-5.2-TEE"],
+      addable: ["moonshotai/Kimi-K3-TEE", "zai-org/GLM-5.2-TEE"],
+      blocked: {},
       unavailable: [],
+      contextLengths: { "moonshotai/Kimi-K3-TEE": 262144 },
+      cached: undefined,
+      stale: undefined,
+      fetchedAt: undefined,
       note: "Discovery never edits the registry. New models must pass the live compatibility test before they are listed in Codex.",
     });
 
@@ -176,6 +189,11 @@ test("Chutes public-catalog fixtures drive discovery, deterministic curation, an
     assert.equal(stored.models[0].provider, "chutes");
     assert.equal(stored.models[0].upstreamModel, "moonshotai/Kimi-K3-TEE");
     assert.equal(stored.models[0].requestProfile, undefined);
+    // The catalog said how big this model is, so curation stores that rather
+    // than the conservative 131072 guess -- and the compaction threshold
+    // Codex reads follows from it (#266).
+    assert.equal(stored.models[0].contextWindow, 262144);
+    assert.equal(stored.models[0].autoCompact, 222822);
     assert.deepEqual(
       stored.models[0].reasoningLevels.map((level) => level.effort),
       ["high"],

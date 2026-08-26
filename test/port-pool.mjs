@@ -25,7 +25,11 @@ import { fileURLToPath } from "node:url";
 //
 // Nothing here serializes: the blocks are disjoint by construction, so no test
 // file ever waits on another.
-const FIRST_PORT = 20_000;
+// Keep the pool comfortably above the privileged/system-service range while
+// leaving enough non-ephemeral space for large integration files. The routing
+// suite now needs 75 distinct listeners; starting at 20,000 divided the range
+// into only 74 ports once the Control Center tests were added.
+const FIRST_PORT = 10_000;
 // One below Linux's default ephemeral floor of 32768.
 const LAST_PORT = 32_767;
 const MAX_BLOCK = 256;
@@ -95,9 +99,18 @@ export async function freePort() {
   for (let offset = 0; offset < block.size; offset += 1) {
     const port = block.start + offset;
     if (issued.has(port)) continue;
+    // Claimed before the probe, not after it. Callers draw several ports at
+    // once (`Promise.all(Array.from({ length: 6 }, freePort))`), and with the
+    // claim on the far side of the `await` every one of those starts at the
+    // same offset and they sort themselves out only by colliding on the bind:
+    // six draws deliberately provoke fifteen EADDRINUSE failures. That is
+    // wasteful everywhere and worse on Windows, where each losing bind is a
+    // socket the next attempt has to wait out. Claiming first makes concurrent
+    // draws walk disjoint offsets and never contend at all. A port that then
+    // probes busy stays claimed: it is not usable this run either way.
+    issued.add(port);
     // eslint-disable-next-line no-await-in-loop -- probing in order is the point
     if (!(await isFree(port))) continue;
-    issued.add(port);
     return port;
   }
   throw new Error(

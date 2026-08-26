@@ -30,8 +30,12 @@
       "inputModalities": [
         "text"
       ],
+      "searchTool": {
+        "mode": "standalone"
+      },
       "requestProfile": "deepseek-thinking",
-      "compHash": "deepseek-v4-flash-v1"
+      "supportsReasoningSummaries": true,
+      "compHash": "deepseek-v4-flash-v2"
     }
   ]
 }

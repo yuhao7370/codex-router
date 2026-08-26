@@ -45,10 +45,12 @@ Router state lives under `$CODEX_HOME/codex-router` by default:
 | `xai-api-key.secret` | Optional xAI key | `600` |
 | `anthropic-api-key.secret` | Optional Anthropic key | `600` |
 | `github-copilot-token.secret` | Optional fine-grained GitHub token with Copilot Requests permission | `600` |
+| `orcarouter-api-key.secret` | Optional OrcaRouter API key | `600` |
 | `native-models.json` | Cached native Codex catalog | `600` |
 | `merged-models.json` | Native plus registry model catalog | `600` |
 | `litellm.yaml` | Generated routes with environment references only | `600` |
 | `enabled-providers.json` | Picker visibility, no credential values | `600` |
+| `provider-catalog-cache.json` | Model ids each provider published, no credential values | `600` |
 | `install-manifest.json` | Installed version and rollback metadata | `600` |
 | `migrations/` | Protected config/service rollback snapshots | private |
 | `support/` | Locally generated diagnostic bundles | `600` files |
@@ -102,6 +104,17 @@ HTTPS GitHub Copilot hosts before the token is sent. A base URL override is
 trusted-user configuration and receives the same token, so it must be protected
 like every other provider override. Validated account routing is cached briefly
 in process memory and refreshed once after an upstream 401.
+
+An install made with `--no-provider --no-discovery` (see
+[docs/INSTALL.md](docs/INSTALL.md)) is verifiable in this frame: zero provider
+credential reads or writes, zero Keychain lookups, zero reads of other CLIs'
+OAuth or session files, zero reads of Codex's `auth.json`, no `codex login
+status` spawn against the real `CODEX_HOME`, and no outbound provider or
+native connection — traffic gets a local `503 router_idle_no_provider`. Every
+credential reader funnels through the persisted `discovery-mode.json`
+kill-switch. The one Codex spawn that remains during install is `codex debug
+models --bundled`, which reads the binary's static model list, not
+credentials.
 
 ## Configuration safety
 

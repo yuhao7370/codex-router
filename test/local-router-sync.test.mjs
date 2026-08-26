@@ -7,9 +7,30 @@ import test from "node:test";
 const dir = mkdtempSync(path.join(os.tmpdir(), "cr-local-router-sync-"));
 process.env.CODEX_ROUTER_STATE_DIR = dir;
 
-const { mergeLocalRouterModels, planLocalRouterRemovals } = await import(
+const {
+  cleanLocalRouterModels,
+  mergeLocalRouterModels,
+  planLocalRouterRemovals,
+  syncLocalRouterModels,
+} = await import(
   "../src/local-router-sync.mjs"
 );
+
+test("sync and cleanup bypass the provider catalog cache", async () => {
+  const calls = [];
+  const discover = async (...args) => {
+    calls.push(args);
+    return { discovered: [], metadataById: {}, unavailable: [], unregistered: [] };
+  };
+
+  await syncLocalRouterModels({ discover });
+  await cleanLocalRouterModels({ discover });
+
+  assert.deepEqual(calls, [
+    ["local-router", { refresh: true }],
+    ["local-router", { refresh: true }],
+  ]);
+});
 
 test("folds new local-router models into user models and keeps others", () => {
   const existing = [

@@ -5,6 +5,7 @@ import {
   mkdirSync,
   readFileSync,
   renameSync,
+  statfsSync,
   writeFileSync,
 } from "node:fs";
 import os from "node:os";
@@ -18,6 +19,21 @@ import {
 } from "./provider-selection.mjs";
 import { STATE_DIR } from "./paths.mjs";
 import { readUserModels, userModelEntry, writeUserModels } from "./user-models.mjs";
+import {
+  canonicalLocalModelTag,
+  localModelDisplayName,
+  splitLocalModelTag,
+} from "./local-model-ref.mjs";
+import {
+  localOllamaRuntimeSnapshot,
+  ollamaCommand,
+  ollamaModelsPath,
+} from "./ollama-runtime.mjs";
+import { readLocalDownload, writeLocalDownload } from "./local-download.mjs";
+import {
+  EXPLORE_LOCAL_MODELS,
+  LOCAL_FAMILY_RESEARCH,
+} from "./local-ollama-catalog.mjs";
 // The vision catalog is measured against a known image, so image readers are
 // taken from there rather than guessed at a second time here.
 import { LOCAL_VISION_CATALOG as VISION_CATALOG } from "./vision-host.mjs";
@@ -70,6 +86,13 @@ function writeSelection(selection) {
 
 export const LOCAL_PROVIDER_ID = "local";
 
+function localOllamaBinary(spawn) {
+  // Tests inject a fake spawn and expect the stable CLI name. The real path can
+  // be the app bundle or a package-manager install, so production calls use
+  // the runtime manager's resolved executable.
+  return spawn === spawnSync ? ollamaCommand() || "ollama" : "ollama";
+}
+
 // Local models sort after every cloud model in the picker: they are slower and
 // smaller, so they should not displace a paid flagship at the top of the list.
 const LOCAL_MODEL_PRIORITY = 900;
@@ -95,9 +118,15 @@ const LOCAL_AUTO_COMPACT = 28000;
 export function setLocalModelEnabled(tag, enabled, { capabilitiesFor } = {}) {
   const value = String(tag || "").trim();
   if (!value) throw new Error("A model tag is required.");
-  const current = new Set(readLocalModelSelection().enabled);
-  if (enabled) current.add(value);
-  else current.delete(value);
+  // Store one spelling per model. The downloader normalizes to `gemma3:latest`
+  // while the CLI used to store whatever was typed, so a set keyed on the raw
+  // string could hold both and `set gemma3 off` would clear neither. Dropping
+  // every spelling first also migrates those older entries on the next write.
+  const canonical = canonicalLocalModelTag(value);
+  const remaining = readLocalModelSelection().enabled.filter(
+    (entry) => canonicalLocalModelTag(entry) !== canonical,
+  );
+  const current = new Set(enabled ? [...remaining, canonical] : remaining);
   const selection = writeSelection({ version: 1, enabled: [...current].sort() });
   syncLocalUserModels({ enabled: selection.enabled, ...(capabilitiesFor ? { capabilitiesFor } : {}) });
   // Checking a model is the operator saying they want it available, so the
@@ -138,6 +167,12 @@ export function syncLocalUserModels({
   const publishable = enabled.filter((tag) => capabilitiesFor(tag).includes("tools"));
   const entries = publishable.map((tag, index) => {
     const capabilities = capabilitiesFor(tag);
+    let displayName;
+    try {
+      displayName = localModelDisplayName(tag);
+    } catch {
+      displayName = String(tag);
+    }
     return {
       ...userModelEntry({
         providerId: LOCAL_PROVIDER_ID,
@@ -150,7 +185,7 @@ export function syncLocalUserModels({
           inputModalities: capabilities.includes("vision") ? ["text", "image"] : ["text"],
           contextWindow: LOCAL_CONTEXT_WINDOW,
           autoCompact: LOCAL_AUTO_COMPACT,
-          description: `${tag} running locally through Ollama on this machine.`,
+          description: `${displayName} running locally through Ollama on this machine.`,
         },
       }),
       // Marked experimental in the picker itself. Vision is proven -- a local
@@ -158,7 +193,7 @@ export function syncLocalUserModels({
       // Codex turn is not: a model can pass this check and fail the same one
       // minutes later, and the label has to say so where the choice is made,
       // not only in a doc nobody opens mid-task.
-      displayName: `${tag} (local, experimental)`,
+      displayName: `${displayName} (local, experimental)`,
       // Codex's apply_patch is a freeform custom tool, which has no
       // representation in Ollama's tool schema: it arrives mangled or not at
       // all, and the model is left guessing at a toolset it cannot see. Opting
@@ -188,7 +223,13 @@ const REGISTRY_BASE =
 // has it and still emits tool calls as plain text. So this reports "the model
 // claims tools", and only a real request proves it.
 export async function fetchRegistryCapabilities(tag, { fetchImpl = fetch, timeoutMs = 6000 } = {}) {
-  const [name, version = "latest"] = String(tag).split(":");
+  let identity;
+  try {
+    identity = splitLocalModelTag(tag);
+  } catch {
+    return undefined;
+  }
+  const { name, variant: version } = identity;
   if (!name) return undefined;
   const base = `${REGISTRY_BASE}/v2/library/${encodeURIComponent(name)}`;
   try {
@@ -208,18 +249,40 @@ export async function fetchRegistryCapabilities(tag, { fetchImpl = fetch, timeou
     // hand back the raw quotient, so a model whose template could not be read
     // reported "18.556700222 GB" in the tray while its neighbours read "18.6".
     const sizeGb = Math.round((bytes / 1e9) * 10) / 10;
-    if (!template?.digest) return { tag, tools: false, sizeGb };
+    const digest = manifest.headers?.get?.("docker-content-digest") || parsed?.config?.digest;
+    if (!template?.digest) {
+      return {
+        tag,
+        tools: false,
+        sizeGb,
+        digest: digest || null,
+        family: identity.family,
+        variant: identity.variant,
+      };
+    }
     // Blob URLs redirect to a CDN, so the fetch has to follow them.
     const blob = await fetchImpl(`${base}/blobs/${template.digest}`, {
       redirect: "follow",
       signal: AbortSignal.timeout(timeoutMs),
     });
-    if (!blob.ok) return { tag, tools: false, sizeGb };
+    if (!blob.ok) {
+      return {
+        tag,
+        tools: false,
+        sizeGb,
+        digest: digest || null,
+        family: identity.family,
+        variant: identity.variant,
+      };
+    }
     const text = await blob.text();
     return {
       tag,
       tools: /\{\{[^}]*\.Tools/i.test(text),
       sizeGb,
+      digest: digest || null,
+      family: identity.family,
+      variant: identity.variant,
     };
   } catch {
     // Offline or an unknown tag: the install proceeds unannotated rather than
@@ -302,7 +365,7 @@ export function localModelCapabilities(tag, id, { spawn = spawnSync, cache } = {
   const key = id || tag;
   if (store[key]) return store[key];
   try {
-    const result = spawn("ollama", ["show", tag], { encoding: "utf8" });
+    const result = spawn(localOllamaBinary(spawn), ["show", tag], { encoding: "utf8" });
     if (result.status !== 0 || typeof result.stdout !== "string") return [];
     const capabilities = parseOllamaCapabilities(result.stdout);
     store[key] = capabilities;
@@ -338,7 +401,7 @@ export function parseOllamaList(stdout) {
 
 export function localModelInventory({ spawn = spawnSync } = {}) {
   try {
-    const result = spawn("ollama", ["list"], { encoding: "utf8" });
+    const result = spawn(localOllamaBinary(spawn), ["list"], { encoding: "utf8" });
     if (result.status !== 0 || typeof result.stdout !== "string") return [];
     return parseOllamaList(result.stdout);
   } catch {
@@ -351,12 +414,19 @@ export function localModelInventory({ spawn = spawnSync } = {}) {
 // request pays a load penalty the operator should be able to see coming.
 export function runningLocalModels({ spawn = spawnSync } = {}) {
   try {
-    const result = spawn("ollama", ["ps"], { encoding: "utf8" });
+    const result = spawn(localOllamaBinary(spawn), ["ps"], { encoding: "utf8" });
     if (result.status !== 0 || typeof result.stdout !== "string") return [];
     return parseOllamaList(result.stdout).map((entry) => entry.tag);
   } catch {
     return [];
   }
+}
+
+// Answers "is this model checked?" across spellings, so a caller holding
+// `gemma3` and a state file holding `gemma3:latest` agree.
+export function isLocalModelEnabled(tag, selection = readLocalModelSelection()) {
+  const canonical = canonicalLocalModelTag(tag);
+  return selection.enabled.some((entry) => canonicalLocalModelTag(entry) === canonical);
 }
 
 // Deleting reclaims gigabytes and cannot be undone without downloading again,
@@ -367,7 +437,7 @@ export function removeLocalModel(tag, { spawn = spawnSync, confirmed = false, ca
   if (!confirmed) {
     throw new Error(`Removing ${value} deletes it from disk. Pass --yes to confirm.`);
   }
-  const result = spawn("ollama", ["rm", value], { encoding: "utf8" });
+  const result = spawn(localOllamaBinary(spawn), ["rm", value], { encoding: "utf8" });
   if (result.status !== 0) {
     const detail = String(result.stderr || "").trim();
     throw new Error(`\`ollama rm ${value}\` failed${detail ? `: ${detail}` : "."}`);
@@ -387,26 +457,47 @@ export function localModelsSnapshot({
   benchmarks = {},
   capabilities,
   agentChecks = readAgentChecks(),
+  runtime = localOllamaRuntimeSnapshot(),
 } = {}) {
-  const enabled = new Set(selection.enabled);
+  // Compared canonically: `ollama list` always prints `gemma3:latest`, while an
+  // older state file may hold the bare `gemma3` the CLI once stored. Matching
+  // on the raw string showed such a model as unchecked even though it routed.
+  const enabled = new Set(selection.enabled.map((tag) => canonicalLocalModelTag(tag)));
   const runningSet = new Set(running);
   const cache = capabilities;
   const models = inventory.map((entry) => {
     const caps = cache
       ? cache[entry.tag] || []
       : localModelCapabilities(entry.tag, entry.id);
+    let identity;
+    try {
+      identity = splitLocalModelTag(entry.tag);
+    } catch {
+      identity = { family: entry.tag, variant: "latest" };
+    }
+    const measured = benchmarks[entry.tag];
     return {
       ...entry,
+      family: identity.family,
+      variant: identity.variant,
       capabilities: caps,
-      enabled: enabled.has(entry.tag),
+      enabled: enabled.has(canonicalLocalModelTag(entry.tag)),
       running: runningSet.has(entry.tag),
       // Reported by Ollama, not guessed from the name.
       vision: caps.includes("vision"),
       // Codex drives models through tool calls, so a model without them can
       // never be a chat model here -- only a vision reader for the bridge.
       tools: caps.includes("tools"),
-      accuracy: benchmarks[entry.tag]?.tier,
-      measured: benchmarks[entry.tag],
+      accuracy: measured?.tier,
+      measured,
+      tokensPerSecond: Number.isFinite(measured?.tokensPerSecond)
+        ? measured.tokensPerSecond
+        : Number.isFinite(measured?.evalTokensPerSecond)
+          ? measured.evalTokensPerSecond
+          : null,
+      speedStatus: Number.isFinite(measured?.tokensPerSecond) || Number.isFinite(measured?.evalTokensPerSecond)
+        ? "measured"
+        : "unmeasured",
       // Whether the real Codex client could actually drive it. Unmeasured
       // stays unmeasured: a guess here is what sends someone into a task with
       // a model that invents tools.
@@ -420,6 +511,59 @@ export function localModelsSnapshot({
   const capacity = detectMachine();
   const available = suggestedLocalModels({ capacity, installed: models });
   const availableVision = suggestedVisionModels({ capacity, installed: models });
+  const availableExplore = suggestedExploreModels({ capacity, installed: models });
+  const familyEntries = [...models, ...available, ...availableVision, ...availableExplore];
+  const families = new Map();
+  for (const entry of familyEntries) {
+    const tag = String(entry.tag || "");
+    let identity;
+    try {
+      identity = splitLocalModelTag(tag);
+    } catch {
+      identity = { family: tag, variant: "latest" };
+    }
+    const current = families.get(identity.family) || {
+      family: identity.family,
+      displayName: localModelDisplayName(tag),
+      variants: [],
+    };
+    if (!current.variants.includes(identity.variant)) current.variants.push(identity.variant);
+    families.set(identity.family, current);
+  }
+  for (const family of families.values()) family.variants.sort();
+  let download = readLocalDownload();
+  // Cancellation leaves a tombstone in the protected state file
+  // so a worker that is still unwinding cannot resurrect its progress. It is
+  // not an operation anymore, though: every client should clear its status
+  // card as soon as the cancel command succeeds.
+  if (download?.status === "cancelled") download = null;
+  // Older uninstall workers recorded an error when Ollama had already
+  // removed the weights but the optional Codex catalog refresh failed.  The
+  // inventory is authoritative here: do not keep showing a red "removal
+  // failed" card for a model that is no longer on disk.  Preserve the warning
+  // so the operator still knows the picker may need a Codex restart.
+  const removedButUnpublished = download?.kind === "uninstall"
+    && download.status === "error"
+    && /^The model was removed,/i.test(String(download.error || ""));
+  if (removedButUnpublished && !models.some((model) => canonicalLocalModelTag(model.tag) === canonicalLocalModelTag(download.tag))) {
+    const catalogError = download.catalogError || download.error;
+    const repaired = {
+      ...download,
+      status: "done",
+      detail: "Model removed · catalog refresh needed",
+      percent: 100,
+      updatedAt: Date.now(),
+      catalogError,
+      error: undefined,
+    };
+    try {
+      download = writeLocalDownload(repaired);
+    } catch {
+      // Rendering the truthful inventory still matters if the protected state
+      // file cannot be rewritten; the next refresh can try the repair again.
+      download = repaired;
+    }
+  }
   return {
     path: LOCAL_MODELS_STATE_PATH,
     installed: models.length,
@@ -429,6 +573,14 @@ export function localModelsSnapshot({
     models,
     available,
     availableVision,
+    availableExplore,
+    families: [...families.values()].sort((left, right) => left.family.localeCompare(right.family)),
+    catalog: {
+      mode: "ollama-tags",
+      note: "Any valid Ollama tag is supported. Paste an ollama.com model URL or enter a tag to inspect and install it.",
+    },
+    runtime,
+    download,
     machine: describeMachine(capacity),
   };
 }
@@ -476,6 +628,7 @@ export function machineCapacity({
   totalMemoryBytes,
   gpuMemoryBytes,
   unifiedMemory = false,
+  freeDiskBytes,
   platform = process.platform,
 } = {}) {
   const total = Number(totalMemoryBytes) || 0;
@@ -494,7 +647,26 @@ export function machineCapacity({
     // machine to a crawl is reported as a clean fit.
     fastBudgetBytes: gpuBudget || Math.floor(systemBudget * COMFORTABLE_CPU_SHARE),
     ceilingBytes: Math.max(gpuBudget || 0, systemBudget),
+    freeDiskBytes: Number.isFinite(freeDiskBytes) ? freeDiskBytes : undefined,
   };
+}
+
+export function availableDiskBytes(directory = STATE_DIR, statfs = statfsSync) {
+  let candidate = directory;
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    try {
+      const stats = statfs(candidate);
+      const available = Number(stats?.bavail) * Number(stats?.bsize);
+      return Number.isFinite(available) && available >= 0 ? available : undefined;
+    } catch {
+      // A fresh install has no model directory yet. Walk upward until an
+      // existing parent gives a useful same-volume estimate.
+      const parent = path.dirname(candidate);
+      if (parent === candidate) break;
+      candidate = parent;
+    }
+  }
+  return undefined;
 }
 
 export function detectMachine() {
@@ -503,6 +675,7 @@ export function detectMachine() {
     totalMemoryBytes: os.totalmem(),
     gpuMemoryBytes: unifiedMemory ? undefined : nvidiaMemoryBytes(),
     unifiedMemory,
+    freeDiskBytes: availableDiskBytes(ollamaModelsPath()),
   });
 }
 
@@ -515,7 +688,23 @@ export function describeMachine(capacity) {
     : capacity.gpuBudgetBytes
       ? `${(capacity.gpuBudgetBytes / 1e9).toFixed(1)} GB GPU memory`
       : "no GPU memory detected; models run on the CPU";
-  return `${memory} · ${gpu}`;
+  const disk = Number.isFinite(capacity.freeDiskBytes)
+    ? ` · ${(capacity.freeDiskBytes / 1e9).toFixed(1)} GB free disk`
+    : "";
+  return `${memory} · ${gpu}${disk}`;
+}
+
+// Disk is separate from memory fit: a model can fit the GPU and still leave
+// the machine unable to finish its pull. Keep this advisory conservative and
+// do not refuse an unknown filesystem (network mounts and test doubles often
+// do not expose statfs data).
+export function rateDiskFit(sizeGb, capacity = detectMachine()) {
+  const bytes = Number(sizeGb) * 1e9;
+  if (!Number.isFinite(bytes) || bytes <= 0 || !Number.isFinite(capacity.freeDiskBytes)) return undefined;
+  const required = bytes * 1.1;
+  if (capacity.freeDiskBytes < required) return "too-large";
+  if (capacity.freeDiskBytes < required * 2) return "tight";
+  return "fits";
 }
 
 // "fits" runs at full speed, "tight" runs but spills to the CPU, "too-large"
@@ -656,6 +845,13 @@ export const SUGGESTED_LOCAL_MODELS = Object.freeze(
   ].map((entry) => Object.freeze(entry)),
 );
 
+// A discoverable family/tag list captured from the official Ollama tag pages.
+// It is intentionally separate from the coding shortlist: the registry
+// template is the authority for tool calling, and these tags should not be
+// offered as Codex agents until `ollama show` proves that capability on the
+// installed tag. Any other tag remains installable through the URL/tag field.
+export { EXPLORE_LOCAL_MODELS };
+
 function notInstalled(installed) {
   const have = new Set(installed.map((entry) => String(entry?.tag ?? entry)));
   return (tag) => !have.has(tag) && !have.has(`${tag}:latest`);
@@ -671,7 +867,15 @@ export function suggestedLocalModels({
   const fresh = notInstalled(installed);
   return SUGGESTED_LOCAL_MODELS
     .filter((entry) => entry.tools && entry.context >= MIN_CODING_CONTEXT)
-    .map((entry) => ({ ...entry, fit: rateModelFit(entry.sizeGb, capacity) }))
+    .map((entry) => ({
+      ...entry,
+      family: splitLocalModelTag(entry.tag).family,
+      variant: splitLocalModelTag(entry.tag).variant,
+      displayName: localModelDisplayName(entry.tag),
+      fit: rateModelFit(entry.sizeGb, capacity),
+      diskFit: rateDiskFit(entry.sizeGb, capacity),
+      speedStatus: "unmeasured",
+    }))
     .filter((entry) => fresh(entry.tag))
     .filter((entry) => includeUnusable || entry.fit !== "too-large")
     // Proven first: an untested model is a thing to try, not a recommendation.
@@ -699,6 +903,7 @@ export function suggestedVisionModels({
       accuracy: entry.accuracy,
       note: entry.note,
       fit: rateModelFit(entry.sizeGb, capacity),
+      diskFit: rateDiskFit(entry.sizeGb, capacity),
     }))
     .filter((entry) => fresh(entry.tag))
     .filter((entry) => entry.fit !== "too-large")
@@ -710,6 +915,53 @@ export function suggestedVisionModels({
         VISION_ACCURACY_RANK[left.accuracy] - VISION_ACCURACY_RANK[right.accuracy] ||
         left.sizeGb - right.sizeGb,
     );
+}
+
+// Every model the router knows about, in one browsable list.
+//
+// The two shortlists above are recommendations, and they deliberately drop
+// anything this machine cannot run. That also made those entries unreachable:
+// on an 8 GB laptop `qwen2.5-coder:14b`, `gpt-oss:20b` and `devstral` appeared
+// in no list at all, so there was no way to install one even deliberately.
+// This list hides nothing. It carries the fit rating instead, so the caller can
+// warn about a model that will not fit rather than pretend it does not exist.
+export function suggestedExploreModels({
+  capacity = detectMachine(),
+  installed = [],
+} = {}) {
+  const fresh = notInstalled(installed);
+  const seen = new Set();
+  const entries = [];
+  for (const entry of [...EXPLORE_LOCAL_MODELS, ...SUGGESTED_LOCAL_MODELS, ...VISION_CATALOG]) {
+    // `devstral` and `devstral:latest` are one model; the shortlists spell the
+    // bare form and the explore catalog spells the tagged one.
+    const canonical = canonicalLocalModelTag(entry.tag);
+    if (seen.has(canonical) || !fresh(entry.tag)) continue;
+    seen.add(canonical);
+    let identity;
+    try {
+      identity = splitLocalModelTag(entry.tag);
+    } catch {
+      identity = { family: entry.tag, variant: "latest" };
+    }
+    const research = LOCAL_FAMILY_RESEARCH[identity.family];
+    const cloudOnly = entry.downloadable === false;
+    entries.push({
+      // Defaults first so a catalog that states either one still wins.
+      tools: false,
+      downloadable: true,
+      ...entry,
+      family: identity.family,
+      variant: identity.variant,
+      displayName: entry.displayName || localModelDisplayName(entry.tag),
+      fit: cloudOnly ? "cloud-only" : rateModelFit(entry.sizeGb, capacity),
+      diskFit: cloudOnly ? "cloud-only" : rateDiskFit(entry.sizeGb, capacity),
+      researchStatus: research?.status || "Cataloged · compatibility unverified",
+      researchCapabilities: research?.capabilities || [],
+      researchNote: research?.note || "Verify capabilities after pull.",
+    });
+  }
+  return entries;
 }
 
 // Mirrors the vision catalog's own ranking: measured-accurate, then partial,
@@ -739,12 +991,15 @@ export function renderLocalModels(snapshot) {
       const role = model.tools ? (model.vision ? "code + images" : "code") : "images only";
       lines.push(
         `  ${model.enabled ? "[x]" : "[ ]"} ${model.tag.padEnd(width)} ` +
-          `${`${model.sizeGb.toFixed(1)} GB`.padStart(8)}  ${role}${model.running ? "  · loaded" : ""}`,
+          `${`${model.sizeGb.toFixed(1)} GB`.padStart(8)}  ${role}` +
+          `${model.tokensPerSecond ? ` · ${model.tokensPerSecond.toFixed(1)} tok/s` : ""}` +
+          `${model.running ? "  · loaded" : ""}`,
       );
     }
   }
   const coding = snapshot.available || [];
   const vision = snapshot.availableVision || [];
+  const explore = snapshot.availableExplore || [];
   if (coding.length) {
     // The honest framing: Codex's own prompt takes most of the window before
     // any code is added, and only a verified model is known to drive a turn.
@@ -760,7 +1015,8 @@ export function renderLocalModels(snapshot) {
     for (const entry of coding) {
       lines.push(
         `  ${entry.tag.padEnd(width)} ${`${entry.sizeGb.toFixed(1)} GB`.padStart(8)} ` +
-          `${entry.codex.padEnd(9)} ${entry.note}${entry.fit === "tight" ? " (tight)" : ""}`,
+          `${entry.codex.padEnd(9)} ${entry.note}${entry.fit === "tight" ? " (memory tight)" : ""}` +
+          `${entry.diskFit === "tight" ? " (disk tight)" : ""}`,
       );
     }
     lines.push("", "  Test one yourself:  ./bin/control local-models agent-check <tag>");
@@ -774,8 +1030,44 @@ export function renderLocalModels(snapshot) {
       );
     }
   }
+  if (explore.length) {
+    lines.push(
+      "",
+      "Explore Ollama tags (fit is shown; capabilities are checked after pull):",
+    );
+    for (const entry of explore) {
+      if (entry.downloadable === false) {
+        lines.push(`  ${entry.tag.padEnd(42)} cloud only · not downloadable`);
+      } else {
+        const fit = entry.fit === "too-large" ? "won't fit" : entry.fit || "fit unknown";
+        lines.push(`  ${entry.tag.padEnd(42)} ${`${entry.sizeGb.toFixed(1)} GB`.padStart(8)} · ${fit}`);
+      }
+    }
+  }
   if (coding.length || vision.length) {
-    lines.push("", `  ./bin/control local-models install ${(coding[0] || vision[0]).tag}`);
+    lines.push(
+      "",
+      `  ./bin/control local-models install ${(coding[0] || vision[0]).tag} --yes`,
+      "  Any valid Ollama tag or ollama.com model URL also works.",
+    );
+  }
+  // Present whenever the snapshot carries it, including the not-running case:
+  // an LM Studio user who stopped the server should read "not running", not
+  // watch the whole section vanish as if support had gone away.
+  const lmstudio = snapshot.lmstudio;
+  if (lmstudio) {
+    lines.push("", `${lmstudio.displayName || "LM Studio"}:`);
+    if (!lmstudio.reachable && lmstudio.models.length === 0) {
+      lines.push("  Not running. Start LM Studio's local server to list its models.");
+    } else {
+      for (const model of lmstudio.models) {
+        lines.push(
+          `  ${model.enabled ? "[x]" : "[ ]"} ${model.id}` +
+            `${model.served ? "" : "  · not currently served"}`,
+        );
+      }
+      lines.push("  Toggle one:  ./bin/control local-models lmstudio-set <id> on|off");
+    }
   }
   return lines.join("\n");
 }
@@ -876,7 +1168,13 @@ export function parseGgufContextLength(buffer) {
 }
 
 export async function fetchRegistryContext(tag, { fetchImpl = fetch, timeoutMs = 8_000 } = {}) {
-  const [name, version = "latest"] = String(tag).split(":");
+  let identity;
+  try {
+    identity = splitLocalModelTag(tag);
+  } catch {
+    return undefined;
+  }
+  const { name, variant: version } = identity;
   if (!name) return undefined;
   const base = `${REGISTRY_BASE}/v2/library/${encodeURIComponent(name)}`;
   try {

@@ -121,7 +121,7 @@ function mergeEvent(target, event) {
     provider = newEntry();
     target.providers.set(providerId, provider);
   }
-  mergeEntry(provider, event, at);
+  mergeEntry(provider, event, at, { billed: true });
 
   const accountId =
     typeof event.accountId === "string" && event.accountId ? event.accountId : "";
@@ -135,17 +135,22 @@ function mergeEvent(target, event) {
   }
 }
 
-function mergeEntry(entry, event, at) {
+function mergeEntry(entry, event, at, { billed = false } = {}) {
   const day = dateKey(at);
   const slug = typeof event.model === "string" && event.model ? event.model : "unknown";
-  const inputTokens = nonnegative(event.inputTokens);
-  const outputTokens = nonnegative(event.outputTokens);
+  const inputTokens = nonnegative(billed ? event.billedInputTokens ?? event.inputTokens : event.inputTokens);
+  const outputTokens = nonnegative(billed ? event.billedOutputTokens ?? event.outputTokens : event.outputTokens);
+  const cachedInputTokens = Math.min(nonnegative(event.cachedInputTokens), inputTokens);
   const hasTokenField =
+    (billed && event.billedInputTokens !== undefined) ||
+    (billed && event.billedOutputTokens !== undefined) ||
     event.totalTokens !== undefined ||
     event.inputTokens !== undefined ||
     event.outputTokens !== undefined;
   const totalTokens = nonnegative(
-    event.totalTokens ?? (hasTokenField ? inputTokens + outputTokens : 0),
+    billed && (event.billedInputTokens !== undefined || event.billedOutputTokens !== undefined)
+      ? inputTokens + outputTokens
+      : event.totalTokens ?? (hasTokenField ? inputTokens + outputTokens : 0),
   );
   const successful =
     Number.isInteger(event.status) && event.status >= 200 && event.status < 400;
@@ -165,7 +170,7 @@ function mergeEntry(entry, event, at) {
   if (hasTokenField) bucket.meteredRequests += 1;
   bucket.inputTokens += inputTokens;
   bucket.outputTokens += outputTokens;
-  bucket.cachedInputTokens += nonnegative(event.cachedInputTokens);
+  bucket.cachedInputTokens += cachedInputTokens;
   bucket.totalTokens += totalTokens;
   const isoAt = new Date(at).toISOString();
   if (!bucket.lastUsedAt || at >= Date.parse(bucket.lastUsedAt)) {
@@ -216,9 +221,19 @@ function rollUp(entry, fromDay, toDay) {
       ) {
         model.lastUsedAt = bucket.lastUsedAt;
       }
-      const daily = out.daily.get(day) || { startDate: day, tokens: 0, requests: 0 };
+      const daily = out.daily.get(day) || {
+        startDate: day,
+        tokens: 0,
+        requests: 0,
+        inputTokens: 0,
+        cachedInputTokens: 0,
+        outputTokens: 0,
+      };
       daily.tokens += bucket.totalTokens;
       daily.requests += bucket.requests;
+      daily.inputTokens += bucket.inputTokens;
+      daily.cachedInputTokens += bucket.cachedInputTokens;
+      daily.outputTokens += bucket.outputTokens;
       out.daily.set(day, daily);
     }
     if (!visible) continue;
@@ -247,26 +262,56 @@ export function usageSummarySnapshot({ range = "90d", now = Date.now() } = {}) {
       (provider) => [provider.id, provider],
     ),
   );
+  for (const providerId of target.providers.keys()) {
+    if (!seed.has(providerId)) {
+      seed.set(providerId, {
+        id: providerId,
+        displayName: `Historical provider (${providerId})`,
+        credentialType: "unknown",
+      });
+    }
+  }
   const providers = [...seed.values()].map((provider) => {
     const rollup = rollUp(target.providers.get(provider.id), fromDay, toDay);
     return {
       id: provider.id,
       displayName: provider.displayName,
-      credentialType: provider.kind === "oauth" ? "oauth" : "api",
+      credentialType: provider.credentialType || (provider.kind === "oauth"
+        ? "oauth"
+        : provider.authMode === "anonymous"
+          ? "anonymous"
+          : provider.authMode === "per-model"
+            ? "per-model"
+            : "api"),
       scope: "local-router",
       requests: rollup.requests,
       successfulRequests: rollup.successfulRequests,
       meteredRequests: rollup.meteredRequests,
       inputTokens: rollup.inputTokens,
+      regularInputTokens: Math.max(0, rollup.inputTokens - rollup.cachedInputTokens),
       outputTokens: rollup.outputTokens,
       cachedInputTokens: rollup.cachedInputTokens,
       totalTokens: rollup.totalTokens,
+      last24hInputTokens: 0,
+      last24hRegularInputTokens: 0,
+      last24hCachedInputTokens: 0,
+      last24hOutputTokens: 0,
+      last24hTokens: 0,
+      last24hRequests: 0,
+      last24hMeteredRequests: 0,
       dailyUsageBuckets: [...rollup.daily.values()].sort((left, right) =>
         left.startDate.localeCompare(right.startDate),
       ),
-      models: [...rollup.models.values()].sort(
-        (left, right) => right.totalTokens - left.totalTokens || right.requests - left.requests,
-      ),
+      models: [...rollup.models.values()]
+        .map((model) => ({
+          ...model,
+          observedTokensPerSecond: null,
+          observedFirstTokenMs: null,
+          speedSampleCount: 0,
+        }))
+        .sort(
+          (left, right) => right.totalTokens - left.totalTokens || right.requests - left.requests,
+        ),
     };
   });
 

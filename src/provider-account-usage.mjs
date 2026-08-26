@@ -139,7 +139,7 @@ export function grokCreditsMetrics(payload) {
   if (!config || typeof config !== "object") return [];
 
   const metrics = [];
-  const usagePct = numberValue(config.creditUsagePercent ?? config.credit_usage_percent);
+  const reportedPct = numberValue(config.creditUsagePercent ?? config.credit_usage_percent);
   const period = config.currentPeriod || config.current_period || {};
   const periodType = String(period.type || period.period_type || "");
   const periodEnd = period.end || config.billingPeriodEnd || config.billing_period_end;
@@ -148,6 +148,15 @@ export function grokCreditsMetrics(payload) {
     : periodType.includes("MONTHLY")
       ? "Monthly limit"
       : "Usage limit";
+
+  // The proxy serializes proto3 JSON, which drops zero-valued fields: a
+  // period with no recorded usage arrives without creditUsagePercent at all.
+  // The period itself proves the quota exists, so missing means 0% used.
+  const usagePct = Number.isFinite(reportedPct)
+    ? reportedPct
+    : periodType || periodEnd
+      ? 0
+      : undefined;
 
   if (Number.isFinite(usagePct)) {
     const usedPercent = Math.max(0, Math.min(100, usagePct));
@@ -201,6 +210,192 @@ export function grokCreditsMetrics(payload) {
   }
 
   return metrics;
+}
+
+// MiniMax reports coding-plan windows as remaining percentages per feature;
+// only the "general" entry covers the chat models this router forwards to
+// (other entries track video and image generation allowances).
+export function minimaxQuotaMetrics(payload) {
+  const entries = Array.isArray(payload?.model_remains) ? payload.model_remains : [];
+  const coding = entries.find((entry) => entry?.model_name === "general");
+  if (!coding) return [];
+  const windowMetric = (label, remainingValue, endMs) => {
+    const reported = numberValue(remainingValue);
+    if (!Number.isFinite(reported)) return undefined;
+    const remainingPercent = Math.max(0, Math.min(100, reported));
+    const usedPercent = 100 - remainingPercent;
+    const metric = {
+      kind: "quota",
+      label,
+      usedPercent,
+      remainingPercent,
+      used: usedPercent,
+      limit: 100,
+      remaining: remainingPercent,
+      unit: "percent",
+    };
+    const end = numberValue(endMs);
+    if (Number.isFinite(end) && end > 0) metric.resetAt = end / 1_000;
+    return metric;
+  };
+  const start = numberValue(coding.start_time);
+  const end = numberValue(coding.end_time);
+  const hours =
+    Number.isFinite(start) && Number.isFinite(end) && end > start
+      ? Math.round((end - start) / 3_600_000)
+      : undefined;
+  const intervalLabel = Number.isFinite(hours) && hours >= 1 ? `${hours}-hour limit` : "Current window";
+  return [
+    windowMetric(intervalLabel, coding.current_interval_remaining_percent, coding.end_time),
+    windowMetric("Weekly limit", coding.current_weekly_remaining_percent, coding.weekly_end_time),
+  ].filter(Boolean);
+}
+
+// opencode Zen reports Go-plan windows as used percentages. The rolling
+// window's duration is not part of the payload, so its label stays generic
+// instead of claiming a specific span.
+export function opencodeGoUsageMetrics(payload) {
+  const usage = payload?.usage;
+  if (!usage || typeof usage !== "object") return [];
+  const windowMetric = (label, detail) => {
+    const percent = numberValue(detail?.percent);
+    if (!Number.isFinite(percent)) return undefined;
+    const usedPercent = Math.max(0, Math.min(100, percent));
+    const metric = {
+      kind: "quota",
+      label,
+      usedPercent,
+      remainingPercent: 100 - usedPercent,
+      used: usedPercent,
+      limit: 100,
+      remaining: 100 - usedPercent,
+      unit: "percent",
+    };
+    const resetAt = resetTimestamp(detail?.resetsAt ?? detail?.reset_at);
+    if (resetAt !== undefined) metric.resetAt = resetAt;
+    return metric;
+  };
+  return [
+    windowMetric("Rolling limit", usage.rolling),
+    windowMetric("Weekly limit", usage.weekly),
+    windowMetric("Monthly limit", usage.monthly),
+  ].filter(Boolean);
+}
+
+// Command Code's billing API reports plan windows as used/cap credit
+// counters; resetAt is an epoch that stays 0 until the window first opens.
+export function commandCodeCreditsMetrics(payload) {
+  const windows = payload?.windowLimits;
+  if (!windows || typeof windows !== "object") return [];
+  const windowMetric = (label, detail) => {
+    if (!detail || typeof detail !== "object") return undefined;
+    const resetRaw = numberValue(detail.resetAt);
+    const resetMs = Number.isFinite(resetRaw) && resetRaw > 0
+      ? resetRaw > 1e12 ? resetRaw : resetRaw * 1_000
+      : undefined;
+    return quotaMetric(
+      label,
+      {
+        limit: detail.cap,
+        used: detail.used,
+        ...(resetMs !== undefined ? { resetTime: new Date(resetMs).toISOString() } : {}),
+      },
+      "credits",
+    );
+  };
+  // The window caps say how fast the plan may be spent; the credit pool says
+  // how much is left to spend at all. A coding plan runs out of the second one
+  // long before it stops hitting the first, so reporting only the windows
+  // hides the number that actually ends someone's afternoon.
+  const credits = payload?.credits;
+  const monthly = numberValue(credits?.monthlyCredits);
+  const purchased = numberValue(credits?.purchasedCredits);
+  const free = numberValue(credits?.freeCredits);
+  const total = [monthly, purchased, free].filter(Number.isFinite).reduce((sum, part) => sum + part, 0);
+  const balance = Number.isFinite(monthly)
+    ? [{
+        kind: "balance",
+        label: "Plan credits",
+        value: total,
+        currency: "USD",
+        detail: [
+          Number.isFinite(monthly) ? `Plan ${monthly.toFixed(2)}` : undefined,
+          Number.isFinite(purchased) && purchased > 0 ? `Purchased ${purchased.toFixed(2)}` : undefined,
+          Number.isFinite(free) && free > 0 ? `Free ${free.toFixed(2)}` : undefined,
+        ].filter(Boolean).join(" · "),
+        available: credits?.belowThreshold !== true,
+      }]
+    : [];
+  return [
+    ...balance,
+    windowMetric("5-hour limit", windows.fiveHour),
+    windowMetric("Weekly limit", windows.weekly),
+  ].filter(Boolean);
+}
+
+// Venice funds inference from three independent pools -- funded USD, VCU from
+// staked VVV, and the 24-hour DIEM allowance -- and consumes whichever is
+// available at request time, so reporting only one of them would show a user
+// with a full VCU balance a zero. `accessPermitted` is Venice's own answer to
+// "may this key call the API at all"; a key whose plan or per-key spend limit
+// blocks it still reports balances, so the flag rides on every metric rather
+// than suppressing them.
+export function veniceBalanceMetrics(data) {
+  const balances = data?.balances;
+  if (!balances || typeof balances !== "object") return [];
+  const available = data.accessPermitted !== false;
+  return [
+    ["USD", "USD balance", "Funded USD credits"],
+    ["VCU", "VCU balance", "Venice Compute Units from staked VVV"],
+    ["DIEM", "DIEM balance", "Daily DIEM allowance"],
+  ]
+    .map(([code, label, detail]) => {
+      const value = numberValue(balances[code] ?? balances[code.toLowerCase()]);
+      if (!Number.isFinite(value)) return undefined;
+      return { kind: "balance", label, value, currency: code, detail, available };
+    })
+    .filter(Boolean);
+}
+
+// `/api/v1/key` answers for any inference key and is the only OpenRouter route
+// that reports the per-key spend cap. `limit: null` means the key is uncapped,
+// which is not a quota and must not be rendered as a full one.
+export function openRouterKeyMetrics(payload) {
+  const data = payload?.data;
+  if (!data || typeof data !== "object") return [];
+  const limit = numberValue(data.limit);
+  if (!Number.isFinite(limit) || limit <= 0) return [];
+  return [
+    quotaMetric(
+      "Key spend limit",
+      {
+        limit,
+        used: numberValue(data.usage),
+        remaining: numberValue(data.limit_remaining),
+        resetTime: typeof data.limit_reset === "string" ? data.limit_reset : undefined,
+      },
+      "USD",
+    ),
+  ].filter(Boolean);
+}
+
+// `/api/v1/credits` reports the account-wide pool, but OpenRouter serves it
+// only to a management key: an ordinary inference key gets HTTP 403 there
+// while `/api/v1/key` keeps working, so this is an enrichment and never the
+// thing a missing balance is blamed on.
+export function openRouterCreditsMetrics(payload) {
+  const data = payload?.data;
+  const purchased = numberValue(data?.total_credits);
+  const used = numberValue(data?.total_usage);
+  if (!Number.isFinite(purchased) || !Number.isFinite(used)) return [];
+  return [{
+    kind: "balance",
+    label: "Credit balance",
+    value: purchased - used,
+    currency: "USD",
+    detail: `Purchased ${purchased.toFixed(2)} · Used ${used.toFixed(2)}`,
+    available: purchased - used > 0,
+  }];
 }
 
 export function githubCopilotQuotaMetrics(payload) {
@@ -286,8 +481,13 @@ async function deepSeekAccount(fetchImpl) {
   return { status: "available", source: "official-api", metrics };
 }
 
-async function kimiApiAccount(fetchImpl) {
-  const provider = PROVIDERS.get("kimi-api");
+// Moonshot runs two platforms that share this balance route but nothing else:
+// the global console at platform.moonshot.ai and the mainland one at
+// platform.moonshot.cn. Accounts, billing, and keys are separate -- a key
+// minted on one is rejected by the other -- so they are separate providers here
+// and this probe is parameterized rather than pinned to one of them.
+async function kimiApiAccount(fetchImpl, providerId = "kimi-api") {
+  const provider = PROVIDERS.get(providerId);
   const credential = resolveProviderCredential(provider);
   if (!credential) return { status: "not-configured", source: "official-api", metrics: [] };
   const baseURL = (process.env[provider.baseUrlEnv] || provider.baseUrl).replace(/\/+$/, "");
@@ -336,6 +536,44 @@ async function chutesAccount(fetchImpl) {
     metrics,
     dashboardUrl: "https://chutes.ai/app",
   };
+}
+
+async function opencodeGoAccount(fetchImpl) {
+  const provider = PROVIDERS.get("opencode-go");
+  const credential = resolveProviderCredential(provider);
+  if (!credential) return { status: "not-configured", source: "official-api", metrics: [] };
+  const baseURL = (process.env[provider.baseUrlEnv] || provider.baseUrl).replace(/\/+$/, "");
+  if (new URL(baseURL).origin !== "https://opencode.ai") {
+    return localOnly("Plan usage is unavailable for a custom opencode endpoint");
+  }
+  const payload = await requestJson(`${baseURL}/usage`, credential.value, {}, fetchImpl);
+  const metrics = opencodeGoUsageMetrics(payload);
+  if (!metrics.length) throw new Error("opencode usage response was incomplete");
+  return { status: "available", source: "official-api", metrics };
+}
+
+const MINIMAX_ACCOUNT_HOSTS = new Set(["api.minimax.io", "api.minimaxi.com"]);
+
+async function minimaxTokenPlanAccount(fetchImpl) {
+  const provider = PROVIDERS.get("minimax-token-plan");
+  const credential = resolveProviderCredential(provider);
+  if (!credential) return { status: "not-configured", source: "official-api", metrics: [] };
+  const baseURL = (process.env[provider.baseUrlEnv] || provider.baseUrl).replace(/\/+$/, "");
+  if (!MINIMAX_ACCOUNT_HOSTS.has(new URL(baseURL).hostname)) {
+    return localOnly("Plan usage is unavailable for a custom MiniMax endpoint");
+  }
+  const payload = await requestJson(`${baseURL}/coding_plan/remains`, credential.value, {}, fetchImpl);
+  const status = payload?.base_resp?.status_code;
+  if (status !== undefined && status !== 0) {
+    throw new Error(
+      typeof payload?.base_resp?.status_msg === "string" && payload.base_resp.status_msg
+        ? payload.base_resp.status_msg
+        : `MiniMax coding plan API returned status ${status}`,
+    );
+  }
+  const metrics = minimaxQuotaMetrics(payload);
+  if (!metrics.length) throw new Error("MiniMax coding plan response was incomplete");
+  return { status: "available", source: "official-api", metrics };
 }
 
 async function kimiOAuthAccount(fetchImpl) {
@@ -435,10 +673,16 @@ function withHeaderQuota(providerId, fallback) {
 const ZAI_QUOTA_URL =
   process.env.ZAI_QUOTA_URL || "https://api.z.ai/api/monitor/usage/quota/limit";
 const ZAI_PLAN_DASHBOARD_URL = "https://z.ai/manage-apikey/coding-plan/personal/my-plan";
+const ZAI_API_DASHBOARD_URL = "https://z.ai/manage-apikey/billing";
 const QWEN_PLAN_DASHBOARD_URL =
   "https://modelstudio.console.alibabacloud.com/ap-southeast-1/?tab=plan#/efm/subscription/token-plan";
 const OLLAMA_DASHBOARD_URL = "https://ollama.com/settings";
 const COMMANDCODE_DASHBOARD_URL = "https://commandcode.ai/studio";
+const OPENROUTER_DASHBOARD_URL = "https://openrouter.ai/settings/credits";
+const VENICE_DASHBOARD_URL = "https://venice.ai/settings/api";
+// Nous publishes no credits or usage route on the inference API (a 404 on both
+// /v1/credits and /v1/key), so the portal page is the only honest destination.
+const NOUS_DASHBOARD_URL = "https://portal.nousresearch.com/manage-subscription";
 
 function zaiWindowLabel(unit, number) {
   if (unit === 6) return number === 1 ? "Weekly limit" : `${number}-week limit`;
@@ -524,6 +768,42 @@ async function zaiCodingAccount(fetchImpl) {
   return account;
 }
 
+// The credits route is not in the public docs, so any failure degrades to the
+// Studio link and observed router traffic instead of an error state.
+async function commandCodeAccount(fetchImpl) {
+  const provider = PROVIDERS.get("commandcode");
+  const credential = resolveProviderCredential(provider);
+  if (!credential) return { status: "not-configured", source: "official-api", metrics: [] };
+  const fallback = (message) => ({
+    ...withHeaderQuota("commandcode", localOnly(message)),
+    dashboardUrl: COMMANDCODE_DASHBOARD_URL,
+  });
+  const baseURL = (process.env[provider.baseUrlEnv] || provider.baseUrl).replace(/\/+$/, "");
+  if (new URL(baseURL).origin !== "https://api.commandcode.ai") {
+    return fallback("Account usage is unavailable for a custom Command Code endpoint");
+  }
+  try {
+    const payload = await requestJson(
+      "https://api.commandcode.ai/alpha/billing/credits",
+      credential.value,
+      {},
+      fetchImpl,
+    );
+    const metrics = commandCodeCreditsMetrics(payload);
+    if (!metrics.length) {
+      return fallback("Command Code reported no plan windows; showing router traffic");
+    }
+    return {
+      status: "available",
+      source: "official-api",
+      metrics,
+      dashboardUrl: COMMANDCODE_DASHBOARD_URL,
+    };
+  } catch {
+    return fallback("Command Code account usage is unavailable; showing router traffic");
+  }
+}
+
 async function githubCopilotAccount(fetchImpl) {
   const credential = resolveProviderCredential("github-copilot");
   if (!credential) return { status: "not-configured", source: "official-api", metrics: [] };
@@ -550,11 +830,85 @@ async function githubCopilotAccount(fetchImpl) {
   return account;
 }
 
+async function veniceAccount(fetchImpl) {
+  const provider = PROVIDERS.get("venice");
+  const credential = resolveProviderCredential(provider);
+  if (!credential) return { status: "not-configured", source: "official-api", metrics: [] };
+  const fallback = (message) => ({
+    ...withHeaderQuota("venice", localOnly(message)),
+    dashboardUrl: VENICE_DASHBOARD_URL,
+  });
+  const baseURL = (process.env[provider.baseUrlEnv] || provider.baseUrl).replace(/\/+$/, "");
+  if (new URL(baseURL).origin !== "https://api.venice.ai") {
+    return fallback("Account balances are unavailable for a custom Venice endpoint");
+  }
+  let payload;
+  try {
+    payload = await requestJson(`${baseURL}/api_keys/rate_limits`, credential.value, {}, fetchImpl);
+  } catch {
+    return fallback("Venice account balances are unavailable; showing router traffic");
+  }
+  const data = payload?.data ?? payload;
+  const metrics = veniceBalanceMetrics(data);
+  if (!metrics.length) return fallback("Venice reported no balances; showing router traffic");
+  const account = {
+    status: "available",
+    source: "official-api",
+    metrics,
+    dashboardUrl: VENICE_DASHBOARD_URL,
+  };
+  if (typeof data?.apiTier?.id === "string" && data.apiTier.id) account.plan = data.apiTier.id;
+  // The plan note already warns that a free Venice account has no API
+  // entitlement; this is the same fact confirmed against the live key.
+  if (data?.accessPermitted === false) {
+    account.message = "This Venice key is not permitted to call the API; check its tier and spend limits.";
+  }
+  return account;
+}
+
+async function openRouterAccount(fetchImpl) {
+  const provider = PROVIDERS.get("openrouter");
+  const credential = resolveProviderCredential(provider);
+  if (!credential) return { status: "not-configured", source: "official-api", metrics: [] };
+  const fallback = (message) => ({
+    ...withHeaderQuota("openrouter", localOnly(message)),
+    dashboardUrl: OPENROUTER_DASHBOARD_URL,
+  });
+  const baseURL = (process.env[provider.baseUrlEnv] || provider.baseUrl).replace(/\/+$/, "");
+  if (new URL(baseURL).origin !== "https://openrouter.ai") {
+    return fallback("Account credits are unavailable for a custom OpenRouter endpoint");
+  }
+  let key;
+  try {
+    key = await requestJson(`${baseURL}/key`, credential.value, {}, fetchImpl);
+  } catch {
+    return fallback("OpenRouter account usage is unavailable; showing router traffic");
+  }
+  // A management key adds the account-wide pool; an inference key answers 403
+  // here and keeps the per-key metrics it already has.
+  const credits = await requestJson(`${baseURL}/credits`, credential.value, {}, fetchImpl)
+    .then(openRouterCreditsMetrics)
+    .catch(() => []);
+  const metrics = [...credits, ...openRouterKeyMetrics(key)];
+  if (!metrics.length) {
+    return fallback("This OpenRouter key is uncapped and its balance needs a management key");
+  }
+  return {
+    status: "available",
+    source: "official-api",
+    metrics,
+    dashboardUrl: OPENROUTER_DASHBOARD_URL,
+    plan: key?.data?.is_free_tier === true ? "Free tier" : "Paid",
+  };
+}
+
 async function accountUsageFor(providerId, fetchImpl) {
   try {
     if (providerId === "chutes") return await chutesAccount(fetchImpl);
     if (providerId === "deepseek") return await deepSeekAccount(fetchImpl);
-    if (providerId === "kimi-api") return await kimiApiAccount(fetchImpl);
+    if (providerId === "kimi-api" || providerId === "kimi-api-cn") {
+      return await kimiApiAccount(fetchImpl, providerId);
+    }
     if (providerId === "kimi-oauth") return await kimiOAuthAccount(fetchImpl);
     if (providerId === "grok-oauth") return await grokOAuthAccount(fetchImpl);
     if (providerId === "grok-api") {
@@ -574,6 +928,20 @@ async function accountUsageFor(providerId, fetchImpl) {
         : { status: "not-configured", source: "official-api", metrics: [] };
     }
     if (providerId === "zai-coding") return await zaiCodingAccount(fetchImpl);
+    if (providerId === "zai-api") {
+      // The quota route zai-coding polls reports a Coding Plan's windows; a
+      // pay-per-token platform key has no plan behind it and Z.ai publishes no
+      // balance API, so link the billing page instead of inventing a number.
+      return resolveProviderCredential("zai-api")
+        ? {
+            ...withHeaderQuota(
+              providerId,
+              localOnly("Z.ai shows the platform balance only on z.ai; showing router traffic"),
+            ),
+            dashboardUrl: ZAI_API_DASHBOARD_URL,
+          }
+        : { status: "not-configured", source: "official-api", metrics: [] };
+    }
     if (providerId === "qwen-plan") {
       // Alibaba plan quotas are only visible behind a console session; never
       // import browser cookies. Link to the console instead.
@@ -598,16 +966,31 @@ async function accountUsageFor(providerId, fetchImpl) {
           }
         : { status: "not-configured", source: "official-api", metrics: [] };
     }
-    if (providerId === "commandcode") {
-      return resolveProviderCredential("commandcode")
+    if (providerId === "commandcode") return await commandCodeAccount(fetchImpl);
+    if (providerId === "venice") return await veniceAccount(fetchImpl);
+    if (providerId === "openrouter") return await openRouterAccount(fetchImpl);
+    if (providerId === "nousresearch") {
+      // Nous Portal shows credits and the subscription tier only in the
+      // browser: the inference API answers 404 on both /credits and /key, so
+      // there is no number to fetch and inventing one would be worse than the
+      // link. Router traffic still fills the usage card.
+      return resolveProviderCredential("nousresearch")
         ? {
             ...withHeaderQuota(
               providerId,
-              localOnly("Command Code shows credits and usage only in Studio; showing router traffic"),
+              localOnly("Nous Portal shows credits only on the portal; showing router traffic"),
             ),
-            dashboardUrl: COMMANDCODE_DASHBOARD_URL,
+            dashboardUrl: NOUS_DASHBOARD_URL,
           }
         : { status: "not-configured", source: "official-api", metrics: [] };
+    }
+    if (providerId === "minimax-token-plan") return await minimaxTokenPlanAccount(fetchImpl);
+    if (providerId === "opencode-go") return await opencodeGoAccount(fetchImpl);
+    // Keyed on the auth mode rather than on a list of ids: an anonymous
+    // provider has no account to query by construction, so a new one must not
+    // be able to fall through to a branch that would try.
+    if (["anonymous", "per-model"].includes(PROVIDERS.get(providerId)?.authMode)) {
+      return withHeaderQuota(providerId, localOnly("Anonymous free-provider quota is not exposed; showing router traffic"));
     }
     if (providerId === "github-copilot") return await githubCopilotAccount(fetchImpl);
     // Every remaining provider — including the catalog-only ones — reports its

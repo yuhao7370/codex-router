@@ -2,7 +2,9 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  contextLengthFailure,
   extractUpstreamDetail,
+  gatewayErrorStatus,
   translateGatewayError,
 } from "../src/error-translation.mjs";
 
@@ -35,6 +37,52 @@ test("extractUpstreamDetail falls back to truncated raw text for non-JSON bodies
 test("extractUpstreamDetail returns empty string for empty bodies", () => {
   assert.equal(extractUpstreamDetail(""), "");
   assert.equal(extractUpstreamDetail(undefined), "");
+});
+
+test("an Ollama MLX context rejection becomes a non-retryable context error", () => {
+  const bodyText = JSON.stringify({
+    error: {
+      message:
+        "litellm.APIConnectionError: APIConnectionError: OllamaException - input length (269931 tokens) exceeds the model's maximum context length (262144 tokens). LiteLLM Retried: 2 times",
+      type: null,
+      code: "500",
+    },
+  });
+
+  assert.deepEqual(contextLengthFailure(bodyText), {
+    detail:
+      "input length (269931 tokens) exceeds the model's maximum context length (262144 tokens). LiteLLM Retried: 2 times",
+    inputTokens: 269931,
+    maximumTokens: 262144,
+  });
+  assert.equal(gatewayErrorStatus({ status: 500, bodyText }), 400);
+
+  const payload = translateGatewayError({
+    status: 500,
+    bodyText,
+    modelName: "Qwen3.8 27B MLX (local)",
+    providerName: "Ollama",
+  });
+  assert.equal(payload.error.type, "invalid_request_error");
+  assert.equal(payload.error.param, "input");
+  assert.equal(payload.error.code, "context_length_exceeded");
+  assert.match(payload.error.message, /269,931 tokens/);
+  assert.match(payload.error.message, /262,144-token context window/);
+  assert.match(payload.error.message, /not high demand/);
+  assert.doesNotMatch(payload.error.message, /LiteLLM|APIConnectionError/);
+});
+
+test("ordinary Ollama-style 500 errors remain retryable server errors", () => {
+  const bodyText = JSON.stringify({ error: { message: "mlx runner stopped unexpectedly" } });
+  assert.equal(gatewayErrorStatus({ status: 500, bodyText }), 500);
+  const payload = translateGatewayError({
+    status: 500,
+    bodyText,
+    modelName: "Qwen3.8 27B MLX (local)",
+    providerName: "Ollama",
+  });
+  assert.equal(payload.error.type, "server_error");
+  assert.equal(payload.error.code, "500");
 });
 
 test("a 5xx names the provider and keeps the upstream detail", () => {
@@ -115,6 +163,41 @@ test("a 401 from an OAuth provider says sign in again, not re-run setup", () => 
   );
   assert.equal(payload.error.type, "authentication_error");
   assert.ok(!payload.error.message.includes("codex-router setup"));
+});
+
+// Captured from a live opencode-free outage: OpenCode Zen answered 401 with
+// its ModelError while serving an anonymous free model. The provider holds no
+// credential, so advising a setup re-run sends the operator looking for
+// something that does not exist.
+test("a 401 from an anonymous provider never advises refreshing credentials", () => {
+  const payload = translateGatewayError({
+    status: 401,
+    bodyText: JSON.stringify({
+      type: "error",
+      error: { type: "ModelError", message: "Model  is not supported" },
+    }),
+    modelName: "Ox Alpha Free",
+    providerName: "opencode",
+    providerKind: "openai-compatible",
+    providerAuthMode: "anonymous",
+  });
+  assert.equal(
+    payload.error.message,
+    "opencode serves Ox Alpha Free anonymously, so there is no stored credential to refresh. opencode rejected this request on its free route; the free catalog and limits change without notice, so retry later or switch models. (HTTP 401: Model  is not supported)",
+  );
+  assert.equal(payload.error.type, "authentication_error");
+  assert.ok(!payload.error.message.includes("codex-router setup"));
+});
+
+test("an anonymous provider without the auth mode keeps the credential wording", () => {
+  const payload = translateGatewayError({
+    status: 401,
+    bodyText: JSON.stringify({ error: { message: "invalid api key" } }),
+    modelName: "DeepSeek V4 Pro",
+    providerName: "deepseek",
+    providerKind: "openai-compatible",
+  });
+  assert.match(payload.error.message, /Re-run codex-router setup/);
 });
 
 // Captured from a live Kimi OAuth 403: an exhausted plan arrives on the same
@@ -412,4 +495,49 @@ test("a genuine 403 credential rejection still says so", () => {
   });
   assert.equal(translated.error.type, "authentication_error");
   assert.match(translated.error.message, /rejected the stored credentials/);
+});
+
+// Regression for #179. LiteLLM used to cool a deployment down on a 401 and
+// then answer with its own 429, so the user was told to wait out a rejected
+// credential. router_settings.disable_cooldowns (see litellm-config) stops that
+// at the source; this locks in that a real upstream 401 still classifies
+// correctly once it reaches the translator, and that a real 429 still does too.
+//
+// Deliberately no test for parsing a status out of LiteLLM's cooldown body:
+// _get_cooldown_deployments returns bare deployment ids (cooldown_handlers.py),
+// so the client-facing message carries no originating status to read.
+test("an upstream 401 is an auth failure, not a rate limit", () => {
+  const translated = translateGatewayError({
+    status: 401,
+    bodyText: JSON.stringify({ error: { message: "invalid api key" } }),
+    modelName: "kimi-k3",
+    providerName: "Kimi",
+    providerKind: "api",
+  });
+  assert.equal(translated.error.type, "authentication_error");
+  assert.match(translated.error.message, /Re-run codex-router setup/);
+});
+
+test("an upstream 401 on an OAuth provider advises signing in again", () => {
+  const translated = translateGatewayError({
+    status: 401,
+    bodyText: JSON.stringify({ error: { message: "invalid session" } }),
+    modelName: "kimi-k3",
+    providerName: "Kimi",
+    providerKind: "oauth",
+  });
+  assert.equal(translated.error.type, "authentication_error");
+  assert.match(translated.error.message, /Sign in to Kimi again/);
+});
+
+test("a genuine rate limit is still a rate limit", () => {
+  const translated = translateGatewayError({
+    status: 429,
+    bodyText: JSON.stringify({ error: { message: "rate limit exceeded" } }),
+    modelName: "kimi-k3",
+    providerName: "Kimi",
+    providerKind: "api",
+    retryAfterSeconds: 30,
+  });
+  assert.equal(translated.error.type, "rate_limit_error");
 });

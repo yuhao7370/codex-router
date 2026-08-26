@@ -1,10 +1,15 @@
 import http from "node:http";
 
 import {
+  applyKeepAliveTimeouts,
+  endStreamedResponse,
+  formatErrorChain,
   HOP_BY_HOP_HEADERS,
   httpErrorStatus,
+  installGracefulShutdown,
   pipeResponse,
   readRequestBody,
+  reportListenFailure,
   requireInternalAuth,
   writeJson,
 } from "./http-utils.mjs";
@@ -14,9 +19,12 @@ import {
   MODEL_BY_GATEWAY_ID,
   PROVIDERS,
   providerForModel,
+  endpointForModel,
+  resolveProviderBaseUrl,
 } from "./model-registry.mjs";
-import { parseRateLimitHeaders } from "./rate-limit-headers.mjs";
+import { cooldownUntil, parseRateLimitHeaders } from "./rate-limit-headers.mjs";
 import { recordRateLimitSnapshot } from "./rate-limit-state.mjs";
+import { recordProviderCooldown } from "./model-failover.mjs";
 import { canonicalProviderId, readProviderSelection } from "./provider-selection.mjs";
 import { stripImages, supportsImageInput } from "./vision-bridge.mjs";
 import {
@@ -28,7 +36,17 @@ import {
   ensureFreshGitHubCopilotSession,
   githubCopilotRequestHeaders,
 } from "./github-copilot-session.mjs";
+import {
+  commandCodeRoute,
+  isUpgradeRequired,
+  recordCommandCodeRoute,
+} from "./commandcode-plan.mjs";
+import { relayCommandCodeGenerate } from "./commandcode-relay.mjs";
 import { VERSION } from "./version.mjs";
+import { installStableFetchTransport } from "./fetch-transport.mjs";
+import { zaiCacheUsageTransform } from "./zai-cache-usage.mjs";
+
+installStableFetchTransport();
 
 const LISTEN_HOST =
   process.env.MODEL_ROUTER_API_HOST ||
@@ -55,8 +73,19 @@ const QUIET =
 
 if (!INTERNAL_KEY) throw new Error("MODEL_ROUTER_INTERNAL_KEY is required.");
 
+// One line per provider per process: the refusal repeats on every request,
+// and the point is that the operator learns about it, not that the log fills.
+const warnedBaseUrlOverrides = new Set();
+
 function providerBaseUrl(provider) {
-  return String(process.env[provider.baseUrlEnv] || provider.baseUrl).replace(/\/+$/, "");
+  const { baseUrl, refusedOverride } = resolveProviderBaseUrl(provider);
+  if (refusedOverride && !warnedBaseUrlOverrides.has(provider.id)) {
+    warnedBaseUrlOverrides.add(provider.id);
+    console.error(
+      `[api-forwarder] ${provider.baseUrlEnv} ignored: keyless provider ${provider.id} sends no credential, so it stays on its loopback endpoint`,
+    );
+  }
+  return baseUrl;
 }
 
 // DeepSeek documents low/high/max (docs also accept xhigh as a compat alias).
@@ -87,6 +116,31 @@ function ollamaCloudEffort(value) {
   if (value === "medium") return "medium";
   if (["xhigh", "max", "ultra"].includes(value)) return "max";
   return "high";
+}
+
+// Some upstreams document reasoning_effort per model rather than per vendor:
+// GLM-5.2 answers to high/max, GLM-5.3 adds a low tier (low/high/max, max the
+// upstream default), and Ox Alpha publishes low/high/max on most routes but
+// low/medium/high on Venice. So the accepted rungs travel with the model, and
+// the requested effort is clamped onto the ladder its own registry entry
+// declares instead of onto a fixed map -- otherwise GLM-5.3's low tier could
+// never be reached. Codex's top rungs always mean "as deep as this model
+// goes"; anything else takes the nearest declared rung at or below it, and a
+// request under the model's floor lands on that floor. An absent or unknown
+// value is treated as "high", which is what the two-tier map sent before this
+// generalization.
+const EFFORT_LADDER = ["minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
+
+function declaredEffort(value, levels) {
+  const declared = levels
+    .filter((effort) => EFFORT_LADDER.includes(effort))
+    .sort((left, right) => EFFORT_LADDER.indexOf(left) - EFFORT_LADDER.indexOf(right));
+  if (!declared.length) return undefined;
+  if (["xhigh", "max", "ultra"].includes(value)) return declared.at(-1);
+  const requested = EFFORT_LADDER.indexOf(value);
+  const ceiling = requested === -1 ? EFFORT_LADDER.indexOf("high") : requested;
+  const atOrBelow = declared.filter((effort) => EFFORT_LADDER.indexOf(effort) <= ceiling);
+  return atOrBelow.at(-1) || declared[0];
 }
 
 // Strict chat-completions providers (e.g. MiniMax) reject a turn whose tool
@@ -136,6 +190,45 @@ function coalesceAssistantMessages(messages) {
     coalesced.push(message);
   }
   return coalesced;
+}
+
+function restoreGlmReasoningContent(messages) {
+  if (!Array.isArray(messages)) return messages;
+  return messages.map((message) => {
+    if (message?.role !== "assistant" || !Array.isArray(message.content)) return message;
+    const reasoning = [];
+    const visible = [];
+    let sawThinking = false;
+    for (const part of message.content) {
+      if (part?.type === "thinking") {
+        // A malformed or signature-only thinking block must never fall through
+        // as ordinary assistant content. LiteLLM normally supplies `text`,
+        // while a few adapters use `thinking`; accept either spelling only
+        // when it is a non-empty string, and drop the block otherwise.
+        sawThinking = true;
+        const text = [part.text, part.thinking].find(
+          (value) => typeof value === "string" && value,
+        );
+        if (typeof text === "string" && text) {
+          reasoning.push(text);
+        }
+        continue;
+      }
+      visible.push(part);
+    }
+    if (!sawThinking) return message;
+    const restored = {
+      ...message,
+      content: visible.length ? visible : null,
+    };
+    if (
+      reasoning.length &&
+      !(typeof message.reasoning_content === "string" && message.reasoning_content)
+    ) {
+      restored.reasoning_content = reasoning.join("\n");
+    }
+    return restored;
+  });
 }
 
 // Strict chat-completions providers (Console Go / MiniMax / similar) reject any
@@ -205,8 +298,38 @@ function ensureToolResultsForCalls(messages) {
 // place of a real reasoning signature to skip thought-signature validation.
 const GEMINI_THOUGHT_SIGNATURE_SENTINEL = "skip_thought_signature_validator";
 
-function isGeminiProvider(provider) {
-  return provider?.id === "gemini-api" || provider?.ownedBy === "google";
+function isGeminiProvider(provider, model) {
+  if (provider?.id === "gemini-api" || provider?.ownedBy?.toLowerCase?.() === "google") {
+    return true;
+  }
+  return [
+    provider?.id,
+    provider?.ownedBy,
+    model?.provider,
+    model?.slug,
+    model?.upstreamModel,
+    model?.gatewayModel,
+    model?.model,
+  ].some((value) => typeof value === "string" && value.toLowerCase().includes("gemini"));
+}
+
+// A trailing model turn is a destructive rewrite: it discards part of the
+// caller's conversation. Only Google's own provider gets that behavior from
+// identity. Resellers and custom endpoints must opt in per model after their
+// endpoint has proved that it rejects a prefilled model turn.
+function requiresTrailingUserTurn(provider, model) {
+  return (
+    provider?.id === "gemini-api" ||
+    provider?.ownedBy?.toLowerCase?.() === "google" ||
+    model?.requiresTrailingUserTurn === true
+  );
+}
+
+// Both Command Code entries -- the chat-completions catalog and the Messages
+// variant that carries the Claude models -- reach the same account, so both
+// answer to the same plan entitlement and the same fallback route.
+function isCommandCodeProvider(provider) {
+  return provider?.ownedBy === "commandcode";
 }
 
 // Gemini 3.x thinking models reject assistant tool calls whose reasoning
@@ -271,12 +394,127 @@ function sanitizeGeminiImageContent(messages) {
   });
 }
 
-function sanitizeChatToolHistory(messages, provider) {
+function trimTrailingModelTurns(messages) {
+  const trimmed = [...messages];
+  while (trimmed.length > 0 && trimmed[trimmed.length - 1]?.role === "assistant") {
+    trimmed.pop();
+  }
+  return trimmed;
+}
+
+function sanitizeChatToolHistory(messages, provider, model) {
   if (!Array.isArray(messages)) return messages;
   const repaired = ensureToolResultsForCalls(coalesceAssistantMessages(messages));
-  return isGeminiProvider(provider)
-    ? ensureGeminiThoughtSignatures(sanitizeGeminiImageContent(repaired))
-    : repaired;
+  let cleaned = repaired;
+  if (isGeminiProvider(provider, model)) {
+    cleaned = ensureGeminiThoughtSignatures(sanitizeGeminiImageContent(repaired));
+  }
+  return requiresTrailingUserTurn(provider, model) ? trimTrailingModelTurns(cleaned) : cleaned;
+}
+
+// The Qwen3.8 chat template counts a turn as one of these three roles. Probing
+// the live community endpoint with one-message-token requests measured the rule
+// exactly: `[system, user]` 200s, while `[user, system, user]`,
+// `[user, assistant, system]`, and `[system, system, user]` each 400 with
+// "System message must be at the beginning." So: at most one `system`, and it
+// must sit ahead of the first turn. `developer` is not a turn and is not
+// counted -- `[developer, system, user]`, `[user, developer, user]`, and
+// `[developer, developer, user]` all 200 -- which is why "the beginning" means
+// "before the first turn" rather than index 0, and why nothing here moves,
+// merges, or rewrites a developer message.
+const QWEN38_TURN_ROLES = new Set(["user", "assistant", "tool"]);
+
+function qwen38SystemOrderIsLegal(messages) {
+  let systems = 0;
+  let sawTurn = false;
+  for (const message of messages) {
+    const role = message?.role;
+    if (role === "system") {
+      systems += 1;
+      if (systems > 1 || sawTurn) return false;
+    } else if (QWEN38_TURN_ROLES.has(role)) {
+      sawTurn = true;
+    }
+  }
+  return true;
+}
+
+// Content arrives as a plain string or as OpenAI content parts, and Codex sends
+// both shapes on this route. Strings join with a blank line so the merged
+// instructions read as separate paragraphs; parts lists concatenate. A mixed
+// merge promotes the strings to text parts rather than stringifying the parts,
+// because flattening a parts list would drop everything that is not text.
+function combineQwen38SystemContent(contents) {
+  if (contents.every((content) => typeof content === "string")) return contents.join("\n\n");
+  return contents.flatMap((content) =>
+    typeof content === "string" ? [{ type: "text", text: content }] : content,
+  );
+}
+
+// A compatibility repair, and it is not free: instructions the caller placed
+// mid-conversation end up hoisted ahead of the first turn, so the model reads
+// them as opening context instead of as a later correction. That is a real
+// change in meaning, accepted only because this endpoint answers the original
+// ordering with a 400 and no answer at all. Every non-system message keeps its
+// position, and the merged text keeps the callers' relative order.
+function normalizeQwen38SystemMessages(messages) {
+  if (!Array.isArray(messages) || qwen38SystemOrderIsLegal(messages)) return messages;
+  const rest = [];
+  const contents = [];
+  let first;
+  let firstSystemSlot = -1;
+  for (const message of messages) {
+    if (message?.role !== "system") {
+      rest.push(message);
+      continue;
+    }
+    if (firstSystemSlot === -1) {
+      firstSystemSlot = rest.length;
+      first = message;
+    }
+    const content = message.content;
+    if (content === undefined || content === null || content === "") continue;
+    contents.push(content);
+  }
+  const firstTurn = rest.findIndex((message) => QWEN38_TURN_ROLES.has(message?.role));
+  // Ahead of the first turn, and no earlier than where the caller's own first
+  // system message sat -- so a leading `developer` message keeps its lead.
+  const insertAt = firstTurn === -1 ? firstSystemSlot : Math.min(firstSystemSlot, firstTurn);
+  const merged = { ...first, content: combineQwen38SystemContent(contents) };
+  return [...rest.slice(0, insertAt), merged, ...rest.slice(insertAt)];
+}
+
+// Meta's Responses surface validates the hosted search tool against the legacy
+// `web_search_preview` schema: any other tool carrying `search_content_types`
+// is answered with HTTP 400 "`tools[].search_content_types` is only supported
+// for web_search_preview tools" (param `tools[].search_content_types`).
+//
+// The field is dropped, never renamed and never moved onto another tool. What
+// the caller asked for is a search-result content filter; the endpoint that
+// refuses the field is telling us it will not apply it, and inventing a
+// `web_search_preview` tool to carry it would change which hosted tool the
+// model is offered.
+//
+// The returned array is a copy only when something was actually removed, so a
+// request with no such tool is forwarded byte-identical to what arrived.
+function stripSearchContentTypes(tools) {
+  if (!Array.isArray(tools)) return tools;
+  let stripped = false;
+  const repaired = tools.map((tool) => {
+    if (
+      !tool ||
+      typeof tool !== "object" ||
+      Array.isArray(tool) ||
+      tool.type === "web_search_preview" ||
+      !("search_content_types" in tool)
+    ) {
+      return tool;
+    }
+    stripped = true;
+    const { search_content_types: _refused, ...rest } = tool;
+    return rest;
+  });
+  return stripped ? repaired : tools;
 }
 
 function normalizeBody(buffer, contentType, route) {
@@ -318,6 +556,25 @@ function normalizeBody(buffer, contentType, route) {
     throw error;
   }
 
+  // OpenAI Chat Completions providers place terminal usage in a final empty
+  // choices chunk only when the caller opts into it. Keep this normalization
+  // on the provider's Chat Completions surface: Responses and Anthropic
+  // endpoints have different stream contracts, and a provider that declares
+  // either protocol must not receive an OpenAI-only stream_options field.
+  if (
+    route === "/chat/completions" &&
+    payload.stream === true &&
+    (provider.protocol === undefined || provider.protocol === "openai")
+  ) {
+    const streamOptions = payload.stream_options;
+    payload.stream_options = {
+      ...(streamOptions && typeof streamOptions === "object" && !Array.isArray(streamOptions)
+        ? streamOptions
+        : {}),
+      include_usage: true,
+    };
+  }
+
   payload.model = model.upstreamModel;
   // Google's OpenAI-compatible endpoint (/v1beta/openai/chat/completions)
   // rejects any field outside the OpenAI schema with a hard 400
@@ -338,8 +595,30 @@ function normalizeBody(buffer, contentType, route) {
   // Fireworks rejects this OpenAI search parameter instead of ignoring it.
   // Other provider payloads keep it unchanged.
   if (provider.id === "fireworks") delete payload.web_search_options;
+  // Meta refuses `search_content_types` on anything but a `web_search_preview`
+  // tool, and Codex only ever sends the current spelling: its hosted search
+  // tool is `type: "web_search"`, carrying search_content_types beside
+  // external_web_access, indexed_web_access, filters, user_location, and
+  // search_context_size (read out of the shipped 0.147 binary, which contains
+  // no occurrence of `web_search_preview` at all). The tool is declared on the
+  // turn whenever web search is enabled, not only when the model searches, so
+  // the reporter's "running anything" is literal: every turn 400s and the
+  // provider is unusable rather than degraded (#286).
+  //
+  // Deliberately scoped to Meta and not applied everywhere. OpenAI documents
+  // `search_content_types` on `web_search` and *not* on `web_search_preview`,
+  // which is the reverse of what this endpoint enforces, so Meta is running an
+  // older fork of the schema rather than being the strict reader of it.
+  // Stripping the field for every provider would take a documented parameter
+  // away from the responses-native providers that do follow the current spec
+  // (github-copilot, opencode-go-responses), and neither has been observed to
+  // refuse it. A caller that does send Meta a real `web_search_preview` tool
+  // keeps the field, because that is the one tool this endpoint accepts it on.
+  if (provider.id === "meta" && Array.isArray(payload.tools)) {
+    payload.tools = stripSearchContentTypes(payload.tools);
+  }
   if (Array.isArray(payload.messages)) {
-    payload.messages = sanitizeChatToolHistory(payload.messages, provider);
+    payload.messages = sanitizeChatToolHistory(payload.messages, provider, model);
   }
   if (provider.authProfile === "github-copilot") {
     // This is native ChatGPT account metadata, not an upstream scheduling
@@ -404,7 +683,9 @@ function normalizeBody(buffer, contentType, route) {
   } else if (model.requestProfile === "deepseek-nonthinking") {
     payload.thinking = { type: "disabled" };
     delete payload.reasoning_effort;
-  } else if (model.requestProfile === "ollama-cloud") {
+  } else if (
+    ["ollama-cloud", "ollama-cloud-auto-tool-choice"].includes(model.requestProfile)
+  ) {
     // Absent means the model's own default; Ollama enables thinking on capable
     // models when the parameter is omitted.
     if (payload.reasoning_effort !== undefined) {
@@ -412,6 +693,16 @@ function normalizeBody(buffer, contentType, route) {
     }
     // The native think parameter is ignored on this endpoint.
     delete payload.think;
+    // MiniMax M3 on Ollama Cloud accepts tool calls under auto but can emit
+    // malformed arguments when Codex forces a particular tool. Preserve the
+    // model-scoped exception on direct Chat Completions traffic too.
+    if (
+      model.requestProfile === "ollama-cloud-auto-tool-choice" &&
+      payload.tool_choice !== undefined &&
+      payload.tool_choice !== "none"
+    ) {
+      payload.tool_choice = "auto";
+    }
   } else if (model.requestProfile === "qwen-plan") {
     // DashScope documents reasoning_effort only for the cross-vendor
     // DeepSeek/GLM models it resells (high/max; low/medium collapse to high,
@@ -431,15 +722,16 @@ function normalizeBody(buffer, contentType, route) {
       payload.tool_choice = "auto";
     }
   } else if (model.requestProfile === "glm-thinking") {
-    payload.thinking = { type: "enabled" };
-    // Z.ai documents reasoning_effort only for GLM-5.2, with two effective
-    // tiers (high/max) and max as the upstream default when omitted. Models
-    // whose registry entry offers a single level (GLM-5-Turbo, GLM-5.1) do
-    // not support the parameter at all.
-    if ((model.reasoningLevels || []).length > 1) {
-      payload.reasoning_effort = ["xhigh", "max", "ultra"].includes(payload.reasoning_effort)
-        ? "max"
-        : "high";
+    payload.thinking = { type: "enabled", clear_thinking: false };
+    payload.messages = restoreGlmReasoningContent(payload.messages);
+    // Each GLM entry declares exactly the tiers Z.ai documents for it, and the
+    // requested effort is clamped onto them. Models whose registry entry offers
+    // a single level (GLM-5-Turbo, GLM-4.7) do not support the parameter at
+    // all. Read the count off the entry rather than naming models here: this
+    // list is what goes stale when a route is added.
+    const levels = (model.reasoningLevels || []).map((level) => level.effort);
+    if (levels.length > 1) {
+      payload.reasoning_effort = declaredEffort(payload.reasoning_effort, levels);
     } else {
       delete payload.reasoning_effort;
     }
@@ -464,11 +756,82 @@ function normalizeBody(buffer, contentType, route) {
     delete payload.reasoning_effort;
     payload.thinking = { type: "adaptive" };
     payload.output_config = { effort };
+  } else if (model.requestProfile === "qwen38-community") {
+    // The community endpoint's vLLM build validates reasoning_effort against a
+    // literal set -- none, minimal, low, medium, high, xhigh, max -- and
+    // answers anything else with a 400 naming the whole enum (measured against
+    // the live endpoint, not read off the model card). The Codex ladder is
+    // that set plus `ultra`, so `ultra` is the one value that has to be folded,
+    // and it folds onto `max` because that is the tier it is asking for.
+    // Everything else passes through as the literal the endpoint accepts.
+    if (payload.reasoning_effort === "ultra") payload.reasoning_effort = "max";
+    // The same build refuses two tool shapes Codex sends routinely, both
+    // measured live: an empty list answers "`tools` must not be an empty
+    // array. Either provide at least one tool or omit the field entirely",
+    // and a choice with nothing to choose from answers "When using
+    // `tool_choice`, `tools` must be set". `summarize()` in the router sends
+    // `tools: []` on every compaction, and this model auto-compacts at 230K of
+    // its 262K window, so left alone every compaction against it 400s. Strip
+    // the empty list first, then drop the tool choice that strip leaves
+    // dangling -- the order is what keeps the second rejection from replacing
+    // the first. The repair belongs at this last hop rather than in the
+    // compaction path because an empty tool list is legal on every other
+    // forwarder, and it is exactly how compaction disables tool use there.
+    if (Array.isArray(payload.tools) && payload.tools.length === 0) delete payload.tools;
+    if (!Array.isArray(payload.tools) || payload.tools.length === 0) {
+      delete payload.tool_choice;
+    }
+    // Third measured refusal on the same endpoint: "System message must be at
+    // the beginning." A conversation that already satisfies the rule is left
+    // byte-identical -- see normalizeQwen38SystemMessages for the rule, the
+    // developer-role exemption, and what the repair costs.
+    if (Array.isArray(payload.messages)) {
+      payload.messages = normalizeQwen38SystemMessages(payload.messages);
+    }
   } else if (model.requestProfile === "minimax-m3") {
     // MiniMax uses its own thinking control on the OpenAI-compatible
     // Chat Completions endpoint instead of reasoning_effort.
+    //
+    // Without `reasoning_split`, MiniMax embeds the chain of thought in
+    // `content` as literal <think>...</think> markup, so it renders as
+    // ordinary assistant text in any client that does not know the vendor
+    // format. With it, the reasoning arrives in `reasoning_content` -- which
+    // this router already relays as reasoning -- and `content` carries only
+    // the answer. A live probe against api.minimax.io confirmed both halves:
+    // HTTP 200 either way, `<think>` present in `content` without the flag and
+    // absent with it, alongside a populated `reasoning_content`.
+    //
+    // This is why there is no output filter here. Stripping the markup
+    // downstream means running a state machine over every streamed field, and
+    // the fields it would have to walk include tool-call argument deltas --
+    // where a patch that merely mentions <think> would be corrupted into
+    // invalid JSON. Fixing the leak at the source removes that whole class of
+    // failure instead of managing it.
     delete payload.reasoning_effort;
     payload.thinking = { type: "adaptive" };
+    payload.reasoning_split = true;
+  } else if (model.requestProfile === "ox-alpha") {
+    // Ox Alpha always thinks, and every route validates reasoning_effort
+    // against the rungs the model accepts -- an off-ladder value comes
+    // back as HTTP 400 "This model always engages in thinking and cannot be
+    // disabled" rather than being ignored. Every route accepts low/high/max;
+    // Venice's generic catalog metadata is the documented exception because it
+    // advertises a `medium` rung the model rejects. Codex can send any rung it
+    // knows: an installation older than 0.143 has no `max` in its enum at all,
+    // so the catalog clamps this model's default down to `xhigh` and that is
+    // what arrives here. Clamping onto the entry's own declared ladder is what
+    // keeps both of those cases off the 400.
+    if (payload.reasoning_effort !== undefined) {
+      const effort = declaredEffort(
+        payload.reasoning_effort,
+        (model.reasoningLevels || []).map((level) => level.effort),
+      );
+      if (effort) payload.reasoning_effort = effort;
+      else delete payload.reasoning_effort;
+    }
+    // Absent means the upstream's own default, which is the top rung. The
+    // routes document no `thinking` switch, and thinking cannot be turned off.
+    delete payload.thinking;
   } else if (model.requestProfile === "auto-tool-choice") {
     // Some models call tools happily under "auto" but reject being forced to,
     // the way DeepSeek and Qwen do in thinking mode. Their vendor profiles
@@ -492,10 +855,14 @@ function normalizeBody(buffer, contentType, route) {
       payload.tool_choice = "auto";
     }
   }
-  return { body: Buffer.from(JSON.stringify(payload), "utf8"), model, provider, payload };
+  // The provider still answers protocol, auth profile, and identity; the
+  // endpoint answers where the request goes and what authenticates it. For
+  // every provider but a per-model-endpoint one they are the same object.
+  const endpoint = endpointForModel(model);
+  return { body: Buffer.from(JSON.stringify(payload), "utf8"), model, provider, endpoint, payload };
 }
 
-function upstreamHeaders(requestHeaders, body, apiKey, provider, extraHeaders = {}) {
+function upstreamHeaders(requestHeaders, body, apiKey, provider, extraHeaders = {}, endpoint = provider) {
   const headers = {};
   const providerIdentityHeaders = new Set([
     "copilot-integration-id",
@@ -519,18 +886,22 @@ function upstreamHeaders(requestHeaders, body, apiKey, provider, extraHeaders = 
     }
     if (value !== undefined) headers[name] = Array.isArray(value) ? value.join(", ") : value;
   }
-  if (!provider.keyless) {
-    if (provider.protocol === "anthropic") {
-      headers["x-api-key"] = apiKey;
-      headers["anthropic-version"] ||= "2023-06-01";
-    } else {
-      headers.Authorization = `Bearer ${apiKey}`;
-    }
+  if (provider.keyless || endpoint.keyless || endpoint.authMode === "anonymous") {
+    // The upstream explicitly permits anonymous access -- for a reseller's
+    // free-model subset, or for a single allowlisted community endpoint.
+    // Never forward the gateway's internal bearer token to either.
+  } else if (provider.protocol === "anthropic") {
+    headers["x-api-key"] = apiKey;
+    headers["anthropic-version"] ||= "2023-06-01";
+  } else {
+    headers.Authorization = `Bearer ${apiKey}`;
   }
   headers["User-Agent"] = `codex-router/${VERSION}`;
   headers["Accept-Encoding"] = "identity";
   Object.assign(headers, extraHeaders);
-  if (body.length) headers["Content-Length"] = String(Buffer.byteLength(body));
+  // Content-Length is fetch's to compute. An explicit copy is at best
+  // redundant, and the HTTP/1.1 dispatcher rejects the request outright
+  // (UND_ERR_INVALID_ARG) when a caller-supplied value accompanies a body.
   return headers;
 }
 
@@ -566,9 +937,9 @@ async function normalizeResponsesApiResponse(upstream, normalized) {
   });
 }
 
-async function upstreamSession(provider, credential, payload, options = {}) {
+async function upstreamSession(provider, credential, payload, options = {}, endpoint = provider) {
   if (provider.authProfile !== "github-copilot") {
-    return { apiKey: credential.value, baseUrl: providerBaseUrl(provider), headers: {} };
+    return { apiKey: credential.value, baseUrl: providerBaseUrl(endpoint), headers: {} };
   }
   const session = await ensureFreshGitHubCopilotSession(credential.value, options);
   return {
@@ -578,6 +949,32 @@ async function upstreamSession(provider, credential, payload, options = {}) {
       : session.baseUrl,
     headers: githubCopilotRequestHeaders(payload, session.token),
   };
+}
+
+// Harvest the provider's own quota report from the response it just sent.
+// Costs no extra request and works for any provider that emits the standard
+// headers, so a newly added provider reports limits without bespoke code.
+// Called after the body streams because persisting is synchronous I/O and must
+// never sit in time-to-first-byte.
+function recordUpstreamLimits(normalized, upstream) {
+  const rateLimit = parseRateLimitHeaders(upstream.headers);
+  // Variant-routed responses meter the same upstream subscription, so quota
+  // headers land under the family's canonical provider id.
+  if (rateLimit) recordRateLimitSnapshot(canonicalProviderId(normalized.provider.id), rateLimit);
+  // This hop is the only place the provider's own status and headers are seen
+  // before LiteLLM restates them, so it is the only place a reset time the
+  // gateway does not relay can still be read. A failure that names when the
+  // caller may return is worth recording: the router reads it to skip a
+  // provider it already knows is empty instead of buying the same rejection
+  // once per turn. Only a failure, and only a window the provider itself
+  // named -- a healthy response is never a reason to stop using a provider.
+  if (upstream.ok) return;
+  const until = cooldownUntil(rateLimit);
+  if (!until) return;
+  recordProviderCooldown(canonicalProviderId(normalized.provider.id), {
+    until,
+    reason: upstream.status === 429 ? "rate_limited" : "out_of_usage",
+  });
 }
 
 function healthPayload() {
@@ -636,18 +1033,27 @@ async function handleRequest(request, response) {
 
   const original = await readRequestBody(request);
   const normalized = normalizeBody(original, request.headers["content-type"], route);
-  const credential = resolveProviderCredential(normalized.provider);
+  // Resolved against the endpoint, not the provider: a per-model endpoint keeps
+  // its credential under its own slug, so two custom models on two hosts never
+  // share a key and one missing key never blocks the other model.
+  const credential = resolveProviderCredential(normalized.endpoint);
   if (!credential) {
-    const setup = credentialStatus(normalized.provider).setup;
-    const credentialType = credentialLabel(normalized.provider);
+    const setup = credentialStatus(normalized.endpoint).setup;
+    const credentialType = credentialLabel(normalized.endpoint);
     const label = credentialType === "API key" ? "key" : credentialType.toLowerCase();
+    // Name whichever of the two the operator would go and configure. For a
+    // per-model endpoint the provider is a container, so "Custom key is not
+    // configured" would not say which model to fix.
+    const subject = normalized.provider.perModelEndpoint
+      ? normalized.model.displayName || normalized.model.slug
+      : normalized.provider.displayName;
     writeJson(response, 503, {
       error: {
         type: credentialType === "API key"
           ? "provider_api_key_missing"
           : "provider_credential_missing",
         provider: normalized.provider.id,
-        message: `${normalized.provider.displayName} ${label} is not configured. ${setup}.`,
+        message: `${subject} ${label} is not configured. ${setup}.`,
       },
     });
     return;
@@ -658,13 +1064,56 @@ async function handleRequest(request, response) {
   response.once("close", () => {
     if (!response.writableEnded) controller.abort();
   });
+  // Command Code's documented API is an entitlement, not a credential: the
+  // same key that runs its CLI is refused by /provider/v1 on the plans most of
+  // its customers buy. The CLI's own route serves those plans, so an account
+  // already known to be refused goes straight there rather than paying a 403
+  // for the privilege of finding out again.
+  const commandCode = isCommandCodeProvider(normalized.provider)
+    ? (() => {
+        const id = canonicalProviderId(normalized.provider.id);
+        return { id, ...commandCodeRoute(id, credential.value) };
+      })()
+    : undefined;
+  const relayThroughPlan = async () => {
+    const outcome = await relayCommandCodeGenerate({
+      payload: normalized.payload,
+      model: normalized.model,
+      provider: normalized.provider,
+      apiKey: credential.value,
+      baseUrl: providerBaseUrl(normalized.endpoint),
+      response,
+      signal: controller.signal,
+    });
+    // The plan route meters the same subscription and answers the same quota
+    // headers, so it reports limits and cooldowns exactly as the documented
+    // one does. Skipping this would leave the router blind to an exhausted
+    // plan on the very accounts this route exists to serve.
+    recordUpstreamLimits(normalized, outcome);
+    if (!QUIET) {
+      console.error(
+        `[api-forwarder] provider=${normalized.provider.id} model=${normalized.model.upstreamModel} ` +
+          `route=alpha-generate status=${outcome.status} duration_ms=${Date.now() - startedAt}`,
+      );
+    }
+  };
+  if (commandCode?.route === "plan") {
+    await relayThroughPlan();
+    return;
+  }
   // Fetch may detach a Buffer's backing ArrayBuffer while sending it. Copilot
   // can replay once after refreshing account routing, so use one immutable
   // string for both attempts instead of trying to reuse detached bytes.
   const upstreamBody = normalized.provider.authProfile === "github-copilot"
     ? normalized.body.toString("utf8")
     : normalized.body;
-  let session = await upstreamSession(normalized.provider, credential, normalized.payload);
+  let session = await upstreamSession(
+    normalized.provider,
+    credential,
+    normalized.payload,
+    {},
+    normalized.endpoint,
+  );
   let target = `${session.baseUrl}${route}${requestUrl.search}`;
   let upstream = await fetch(target, {
     method: request.method,
@@ -674,6 +1123,7 @@ async function handleRequest(request, response) {
       session.apiKey,
       normalized.provider,
       session.headers,
+      normalized.endpoint,
     ),
     body: upstreamBody,
     signal: controller.signal,
@@ -687,6 +1137,7 @@ async function handleRequest(request, response) {
       credential,
       normalized.payload,
       { force: true },
+      normalized.endpoint,
     );
     target = `${session.baseUrl}${route}${requestUrl.search}`;
     upstream = await fetch(target, {
@@ -697,22 +1148,56 @@ async function handleRequest(request, response) {
         session.apiKey,
         normalized.provider,
         session.headers,
+        normalized.endpoint,
       ),
       body: upstreamBody,
       signal: controller.signal,
     });
   }
   upstream = await normalizeResponsesApiResponse(upstream, normalized);
-  await pipeResponse(upstream, response);
-  // Harvest the provider's own quota report from the response it just sent.
-  // Costs no extra request and works for any provider that emits the standard
-  // headers, so a newly added provider reports limits without bespoke code.
-  // Recorded after the body streams because persisting is synchronous I/O and
-  // must never sit in time-to-first-byte.
-  const rateLimit = parseRateLimitHeaders(upstream.headers);
-  // Variant-routed responses meter the same upstream subscription, so quota
-  // headers land under the family's canonical provider id.
-  if (rateLimit) recordRateLimitSnapshot(canonicalProviderId(normalized.provider.id), rateLimit);
+  // Falling back here is legal for the same reason the Copilot replay above
+  // is: nothing has been relayed yet. The refusal is read rather than piped
+  // because only its body distinguishes "this plan has no API access" from
+  // every other 403 a gateway can send, and a plan refusal must not reach the
+  // caller as a failed turn when a working route exists.
+  if (commandCode && upstream.status === 403) {
+    const raw = await upstream.text().catch(() => "");
+    let refusal;
+    try {
+      refusal = JSON.parse(raw);
+    } catch {
+      refusal = undefined;
+    }
+    if (isUpgradeRequired(upstream.status, refusal)) {
+      recordCommandCodeRoute(commandCode.id, credential.value, { providerApi: false });
+      await relayThroughPlan();
+      return;
+    }
+    writeJson(
+      response,
+      403,
+      refusal || {
+        error: {
+          type: "provider_error",
+          message: raw.slice(0, 400) || "Command Code refused the request.",
+        },
+      },
+    );
+    return;
+  }
+  // Only written when the account was previously known to be refused and its
+  // re-check window came due, so a healthy Provider-plan account never rewrites
+  // this state once per turn to repeat what it already said.
+  if (commandCode?.recheck && upstream.ok) {
+    recordCommandCodeRoute(commandCode.id, credential.value, { providerApi: true });
+  }
+  await pipeResponse(
+    upstream,
+    response,
+    undefined,
+    zaiCacheUsageTransform(normalized.provider.id, upstream.headers.get("content-type")),
+  );
+  recordUpstreamLimits(normalized, upstream);
   if (!QUIET) {
     console.error(
       `[api-forwarder] provider=${normalized.provider.id} model=${normalized.model.upstreamModel} status=${upstream.status} duration_ms=${Date.now() - startedAt}`,
@@ -723,7 +1208,12 @@ async function handleRequest(request, response) {
 const server = http.createServer((request, response) => {
   handleRequest(request, response).catch((error) => {
     const status = httpErrorStatus(error);
-    console.error("[api-forwarder] request failed");
+    // Names and codes only: a forwarder failure can wrap upstream response
+    // text in its message, and bodies never belong in the log. The code chain
+    // is what distinguishes a dead socket from a refused connect (#171).
+    console.error(
+      `[api-forwarder] request failed: ${formatErrorChain(error, { messages: false })}`,
+    );
     if (!response.headersSent) {
       writeJson(response, status, {
         error: {
@@ -732,15 +1222,17 @@ const server = http.createServer((request, response) => {
         },
       });
     } else if (!response.writableEnded) {
-      response.destroy();
+      endStreamedResponse(response, {
+        message: "The API-provider forwarder lost the upstream response stream.",
+      });
     }
   });
 });
 
+applyKeepAliveTimeouts(server);
+reportListenFailure(server, { label: "api-forwarder", host: LISTEN_HOST, port: LISTEN_PORT });
 server.listen(LISTEN_PORT, LISTEN_HOST, () => {
   console.error("[api-forwarder] listening");
 });
 
-for (const signal of ["SIGINT", "SIGTERM"]) {
-  process.on(signal, () => server.close(() => process.exit(0)));
-}
+installGracefulShutdown(server, { label: "api-forwarder" });

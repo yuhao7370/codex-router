@@ -40,8 +40,8 @@ export function mergeLocalRouterModels({ existing, unregistered, metadataById = 
   };
 }
 
-export async function syncLocalRouterModels() {
-  const discovery = await discoverProviderModels("local-router");
+export async function syncLocalRouterModels({ discover = discoverProviderModels } = {}) {
+  const discovery = await discover("local-router", { refresh: true });
   const merged = mergeLocalRouterModels({
     existing: readUserModels(),
     unregistered: discovery.unregistered,
@@ -77,8 +77,8 @@ export function planLocalRouterRemovals({ existing, available }) {
   };
 }
 
-export async function cleanLocalRouterModels() {
-  const discovery = await discoverProviderModels("local-router");
+export async function cleanLocalRouterModels({ discover = discoverProviderModels } = {}) {
+  const discovery = await discover("local-router", { refresh: true });
   const merged = planLocalRouterRemovals({
     existing: readUserModels(),
     available: discovery.discovered,

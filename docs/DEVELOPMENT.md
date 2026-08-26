@@ -52,12 +52,47 @@ the account endpoint, caches the validated account routing briefly, allowlists
 the returned inference host, and builds provider identity headers. Do not reuse
 that profile for another vendor.
 
+## Audit provider model catalogs
+
+The **Provider model discovery** GitHub workflow has three deliberately
+separate paths:
+
+- Pull requests run only fixture-backed discovery tests. They receive no
+  provider secrets and never call a live model endpoint.
+- A weekly default-branch run audits every anonymous catalog and every API-key
+  catalog whose matching repository secret is configured.
+- A manual run accepts `all`, one provider ID, or a comma-separated set. A
+  targeted run fails when a requested provider's credential is absent; an
+  `all` run records unconfigured providers as skipped so one missing
+  subscription does not hide the rest of the audit.
+
+Repository secret names match the provider credential environment names in
+`config/`; the workflow maps the supported names explicitly. Add only the
+providers the repository is authorized to audit. GitHub Copilot requires the
+fine-grained PAT described above in `COPILOT_GITHUB_TOKEN` rather than the
+workflow's ordinary `GITHUB_TOKEN`.
+
+Each live run uploads `provider-model-audit.json` and writes a job summary with
+new candidates, unavailable registered IDs, skips, and failures. The report is
+research input only: `src/model-discovery-audit.mjs` never invokes curation or
+changes the registry. A newly advertised slug still needs the normal live
+compatibility proof before it can become a listed model.
+
 ## Registry rules
 
 The registry is intentionally declarative. `src/model-registry.mjs` rejects
 unknown provider kinds, duplicate provider IDs, duplicate public slugs,
 duplicate gateway model IDs, missing credential metadata, and incomplete picker
 metadata.
+
+Remote anonymous providers are a separate, tightly constrained mode. A
+provider with `authMode: "anonymous"` must use one of the fixed official
+endpoints allowlisted in `src/model-registry.mjs`, must not declare a
+credential or a base-URL override, and must declare an `anonymousModelPolicy`
+and user-facing `anonymousNote`. Discovery and user-model validation enforce
+that policy so a free route cannot be used to reach paid model IDs. This mode
+is for documented provider-side free exceptions; it is not an alternative
+form of arbitrary keyless hosting (keyless providers remain loopback-only).
 
 Models may declare `serviceTiers` as `{ id, name, description? }` entries only
 when the upstream is verified to honor those request values. The catalog
@@ -112,7 +147,12 @@ npm ci
 npm run check
 npm test
 sh -n install.sh
-for file in bin/*; do sh -n "$file"; done
+for file in bin/*; do
+  case "$file" in
+    *.mjs) node --check "$file" ;;
+    *) sh -n "$file" ;;
+  esac
+done
 npm audit --omit=dev
 ```
 

@@ -3,13 +3,33 @@ import { existsSync, readdirSync, statSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import { isShimFile, resolveRealCodex } from "./codex-shim.mjs";
+import { discoveryDisabled } from "./discovery-mode.mjs";
+import { commandOnPath, preferSpawnablePath, spawnableCommand } from "./spawnable-command.mjs";
+
+export { preferSpawnablePath, spawnableCommand };
+
+const LINUX_DESKTOP_APP_ROOTS = ["/opt/codex-desktop"];
+
+export function linuxDesktopAppBundledCodex({
+  platform = process.platform,
+  roots = LINUX_DESKTOP_APP_ROOTS,
+} = {}) {
+  if (platform !== "linux") return undefined;
+  return roots
+    .map((root) => path.join(root, "resources", "codex"))
+    .find((candidate) => existsSync(candidate) && !isShimFile(candidate));
+}
+
 // The ChatGPT/Codex desktop app bundles its CLI under a version-hashed
 // directory, e.g. %LOCALAPPDATA%\OpenAI\Codex\bin\<hash>\codex.exe. That hash
 // changes on every app update, so scan for the newest installed version
 // instead of pinning a single path.
-function desktopAppBundledCodex() {
-  if (process.platform !== "win32") return undefined;
-  const localAppData = process.env.LOCALAPPDATA;
+function desktopAppBundledCodex({
+  platform = process.platform,
+  localAppData = process.env.LOCALAPPDATA,
+} = {}) {
+  if (platform !== "win32") return undefined;
   if (!localAppData) return undefined;
   const binDir = path.join(localAppData, "OpenAI", "Codex", "bin");
   if (!existsSync(binDir)) return undefined;
@@ -24,59 +44,60 @@ function desktopAppBundledCodex() {
   }
 }
 
-function candidates() {
-  const localAppData = process.env.LOCALAPPDATA;
+export function codexCandidatePaths({
+  platform = process.platform,
+  localAppData = process.env.LOCALAPPDATA,
+  home = os.homedir(),
+  linuxDesktopRoots,
+} = {}) {
   return [
     process.env.CODEX_BIN,
     process.env.CODEX_INSTALL_DIR &&
       path.join(
         process.env.CODEX_INSTALL_DIR,
-        process.platform === "win32" ? "codex.exe" : "codex",
+        platform === "win32" ? "codex.exe" : "codex",
       ),
     "/Applications/ChatGPT.app/Contents/Resources/codex",
     "/Applications/Codex.app/Contents/Resources/codex",
     "/opt/homebrew/bin/codex",
+    linuxDesktopAppBundledCodex({ platform, roots: linuxDesktopRoots }),
     "/usr/local/bin/codex",
     localAppData && path.join(localAppData, "Programs", "OpenAI", "Codex", "bin", "codex.exe"),
     localAppData && path.join(localAppData, "Programs", "Codex", "resources", "codex.exe"),
     localAppData && path.join(localAppData, "Programs", "Codex", "resources", "app", "bin", "codex.exe"),
-    desktopAppBundledCodex(),
-    path.join(os.homedir(), ".local", "bin", process.platform === "win32" ? "codex.exe" : "codex"),
+    desktopAppBundledCodex({ platform, localAppData }),
+    path.join(home, ".local", "bin", platform === "win32" ? "codex.exe" : "codex"),
   ].filter(Boolean);
 }
 
-// `where.exe codex` on an npm global install lists the extensionless shell shim
-// before the one Node can run:
-//   ...\npm\codex       <- POSIX-style shim, listed first, NOT spawnable
-//   ...\npm\codex.cmd   <- the batch shim that actually works
-// existsSync() reports true for the first because Windows resolves it through
-// PATHEXT, but execFileSync throws ENOENT on it without a shell. Choose an entry
-// Node can execute instead of trusting the listed order.
-const WINDOWS_SPAWNABLE_EXTENSIONS = [".exe", ".com", ".cmd", ".bat"];
-
-export function preferSpawnablePath(paths, platform = process.platform) {
-  const found = paths.map((value) => value.trim()).filter(Boolean);
-  if (platform !== "win32") return found[0];
-  for (const extension of WINDOWS_SPAWNABLE_EXTENSIONS) {
-    const match = found.find((value) => value.toLowerCase().endsWith(extension));
-    if (match) return match;
-  }
-  return found[0];
+function candidates() {
+  return codexCandidatePaths();
 }
 
+// The router must never resolve `codex` to the shim it installs in front of it.
+//
+// The shim's job is to guarantee the router is listening before Codex starts,
+// so it runs `control service start` when it finds the router down. Reaching it
+// from inside the router turns that into a loop: the tray polls
+// `control account` every 30 seconds, that spawns Codex through this function,
+// and the shim revives the router the tray just stopped -- forever.
+//
+// Both resolution paths need the filter, not just PATH. `~/.local/bin` is a
+// candidate below *and* a directory `chooseShimDirectory` may install into,
+// because it restricts itself to the home directory.
 export function findCodexBinary() {
-  const direct = candidates().find((candidate) => existsSync(candidate));
+  const direct = candidates().find(
+    (candidate) => existsSync(candidate) && !isShimFile(candidate),
+  );
   if (direct) return direct;
-  const finder = process.platform === "win32" ? "where.exe" : "which";
-  try {
-    const output = execFileSync(finder, ["codex"], {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-    });
-    return preferSpawnablePath(output.split(/\r?\n/)) || undefined;
-  } catch {
-    return undefined;
-  }
+  // Never the raw first line of the finder: on Windows that is the
+  // extensionless npm shim, which Node cannot spawn. See spawnable-command.mjs.
+  const found = commandOnPath("codex");
+  if (found && !isShimFile(found)) return found;
+  // The finder landed on our own shim, so walk past it to the real Codex the
+  // shim itself execs. When there is none, report none: handing back the shim
+  // would rebuild the loop this filter exists to break.
+  return resolveRealCodex()?.file;
 }
 
 export function requireCodexBinary() {
@@ -89,19 +110,13 @@ export function requireCodexBinary() {
   return binary;
 }
 
-// A .cmd/.bat shim is a batch script, so Windows needs a shell to run it. The
-// path is quoted because cmd.exe splits on spaces and Codex is routinely
-// installed under a profile directory that contains them.
-export function codexSpawnTarget(binary, platform = process.platform) {
-  if (platform === "win32" && /\.(cmd|bat)$/i.test(binary)) {
-    return { command: `"${binary}"`, options: { shell: true } };
-  }
-  return { command: binary, options: {} };
-}
-
 export function runCodex(args, options = {}) {
-  const { command, options: spawnOptions } = codexSpawnTarget(requireCodexBinary());
-  return execFileSync(command, args, { ...spawnOptions, ...options });
+  const target = spawnableCommand(requireCodexBinary(), args);
+  return execFileSync(target.command, target.args, {
+    windowsHide: true,
+    ...target.options,
+    ...options,
+  });
 }
 
 // The version tells catalog code whether a cached native capture came from
@@ -125,14 +140,25 @@ export function codexVersion() {
 // every native model from the catalog. Report the reason so callers can refuse
 // to act on an unknown instead of treating it as a definite "logged out".
 export function codexAuthStatus() {
+  // `codex login status` is a credential probe, so --no-discovery skips the
+  // spawn entirely. The distinct reason keeps this apart from "probe-failed":
+  // the catalog treats it like a deliberate signed-out answer (publish no
+  // native models) instead of refusing to rebuild.
+  if (discoveryDisabled()) {
+    return { authenticated: false, reason: "discovery-disabled" };
+  }
   const binary = findCodexBinary();
   if (!binary) return { authenticated: false, reason: "codex-not-found" };
-  const { command, options } = codexSpawnTarget(binary);
   try {
-    execFileSync(command, ["login", "status"], {
-      ...options,
+    // Inside the try: a path this module refuses to hand to a shell is a probe
+    // that could not run, which is the "unknown" this function exists to
+    // report -- not an exception for every caller to learn to expect.
+    const target = spawnableCommand(binary, ["login", "status"]);
+    execFileSync(target.command, target.args, {
+      ...target.options,
       timeout: 10_000,
       stdio: "ignore",
+      windowsHide: true,
     });
     return { authenticated: true, reason: "authenticated", binary };
   } catch (error) {

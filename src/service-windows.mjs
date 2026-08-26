@@ -17,11 +17,38 @@ import {
   TARGET,
 } from "./paths.mjs";
 import { parseNativeProxyUrl } from "./native-proxy.mjs";
+import {
+  clearServiceProcessState,
+  readServiceProcessState,
+  serviceProcessOwns,
+} from "./service-process.mjs";
+import { protectPrivateFile } from "./file-security.mjs";
+import { antigravityClientSecretEnvironment } from "./antigravity-oauth-constants.mjs";
+import { serviceProxyEnvironment } from "./proxy-environment.mjs";
+import {
+  skipServiceManagerCall,
+  assertServiceWriteIsolated,
+} from "./service-write-guard.mjs";
+import { windowsScheduledTaskState } from "./windows-task-state.mjs";
+
+// Only this platform's own module can reach this machine's Task Scheduler.
+// Cross-platform render tests execute this module on POSIX with executable
+// stubs, so those calls must remain live; a real Windows test process must
+// never mutate the developer's scheduler.
+const HOST_MANAGED = process.platform === "win32";
 
 const effectivePlatform = process.env.CODEX_ROUTER_SERVICE_PLATFORM || process.platform;
 const command = process.argv[2] || "status";
 const renderCommands = new Set(["render", "render-launcher", "render-task"]);
 const taskName = "Codex Router";
+const guardLauncherWrite = () => assertServiceWriteIsolated(STATE_DIR, {
+  redirected: Boolean(
+    process.env.MODEL_ROUTER_STATE_DIR || process.env.CODEX_ROUTER_STATE_DIR,
+  ),
+  label: "service launchers",
+  override: "MODEL_ROUTER_STATE_DIR",
+});
+
 const wrapperPath = path.join(STATE_DIR, "start-codex-router.cmd");
 const launcherPath = path.join(STATE_DIR, "start-codex-router-hidden.vbs");
 
@@ -47,6 +74,9 @@ function wrapper() {
     MODEL_ROUTER_OAUTH_PORT: String(PORTS.oauth),
     MODEL_ROUTER_PORT: String(PORTS.router),
     MODEL_ROUTER_API_PORT: String(PORTS.api),
+    MODEL_ROUTER_GROK_OAUTH_PORT: String(PORTS.grokOauth),
+    MODEL_ROUTER_DEVIN_CLI_PORT: String(PORTS.devinCli),
+    MODEL_ROUTER_ANTIGRAVITY_OAUTH_PORT: String(PORTS.antigravityOauth),
     CODEX_HOME,
     CODEX_ROUTER_STATE_DIR: STATE_DIR,
     CODEX_ROUTER_QUIET: "1",
@@ -62,6 +92,8 @@ function wrapper() {
       process.env.CODEX_ROUTER_NATIVE_RETRY_BACKOFF_MS || "100",
     CODEX_ROUTER_NATIVE_RETRY_BUDGET_MS:
       process.env.CODEX_ROUTER_NATIVE_RETRY_BUDGET_MS || "60000",
+    ...serviceProxyEnvironment(),
+    ...antigravityClientSecretEnvironment(),
     // The LiteLLM gateway is a Python process. Force UTF-8 output so its
     // startup banner and logs do not crash on Windows systems whose default
     // ANSI/OEM code page is not UTF-8 (e.g. Russian cp1251), where Python
@@ -70,7 +102,7 @@ function wrapper() {
     PYTHONUTF8: "1",
     ...(process.env.KIMI_CODE_HOME ? { KIMI_CODE_HOME: process.env.KIMI_CODE_HOME } : {}),
   };
-  return `@echo off\r\n${Object.entries(variables)
+  return `@echo off\r\nsetlocal DisableDelayedExpansion\r\n${Object.entries(variables)
     .map(([key, value]) => `set "${key}=${cmdEscape(value)}"`)
     .join("\r\n")}\r\n"${cmdEscape(process.execPath)}" "${cmdEscape(start)}" >> "${cmdEscape(LOG_PATH)}" 2>&1\r\n`;
 }
@@ -108,6 +140,11 @@ function launcher() {
 }
 
 function schtasks(args, options = {}) {
+  // Queries are intentionally not skipped: status must report whether the
+  // named task exists. Callers mark only service-manager mutations below.
+  if (options.mutating && skipServiceManagerCall({ hostManaged: HOST_MANAGED })) {
+    return "";
+  }
   return execFileSync("schtasks.exe", args, {
     encoding: "utf8",
     stdio: options.quiet ? ["ignore", "ignore", "ignore"] : ["ignore", "pipe", "pipe"],
@@ -115,14 +152,32 @@ function schtasks(args, options = {}) {
 }
 
 function writeAtomic(target, contents) {
+  guardLauncherWrite();
   const temporary = `${target}.tmp.${process.pid}`;
-  writeFileSync(temporary, contents);
-  // renameSync replaces an existing destination on Windows, so reinstalling
-  // over an older launcher pair is a plain overwrite rather than a conflict.
-  renameSync(temporary, target);
+  try {
+    writeFileSync(temporary, contents, { mode: 0o600 });
+    // Proxy URLs may contain credentials. Protect both the temporary file and
+    // the replaced launcher so Windows does not leave the secret readable via
+    // inherited ACLs (POSIX mode bits are kept in step for deterministic tests).
+    protectPrivateFile(temporary);
+    // renameSync replaces an existing destination on Windows, so reinstalling
+    // over an older launcher pair is a plain overwrite rather than a conflict.
+    renameSync(temporary, target);
+    protectPrivateFile(target);
+  } catch (error) {
+    try {
+      unlinkSync(temporary);
+    } catch {
+      // Best effort cleanup; preserve the original write/ACL error.
+    }
+    throw error;
+  }
 }
 
-function writeLaunchers(wrapperContents) {
+function writeLaunchers(wrapperContents = wrapper()) {
+  // Refuse before creating the state directory. A test must never leave even
+  // an empty directory behind in the user's real install location.
+  guardLauncherWrite();
   mkdirSync(STATE_DIR, { recursive: true });
   writeAtomic(wrapperPath, Buffer.from(wrapperContents, "utf8"));
   // wscript.exe parses a script file with the system ANSI code page unless the
@@ -147,6 +202,10 @@ function taskAction() {
 }
 
 function installTask() {
+  // PowerShell is a second Task Scheduler path, independent of schtasks().
+  // Keep it behind the same mutation guard so tests cannot register or replace
+  // the user's real task.
+  if (skipServiceManagerCall({ hostManaged: HOST_MANAGED })) return;
   const { execute, argument } = taskAction();
   const script = [
     // The action strings travel through the environment so that the quotes
@@ -186,7 +245,7 @@ function installTask() {
         "LIMITED",
         "/F",
       ],
-      { quiet: true },
+      { quiet: true, mutating: true },
     );
   }
 }
@@ -204,6 +263,12 @@ const TASK_STOP_POLL_MS = 250;
 // Every state query has to return for the deadline above to mean anything, so a
 // wedged PowerShell is capped rather than allowed to hang the install outright.
 const TASK_STATE_TIMEOUT_MS = 15_000;
+// Task Scheduler can report Ready before the detached cmd/node descendants
+// have gone away. Give the verified tree and its ports their own bounded wait
+// after task state changes, so restart never races the old listener.
+const SERVICE_TREE_STOP_TIMEOUT_MS = 15_000;
+const SERVICE_TREE_STOP_POLL_MS = 250;
+const SERVICE_TREE_COMMAND_TIMEOUT_MS = 2_000;
 
 function sleep(milliseconds) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
@@ -220,15 +285,99 @@ function waitForTaskToStop() {
   }
 }
 
-function endTask() {
+function servicePorts(state) {
+  const ports = state?.ports && typeof state.ports === "object" ? state.ports : PORTS;
+  return [...new Set(Object.values(ports).filter((port) => Number.isSafeInteger(port) && port > 0))];
+}
+
+// `taskkill /T /F` is the ownership boundary. This netstat check is only a
+// final readiness guard: if an unrelated process owns one of the configured
+// ports it is never killed, and restart waits until the normal readiness check
+// can report the conflict instead of claiming the old tree was stopped.
+function managedPortStillListening(state) {
+  // netstat is a machine-wide probe. It is not needed to exercise fixture
+  // service lifecycle code and can observe unrelated listeners, so keep it
+  // out of real Windows test runs.
+  if (skipServiceManagerCall({ hostManaged: HOST_MANAGED })) return false;
   try {
-    schtasks(["/End", "/TN", taskName], { quiet: true });
+    const output = execFileSync("netstat.exe", ["-ano", "-p", "tcp"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: SERVICE_TREE_COMMAND_TIMEOUT_MS,
+      windowsHide: true,
+    });
+    const ports = new Set(servicePorts(state).map((port) => `:${port}`));
+    return String(output)
+      .split(/\r?\n/)
+      .some((line) => {
+        const fields = line.trim().split(/\s+/);
+        const local = String(fields[1] || "");
+        const colon = local.lastIndexOf(":");
+        const suffix = colon >= 0 ? local.slice(colon) : local;
+        return fields[0] === "TCP" && fields[3] === "LISTENING" && ports.has(suffix);
+      });
   } catch {
-    // The task may not exist, or may not be running; either way there is no
-    // instance left to wait for.
+    // A missing/blocked netstat cannot prove a listener is present. The
+    // identity-checked process tree is still terminated below, and the normal
+    // health probe remains the final readiness check.
+    return false;
+  }
+}
+
+function stopOwnedServiceTree() {
+  // This path can issue taskkill and then poll process/port state for 15s.
+  // Under test, the service-manager mutation was skipped, so there is no
+  // owned tree to stop and no reason to touch the host or wait on it.
+  if (skipServiceManagerCall({ hostManaged: HOST_MANAGED })) return;
+  const state = readServiceProcessState();
+  if (!state || state.pid === process.pid || !serviceProcessOwns(state, { platform: effectivePlatform })) {
     return;
   }
+  try {
+    execFileSync("taskkill.exe", ["/PID", String(state.pid), "/T", "/F"], {
+      encoding: "utf8",
+      stdio: ["ignore", "ignore", "ignore"],
+      timeout: SERVICE_TREE_COMMAND_TIMEOUT_MS,
+      windowsHide: true,
+    });
+  } catch {
+    // A process that already exited is the desired state. If taskkill failed
+    // for another reason, the bounded wait below leaves the record intact so a
+    // later stop can try the same verified identity again.
+  }
+  const deadline = Date.now() + SERVICE_TREE_STOP_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    const alive = serviceProcessOwns(state, { platform: effectivePlatform });
+    const listening = managedPortStillListening(state);
+    if (!alive && !listening) {
+      clearServiceProcessState();
+      return;
+    }
+    sleep(SERVICE_TREE_STOP_POLL_MS);
+  }
+  if (
+    !serviceProcessOwns(state, { platform: effectivePlatform }) &&
+    !managedPortStillListening(state)
+  ) {
+    clearServiceProcessState();
+  }
+}
+
+function endTask() {
+  // Do not poll after a skipped `/End`: taskState is a truthful read, but in a
+  // test there was no mutation to wait for and a missing PowerShell can spend
+  // the full timeout. This also keeps Kimi OAuth cleanup bounded.
+  const managerSkipped = skipServiceManagerCall({ hostManaged: HOST_MANAGED });
+  if (managerSkipped) return;
+  try {
+    schtasks(["/End", "/TN", taskName], { quiet: true, mutating: true });
+  } catch {
+    // The task may not exist, or may not be running. An orphaned router root
+    // can still be recorded even in that case, so continue to the ownership
+    // cleanup rather than returning early.
+  }
   waitForTaskToStop();
+  stopOwnedServiceTree();
 }
 
 // Only a task that still exists can be started. `Register-ScheduledTask -Force`
@@ -266,6 +415,23 @@ function taskState() {
   return undefined;
 }
 
+async function taskRunning(state) {
+  if (state === "running") return true;
+  // Task Scheduler can answer Ready while its detached launcher is still
+  // serving. Reuse the process-level probe that guards startup readiness, but
+  // keep an unavailable query inconclusive so a restricted shell cannot turn
+  // an idle task into a false running service.
+  const corroborated = await windowsScheduledTaskState({
+    taskName,
+    platform: effectivePlatform,
+    timeoutMs: TASK_STATE_TIMEOUT_MS,
+  });
+  // Neither signal is sufficient alone: COM instances can outlive their
+  // process, while the machine-wide launcher scan can also see a manually
+  // started router. Only their conjunction corroborates this task.
+  return corroborated?.instanceCount > 0 && corroborated?.launcherAlive === true;
+}
+
 if (
   !new Set([
     "install",
@@ -292,8 +458,12 @@ if (command === "render") {
 } else if (command === "render-task") {
   process.stdout.write(`${JSON.stringify(taskAction())}\n`);
 } else if (command === "install") {
-  // Validate and render before the recovery block: invalid configuration must
-  // not be reported as a recovered scheduled-task installation.
+  // Keep the guard outside the scheduler-recovery catch below. An unredirected
+  // test install is a safety violation, not a restricted Task Scheduler
+  // failure, and must exit non-zero without touching the host filesystem.
+  guardLauncherWrite();
+  // Validate the rendered wrapper before entering scheduler recovery. Invalid
+  // proxy configuration is not a Task Scheduler failure and must stay fatal.
   const wrapperContents = wrapper();
   try {
     // Writing the launchers belongs inside the try: renameSync over the .vbs
@@ -307,7 +477,7 @@ if (command === "render") {
     // hidden run — the console window would survive until the next logon.
     endTask();
     installTask();
-    schtasks(["/Run", "/TN", taskName], { quiet: true });
+    schtasks(["/Run", "/TN", taskName], { quiet: true, mutating: true });
   } catch {
     // Scheduled-task creation can be restricted in a non-elevated terminal. The
     // launchers are still written, so the install is reported as success and
@@ -318,16 +488,21 @@ if (command === "render") {
     // snapshot was taken, and re-creating the old console-visible action would
     // reintroduce the very defect this launcher exists to fix.
     try {
-      if (taskExists()) schtasks(["/Run", "/TN", taskName], { quiet: true });
+      if (taskExists()) schtasks(["/Run", "/TN", taskName], { quiet: true, mutating: true });
     } catch {
       // Nothing left to start; the caller's readiness check reports the failure.
     }
   }
-  process.stdout.write(`${JSON.stringify({ installed: true, path: wrapperPath })}\n`);
+  // Launchers alone are not an installed service. A restricted scheduler (or
+  // a test-mode mutation guard) must not claim success when the task is absent.
+  process.stdout.write(`${JSON.stringify({ installed: taskExists(), path: wrapperPath })}\n`);
 } else if (command === "uninstall") {
+  // Refuse before `/End`, `/Delete`, or any filesystem removal when a test has
+  // not redirected its service state directory.
+  guardLauncherWrite();
   endTask();
   try {
-    schtasks(["/Delete", "/TN", taskName, "/F"], { quiet: true });
+    schtasks(["/Delete", "/TN", taskName, "/F"], { quiet: true, mutating: true });
   } catch {
     // The task may not exist.
   }
@@ -342,15 +517,18 @@ if (command === "render") {
 } else if (command === "status") {
   let installed = false;
   let state = "stopped";
+  let loaded = false;
   try {
     schtasks(["/Query", "/TN", taskName, "/FO", "LIST", "/V"]);
     installed = true;
     state = taskState() || "ready";
+    loaded = await taskRunning(state);
+    if (loaded) state = "running";
   } catch {
     // Missing task.
   }
   process.stdout.write(
-    `${JSON.stringify({ installed, loaded: state === "running", state })}\n`,
+    `${JSON.stringify({ installed, loaded, state })}\n`,
   );
 } else if (command === "stop") {
   // Stopping is idempotent, like uninstall and restart: a task that is missing
@@ -359,6 +537,6 @@ if (command === "render") {
   process.stdout.write(`${JSON.stringify({ state: "stopped" })}\n`);
 } else {
   if (command === "restart") endTask();
-  schtasks(["/Run", "/TN", taskName], { quiet: true });
+  schtasks(["/Run", "/TN", taskName], { quiet: true, mutating: true });
   process.stdout.write(`${JSON.stringify({ state: "running" })}\n`);
 }
