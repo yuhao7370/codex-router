@@ -301,6 +301,16 @@
       <div class="stat-value"><span id="failover-badge" class="badge">…</span></div>
       <div class="stat-foot">上次切换：<span id="failover-last">…</span></div>
     </div>
+    <div class="card stat" id="router-service-card" hidden>
+      <div class="stat-label">Router 服务</div>
+      <div class="stat-value"><span id="router-service-state" class="badge">状态异常</span></div>
+      <div class="stat-actions">
+        <button id="router-start-btn">启动</button>
+        <button class="ghost" id="router-stop-btn">停止</button>
+        <button class="ghost" id="router-restart-btn">重启</button>
+      </div>
+      <div id="router-operation-result" class="result" hidden></div>
+    </div>
   </section>
 
   <section class="usage-panel" id="usage-panel-section">
@@ -457,6 +467,56 @@
   let currentPool = new Set();
   let blockedAccounts = new Set();
   let fastAccounts = new Set();
+  let routerOperationPending = false;
+  let routerServiceSnapshot = null;
+
+  function renderRouterService(snapshot) {
+    const state = snapshot?.state || 'failed';
+    el('router-service-state').textContent = ({
+      stopped: '已停止', starting: '启动中', running: '运行正常',
+      unhealthy: '运行但不健康', stopping: '停止中',
+      restarting: '重启中', failed: '状态异常',
+    })[state] || '状态异常';
+    const busy = routerOperationPending || ['starting', 'stopping', 'restarting'].includes(state);
+    el('router-start-btn').disabled = busy || state !== 'stopped';
+    el('router-stop-btn').disabled = busy || !['running', 'unhealthy'].includes(state);
+    el('router-restart-btn').disabled = busy || !['running', 'unhealthy'].includes(state);
+  }
+
+  async function loadRouterService() {
+    try {
+      routerServiceSnapshot = await api('api/router/status');
+      el('router-service-card').hidden = false;
+      renderRouterService(routerServiceSnapshot);
+    } catch (error) {
+      // Embedded mode deliberately has no lifecycle endpoint, so its card stays hidden.
+    }
+  }
+
+  function boundedRouterError(error) {
+    return String(error && error.message ? error.message : error).slice(0, 500);
+  }
+
+  async function runRouterAction(action) {
+    if (action === 'stop' && !confirm('停止 Router 服务会使活跃 Codex 请求断开。确定要停止吗？')) return;
+    if (action === 'restart' && !confirm('重启 Router 服务可能会中断活跃 Codex 请求。确定要重启吗？')) return;
+
+    routerOperationPending = true;
+    renderRouterService(routerServiceSnapshot);
+    hideResult('router-operation-result');
+    try {
+      routerServiceSnapshot = await api(`api/router/${action}`, { method: 'POST' });
+      renderRouterService(routerServiceSnapshot);
+      setResult('router-operation-result', true, ({
+        start: 'Router 服务已启动', stop: 'Router 服务已停止', restart: 'Router 服务已重启',
+      })[action]);
+    } catch (error) {
+      setResult('router-operation-result', false, '操作失败：' + boundedRouterError(error));
+    } finally {
+      routerOperationPending = false;
+      renderRouterService(routerServiceSnapshot);
+    }
+  }
 
   function buildAccountIndex(accounts) {
     accountIndex = new Map();
@@ -812,6 +872,9 @@
       setResult('test-result', false, '清除错误日志失败：' + error.message);
     }
   });
+  el('router-start-btn').addEventListener('click', function () { runRouterAction('start'); });
+  el('router-stop-btn').addEventListener('click', function () { runRouterAction('stop'); });
+  el('router-restart-btn').addEventListener('click', function () { runRouterAction('restart'); });
 
   let logIntervalMs = 2000;
   let accountsIntervalMs = 15000;
@@ -822,7 +885,7 @@
   let accountsTimer = null;
 
   async function pollLog() {
-    try { await loadStatus(); } catch (error) {}
+    try { await Promise.all([loadStatus(), loadRouterService()]); } catch (error) {}
     logNextAt = Date.now() + logIntervalMs;
     logTimer = setTimeout(pollLog, logIntervalMs);
   }
@@ -952,6 +1015,7 @@
     } catch (error) {}
     await loadAccounts();
     await loadStatus();
+    await loadRouterService();
     pollLog();
     pollAccounts();
   }
