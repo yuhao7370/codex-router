@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   chmodSync,
   closeSync,
@@ -23,6 +23,14 @@ const COMMAND_TIMEOUT_MS = 15_000;
 export const MAX_WINDOWS_TASK_SNAPSHOT_BYTES = 4 * 1024 * 1024;
 const SNAPSHOT_DIRECTORY = "windows-task-snapshots";
 const handles = new WeakMap();
+
+function sha256(contents) {
+  return createHash("sha256").update(contents).digest("hex");
+}
+
+function validSha256(value) {
+  return typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
+}
 
 export function runSchtasksCommand(args, options = {}) {
   if (
@@ -117,6 +125,26 @@ function taskSddlRestoreScript() {
     "$service.Connect()",
     "$task = $service.GetFolder('\\').GetTask([string]$env:CODEX_ROUTER_TASK)",
     "$task.SetSecurityDescriptor([string]$env:CODEX_ROUTER_RESTORE_TASK_SDDL, 0x10)",
+  ].join("\n");
+}
+
+function snapshotDefinitionValidationScript() {
+  return [
+    ...utf8Prelude(),
+    "$xmlPath = [string]$env:CODEX_ROUTER_VALIDATE_TASK_XML",
+    "if ($xmlPath) {",
+    "  $settings = [Xml.XmlReaderSettings]::new()",
+    "  $settings.DtdProcessing = [Xml.DtdProcessing]::Prohibit",
+    "  $settings.XmlResolver = $null",
+    "  $stream = [IO.File]::OpenRead($xmlPath)",
+    "  try {",
+    "    $reader = [Xml.XmlReader]::Create($stream, $settings)",
+    "    try { while ($reader.Read()) { } } finally { $reader.Dispose() }",
+    "  } finally { $stream.Dispose() }",
+    "}",
+    "$parsedSddls = ConvertFrom-Json -InputObject ([string]$env:CODEX_ROUTER_VALIDATE_TASK_SDDLS)",
+    "$sddls = if ($null -eq $parsedSddls) { @() } else { @($parsedSddls) }",
+    "foreach ($sddl in $sddls) { [void][Security.AccessControl.RawSecurityDescriptor]::new([string]$sddl) }",
   ].join("\n");
 }
 
@@ -259,6 +287,12 @@ function readManifest(handle) {
     ) {
       throw new Error("Windows task snapshot file list does not match its trusted paths.");
     }
+    if (
+      recorded.sha256 !== trusted.sha256
+      || (recorded.existed ? !validSha256(recorded.sha256) : recorded.sha256 !== null)
+    ) {
+      throw new Error("Windows task snapshot file digest does not match its trusted handle.");
+    }
   }
   if (manifest.exists) {
     if (
@@ -266,15 +300,20 @@ function readManifest(handle) {
       || !Number.isSafeInteger(manifest.xmlBytes)
       || manifest.xmlBytes < 1
       || manifest.xmlBytes > MAX_WINDOWS_TASK_SNAPSHOT_BYTES
+      || !validSha256(manifest.xmlSha256)
       || typeof manifest.sddl !== "string"
       || !manifest.sddl
       || typeof manifest.running !== "boolean"
     ) {
       throw new Error("Windows task snapshot task definition is incomplete.");
     }
+    if (manifest.xmlSha256 !== handle.xmlSha256) {
+      throw new Error("Windows task snapshot XML digest does not match its trusted handle.");
+    }
   } else if (
     manifest.xmlName !== null
     || manifest.xmlBytes !== 0
+    || manifest.xmlSha256 !== null
     || manifest.sddl !== null
     || manifest.running !== false
   ) {
@@ -283,7 +322,13 @@ function readManifest(handle) {
   return manifest;
 }
 
-function readSnapshotCopy(target, expectedBytes, label, { allowEmpty = false } = {}) {
+function readSnapshotCopy(
+  target,
+  expectedBytes,
+  expectedSha256,
+  label,
+  { allowEmpty = false } = {},
+) {
   const stats = lstatSync(target);
   if (
     stats.isSymbolicLink()
@@ -308,10 +353,31 @@ function readSnapshotCopy(target, expectedBytes, label, { allowEmpty = false } =
     ) {
       throw new Error(`Windows task snapshot ${label} is not one bounded exact copy.`);
     }
-    return Buffer.from(bounded.subarray(0, bytes));
+    const contents = Buffer.from(bounded.subarray(0, bytes));
+    if (!validSha256(expectedSha256) || sha256(contents) !== expectedSha256) {
+      throw new Error(`Windows task snapshot ${label} failed its integrity digest.`);
+    }
+    return contents;
   } finally {
     closeSync(descriptor);
   }
+}
+
+function validateSnapshotDefinition(xmlPath, manifest, dependencies) {
+  if (dependencies.platform !== "win32") return;
+  const sddls = [
+    ...(manifest.exists ? [manifest.sddl] : []),
+    ...manifest.files
+      .filter((record) => record.existed && record.acl?.kind === "sddl")
+      .map((record) => record.acl.value),
+  ];
+  dependencies.runPowerShell(snapshotDefinitionValidationScript(), {
+    env: {
+      ...process.env,
+      CODEX_ROUTER_VALIDATE_TASK_XML: xmlPath || "",
+      CODEX_ROUTER_VALIDATE_TASK_SDDLS: JSON.stringify(sddls),
+    },
+  });
 }
 
 function validateSnapshotAcl(target, acl, platform) {
@@ -385,6 +451,7 @@ export async function snapshotWindowsTask({
       throw new Error("Task Scheduler XML exceeds the snapshot maximum.");
     }
     if (metadata.exists) writePrivateFile(path.join(directory, "task.xml"), xml);
+    const xmlSha256 = metadata.exists ? sha256(xml) : null;
 
     const records = [];
     for (let index = 0; index < trustedFiles.length; index += 1) {
@@ -409,6 +476,7 @@ export async function snapshotWindowsTask({
         existed,
         backupName,
         bytes: contents?.length || 0,
+        sha256: contents ? sha256(contents) : null,
         acl,
       });
     }
@@ -419,6 +487,7 @@ export async function snapshotWindowsTask({
       exists: metadata.exists,
       xmlName: metadata.exists ? "task.xml" : null,
       xmlBytes: metadata.exists ? xml.length : 0,
+      xmlSha256,
       sddl: metadata.exists ? metadata.sddl : null,
       running: metadata.exists ? metadata.running : false,
       files: records,
@@ -436,11 +505,13 @@ export async function snapshotWindowsTask({
       directory,
       taskName,
       exists: manifest.exists,
-      files: records.map(({ path: target, existed, backupName, bytes }) => ({
+      xmlSha256,
+      files: records.map(({ path: target, existed, backupName, bytes, sha256: digest }) => ({
         path: target,
         existed,
         backupName,
         bytes,
+        sha256: digest,
       })),
       dependencies,
     });
@@ -471,6 +542,7 @@ export async function restoreWindowsTask(snapshot) {
       contents: readSnapshotCopy(
         path.join(handle.directory, record.backupName),
         record.bytes,
+        record.sha256,
         `copy ${record.backupName}`,
         { allowEmpty: true },
       ),
@@ -480,6 +552,7 @@ export async function restoreWindowsTask(snapshot) {
     ? readSnapshotCopy(
         path.join(handle.directory, manifest.xmlName),
         manifest.xmlBytes,
+        manifest.xmlSha256,
         "task XML",
       )
     : null;
@@ -491,6 +564,7 @@ export async function restoreWindowsTask(snapshot) {
     ? path.join(handle.directory, "restore-task.xml")
     : null;
   if (restoreXmlPath) writePrivateFile(restoreXmlPath, taskXml);
+  validateSnapshotDefinition(restoreXmlPath, manifest, dependencies);
 
   if (current.exists) {
     invokeIgnoringFailure(() => dependencies.runSchtasks(

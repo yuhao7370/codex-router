@@ -33,12 +33,15 @@ function windowsRunners({
   running = true,
   currentExists = exists,
   currentError,
+  taskXml = XML_BYTES,
+  taskSddl = SDDL,
+  validationError,
 } = {}) {
   const calls = [];
   let metadataReads = 0;
   const runSchtasks = (args) => {
     calls.push({ kind: "schtasks", args: [...args] });
-    if (args[0] === "/Query") return Buffer.from(XML_BYTES);
+    if (args[0] === "/Query") return Buffer.from(taskXml);
     if (args[0] === "/Create") {
       calls.push({ kind: "created-xml", bytes: readFileSync(args[4]) });
     }
@@ -66,13 +69,23 @@ function windowsRunners({
       });
       return "";
     }
+    if (env.CODEX_ROUTER_VALIDATE_TASK_XML) {
+      calls.push({
+        kind: "validate-definition",
+        path: env.CODEX_ROUTER_VALIDATE_TASK_XML,
+        sddls: env.CODEX_ROUTER_VALIDATE_TASK_SDDLS,
+        script: _script,
+      });
+      if (validationError) throw validationError;
+      return "";
+    }
     calls.push({ kind: "task-metadata", taskName: env.CODEX_ROUTER_TASK, script: _script });
     if (metadataReads > 0 && currentError) throw currentError;
     const taskExists = metadataReads === 0 ? exists : currentExists;
     metadataReads += 1;
     return JSON.stringify(
       taskExists
-        ? { exists: true, running, sddl: SDDL }
+        ? { exists: true, running, sddl: taskSddl }
         : { exists: false },
     );
   };
@@ -105,12 +118,14 @@ test("snapshot and restore preserve exact task definition, security, running sta
     assert.equal(snapshot.taskName, TASK_NAME);
     assert.equal(snapshot.exists, true);
     assert.deepEqual(snapshot.xml, XML_BYTES);
+    assert.match(snapshot.xmlSha256, /^[a-f0-9]{64}$/);
     assert.equal(snapshot.sddl, SDDL);
     assert.equal(snapshot.running, true);
     assert.deepEqual(snapshot.files.map(({ path: target, existed }) => ({ path: target, existed })), [
       { path: wrapper, existed: true },
       { path: shortcut, existed: true },
     ]);
+    assert.ok(snapshot.files.every(({ sha256 }) => /^[a-f0-9]{64}$/.test(sha256)));
     assert.ok(snapshot.directory.startsWith(path.resolve(stateDir) + path.sep));
 
     writeFileSync(wrapper, "changed", "utf8");
@@ -349,6 +364,123 @@ test("snapshot bounds and records the one file buffer read, never a stale stat s
       readFileSync(path.join(snapshot.directory, snapshot.files[0].backupName)),
       exactBytes,
     );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+function mutatingRunnerCalls(calls) {
+  return calls.filter(({ kind, args }) =>
+    (kind === "schtasks" && ["/End", "/Delete", "/Create", "/Run"].includes(args[0]))
+    || kind === "restore-file-acl"
+    || kind === "restore-task-sddl");
+}
+
+test("same-length launcher and XML corruption are rejected by digest before mutation", async () => {
+  for (const corrupt of ["launcher", "xml"]) {
+    const root = mkdtempSync(path.join(os.tmpdir(), `codex-router-same-length-${corrupt}-`));
+    const launcher = path.join(root, "router.cmd");
+    writeFileSync(launcher, "ABCDEF", "utf8");
+    const runners = windowsRunners();
+    try {
+      const snapshot = await snapshotWindowsTask({
+        taskName: TASK_NAME,
+        files: [launcher],
+        stateDir: path.join(root, "state"),
+        platform: "win32",
+        ...runners,
+      });
+      const sidecar = corrupt === "launcher"
+        ? path.join(snapshot.directory, snapshot.files[0].backupName)
+        : path.join(snapshot.directory, snapshot.xmlName);
+      const original = readFileSync(sidecar);
+      const changed = Buffer.from(original);
+      changed[Math.floor(changed.length / 2)] ^= 0x01;
+      writeFileSync(sidecar, changed);
+      writeFileSync(launcher, "LIVE!!", "utf8");
+      runners.calls.length = 0;
+
+      await assert.rejects(restoreWindowsTask(snapshot), /digest|integrity/i);
+      assert.equal(readFileSync(launcher, "utf8"), "LIVE!!");
+      assert.deepEqual(mutatingRunnerCalls(runners.calls), []);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("native XML and SDDL validation fails before every mutation", async () => {
+  for (const fixture of [
+    {
+      name: "xml",
+      taskXml: Buffer.from("<Task><broken></Task>", "utf8"),
+      taskSddl: SDDL,
+      error: new Error("XML syntax invalid"),
+    },
+    {
+      name: "sddl",
+      taskXml: XML_BYTES,
+      taskSddl: "not-an-sddl",
+      error: new Error("SDDL invalid"),
+    },
+  ]) {
+    const root = mkdtempSync(path.join(os.tmpdir(), `codex-router-invalid-${fixture.name}-`));
+    const launcher = path.join(root, "router.cmd");
+    writeFileSync(launcher, "before", "utf8");
+    const runners = windowsRunners({
+      taskXml: fixture.taskXml,
+      taskSddl: fixture.taskSddl,
+      validationError: fixture.error,
+    });
+    try {
+      const snapshot = await snapshotWindowsTask({
+        taskName: TASK_NAME,
+        files: [launcher],
+        stateDir: path.join(root, "state"),
+        platform: "win32",
+        ...runners,
+      });
+      writeFileSync(launcher, "live", "utf8");
+      runners.calls.length = 0;
+      await assert.rejects(restoreWindowsTask(snapshot), new RegExp(fixture.name, "i"));
+      assert.equal(readFileSync(launcher, "utf8"), "live");
+      assert.deepEqual(mutatingRunnerCalls(runners.calls), []);
+      const validation = runners.calls.find(({ kind }) => kind === "validate-definition");
+      assert.ok(validation);
+      assert.match(validation.script, /XmlReader/);
+      assert.match(validation.script, /RawSecurityDescriptor/);
+      assert.match(validation.script, /OutputEncoding = \$Utf8/);
+      assert.equal(validation.path, path.join(snapshot.directory, "restore-task.xml"));
+      assert.doesNotMatch(validation.script, new RegExp(launcher.replaceAll("\\", "\\\\")));
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("manifest digest tampering is rejected against the trusted handle before mutation", async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "codex-router-digest-manifest-"));
+  const launcher = path.join(root, "router.cmd");
+  writeFileSync(launcher, "before", "utf8");
+  const runners = windowsRunners();
+  try {
+    const snapshot = await snapshotWindowsTask({
+      taskName: TASK_NAME,
+      files: [launcher],
+      stateDir: path.join(root, "state"),
+      platform: "win32",
+      ...runners,
+    });
+    const manifestPath = path.join(snapshot.directory, "snapshot.json");
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+    manifest.files[0].sha256 = "0".repeat(64);
+    writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
+    writeFileSync(launcher, "live", "utf8");
+    runners.calls.length = 0;
+
+    await assert.rejects(restoreWindowsTask(snapshot), /trusted handle|digest/i);
+    assert.equal(readFileSync(launcher, "utf8"), "live");
+    assert.deepEqual(mutatingRunnerCalls(runners.calls), []);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
