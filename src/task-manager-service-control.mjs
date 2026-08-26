@@ -44,10 +44,6 @@ async function defaultRunServiceCommand(action) {
   await runServiceProcess(action);
 }
 
-function readableError(reason) {
-  return redactCallerUrl(String(reason?.message || reason)).slice(0, 500);
-}
-
 export function routerServiceLifecycle({ service, health, operation, serviceError } = {}) {
   if (operation?.action === "start") return "starting";
   if (operation?.action === "stop") return "stopping";
@@ -73,8 +69,12 @@ export function createRouterServiceController({
     ]);
     const service = serviceResult.status === "fulfilled" ? serviceResult.value : undefined;
     const health = healthResult.status === "fulfilled" ? healthResult.value : { ok: false };
-    const serviceError = serviceResult.status === "rejected" ? readableError(serviceResult.reason) : undefined;
-    const healthError = healthResult.status === "rejected" ? readableError(healthResult.reason) : undefined;
+    const serviceError = serviceResult.status === "rejected"
+      ? "Router service status unavailable."
+      : undefined;
+    const healthError = healthResult.status === "rejected"
+      ? "Router health unavailable."
+      : undefined;
     const state = routerServiceLifecycle({ service, health, operation, serviceError, healthError });
     return { state, service, health, operation, serviceError, healthError };
   };

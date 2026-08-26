@@ -12,11 +12,36 @@ import {
   stopOwnedManagerProcess,
   taskManagerServiceStatus,
   taskAction,
+  taskActionIsCanonical,
 } from "../src/task-manager-service-windows.mjs";
 
 const root = path.resolve(".");
 const serviceScript = path.join(root, "src", "task-manager-service-windows.mjs");
 const dispatcherScript = path.join(root, "src", "task-manager-service.mjs");
+
+function canonicalTask(action, overrides = {}) {
+  const currentUser = "EXAMPLE\\operator";
+  return {
+    known: true,
+    exists: true,
+    state: "running",
+    actionCount: 1,
+    action,
+    currentUser,
+    principal: { userId: currentUser, logonType: "interactive", runLevel: "limited" },
+    triggerCount: 1,
+    trigger: { type: "MSFT_TaskLogonTrigger", userId: currentUser, enabled: true },
+    settings: {
+      restartCount: 999,
+      restartInterval: "PT1M",
+      executionTimeLimit: "PT0S",
+      disallowStartIfOnBatteries: false,
+      stopIfGoingOnBatteries: false,
+      multipleInstances: "ignorenew",
+    },
+    ...overrides,
+  };
+}
 
 function run(command, stateDir, extraEnv = {}) {
   return spawnSync(process.execPath, [serviceScript, command], {
@@ -160,6 +185,7 @@ test("status keeps a scheduler query failure unknown", async () => {
     queryTask: async () => ({ known: false }),
     readProcessState: () => undefined,
     readHealth: async () => undefined,
+    readPortOwner: async () => ({ known: false, pid: null }),
   });
   assert.deepEqual(status, {
     installed: null,
@@ -168,6 +194,7 @@ test("status keeps a scheduler query failure unknown", async () => {
     canonical: null,
     healthy: false,
     pid: null,
+    listener: "unknown",
   });
 });
 
@@ -179,14 +206,10 @@ test("status requires canonical task, owned process, and exact health identity",
   };
   const status = await taskManagerServiceStatus({
     stateDir: "C:/state",
-    queryTask: async () => ({
-      known: true,
-      exists: true,
-      state: "running",
-      action: expectedAction,
-    }),
+    queryTask: async () => canonicalTask(expectedAction),
     readProcessState: () => processState,
     processOwns: (state) => state === processState,
+    readPortOwner: async () => ({ known: true, pid: 42 }),
     readHealth: async () => ({
       ok: true,
       service: "codex-router-task-manager",
@@ -201,18 +224,15 @@ test("status requires canonical task, owned process, and exact health identity",
     canonical: true,
     healthy: true,
     pid: 42,
+    listener: "owned",
   });
 
   const wrongIdentity = await taskManagerServiceStatus({
     stateDir: "C:/state",
-    queryTask: async () => ({
-      known: true,
-      exists: true,
-      state: "running",
-      action: expectedAction,
-    }),
+    queryTask: async () => canonicalTask(expectedAction),
     readProcessState: () => processState,
     processOwns: () => true,
+    readPortOwner: async () => ({ known: true, pid: 42 }),
     readHealth: async () => ({
       ok: true,
       service: "codex-router-task-manager",
@@ -224,19 +244,78 @@ test("status requires canonical task, owned process, and exact health identity",
   assert.equal(wrongIdentity.pid, 42);
 });
 
+test("task canonicality covers principal, login trigger, recovery, power, and instance policy", () => {
+  const action = taskAction({ stateDir: "C:/state" });
+  const task = canonicalTask(action);
+  assert.equal(taskActionIsCanonical(task, { stateDir: "C:/state" }), true);
+
+  const drifts = [
+    { principal: { ...task.principal, userId: "EXAMPLE\\other" } },
+    { principal: { ...task.principal, logonType: "password" } },
+    { principal: { ...task.principal, runLevel: "highest" } },
+    { trigger: { ...task.trigger, type: "time" } },
+    { trigger: { ...task.trigger, userId: "EXAMPLE\\other" } },
+    { settings: { ...task.settings, restartCount: 3 } },
+    { settings: { ...task.settings, restartInterval: "PT5M" } },
+    { settings: { ...task.settings, executionTimeLimit: "PT72H" } },
+    { settings: { ...task.settings, disallowStartIfOnBatteries: true } },
+    { settings: { ...task.settings, stopIfGoingOnBatteries: true } },
+    { settings: { ...task.settings, multipleInstances: "parallel" } },
+  ];
+  for (const drift of drifts) {
+    assert.equal(taskActionIsCanonical({ ...task, ...drift }, { stateDir: "C:/state" }), false);
+  }
+});
+
+test("status rejects health whose PID does not own the bound control port", async () => {
+  const processState = { pid: 42 };
+  const status = await taskManagerServiceStatus({
+    stateDir: "C:/state",
+    queryTask: async () => canonicalTask(taskAction({ stateDir: "C:/state" })),
+    readProcessState: () => processState,
+    processOwns: () => true,
+    readPortOwner: async () => ({ known: true, pid: 99 }),
+    readHealth: async () => ({
+      ok: true,
+      service: "codex-router-task-manager",
+      mode: "standalone",
+      pid: 42,
+    }),
+  });
+  assert.equal(status.healthy, false);
+  assert.equal(status.listener, "foreign");
+});
+
+test("status cannot be healthy when the live task definition is noncanonical", async () => {
+  const processState = { pid: 42 };
+  const expected = canonicalTask(taskAction({ stateDir: "C:/state" }));
+  const status = await taskManagerServiceStatus({
+    stateDir: "C:/state",
+    queryTask: async () => ({
+      ...expected,
+      settings: { ...expected.settings, restartCount: 1 },
+    }),
+    readProcessState: () => processState,
+    processOwns: () => true,
+    readPortOwner: async () => ({ known: true, pid: 42 }),
+    readHealth: async () => ({
+      ok: true,
+      service: "codex-router-task-manager",
+      mode: "standalone",
+      pid: 42,
+    }),
+  });
+  assert.equal(status.canonical, false);
+  assert.equal(status.healthy, false);
+});
+
 test("component purge stops exact ownership and removes only created service artifacts", async () => {
   const calls = [];
   await purgeTaskManagerCreatedServiceComponents(
     { task: false, wrapper: false, launcher: true },
     {
       stateDir: "C:/state",
-      queryTask: async () => ({
-        known: true,
-        exists: true,
-        state: "running",
-        actionCount: 1,
-        action: taskAction({ stateDir: "C:/state" }),
-      }),
+      queryTask: async () => canonicalTask(taskAction({ stateDir: "C:/state" })),
       endTask: async () => calls.push("end"),
       stopOwnedProcess: async () => calls.push("stop-owned"),
       deleteTask: async () => calls.push("delete-task"),

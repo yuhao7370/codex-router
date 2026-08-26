@@ -50,11 +50,42 @@ function dependencies(overrides = {}) {
 }
 
 async function start(options) {
-  const server = startTaskManagerUi({ port: 0, ...options });
+  const server = startTaskManagerUi({ port: 0, quiet: true, ...options });
   if (!server.listening) await once(server, "listening");
   const address = server.address();
   assert.ok(typeof address === "object" && address);
   return { server, origin: `http://127.0.0.1:${address.port}` };
+}
+
+function mutationHeaders(origin, overrides = {}) {
+  const headers = {
+    origin,
+    "sec-fetch-site": "same-origin",
+    "content-type": "application/json",
+    ...overrides,
+  };
+  for (const [name, value] of Object.entries(headers)) {
+    if (value === undefined) delete headers[name];
+  }
+  return headers;
+}
+
+function rawPostStatus(url, headers) {
+  const target = new URL(url);
+  return new Promise((resolve, reject) => {
+    const request = http.request({
+      host: target.hostname,
+      port: target.port,
+      path: `${target.pathname}${target.search}`,
+      method: "POST",
+      headers,
+    }, (response) => {
+      response.resume();
+      response.once("end", () => resolve(response.statusCode));
+    });
+    request.once("error", reject);
+    request.end("{}");
+  });
 }
 
 async function close(server) {
@@ -119,36 +150,35 @@ test("standalone POST routes require same-origin JSON before service control", a
   const restartUrl = `${origin}${taskManagerPath(CALLER_KEY)}api/router/restart`;
 
   try {
+    const refused = [
+      mutationHeaders(origin, { origin: undefined }),
+      mutationHeaders(origin, { "sec-fetch-site": undefined }),
+      mutationHeaders(origin, { "sec-fetch-site": "same-site" }),
+      mutationHeaders(origin, { origin: "https://example.invalid" }),
+    ];
+    for (const headers of refused) {
+      assert.equal(
+        (await fetch(restartUrl, { method: "POST", headers, body: "{}" })).status,
+        403,
+        JSON.stringify(headers),
+      );
+      assert.equal(deps.calls.length, 0);
+    }
     assert.equal(
-      (
-        await fetch(restartUrl, {
-          method: "POST",
-          headers: { origin: "https://example.invalid", "content-type": "application/json" },
-          body: "{}",
-        })
-      ).status,
+      await rawPostStatus(restartUrl, mutationHeaders(origin, { host: "example.invalid" })),
       403,
     );
     assert.equal(deps.calls.length, 0);
 
-    assert.equal(
-      (
-        await fetch(restartUrl, {
-          method: "POST",
-          headers: { "sec-fetch-site": "cross-site", "content-type": "application/json" },
-          body: "{}",
-        })
-      ).status,
-      403,
-    );
-    assert.equal(deps.calls.length, 0);
-
-    assert.equal((await fetch(restartUrl, { method: "POST", body: "{}" })).status, 415);
-    assert.equal(deps.calls.length, 0);
+    for (const contentType of [undefined, "application/jsonp", "application/json; charset"]) {
+      const headers = mutationHeaders(origin, { "content-type": contentType });
+      assert.equal((await fetch(restartUrl, { method: "POST", headers, body: "{}" })).status, 415);
+      assert.equal(deps.calls.length, 0);
+    }
 
     const accepted = await fetch(restartUrl, {
       method: "POST",
-      headers: { origin, "content-type": "application/json" },
+      headers: mutationHeaders(origin, { "content-type": "application/json; charset=utf-8" }),
       body: "{}",
     });
     assert.equal(accepted.status, 200);
@@ -193,7 +223,7 @@ test("standalone status uses Router runtime and reports it unavailable when offl
 
     const mutation = await fetch(`${apiBase}disable`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: mutationHeaders(origin),
       body: "{}",
     }).then((response) => response.json());
     assert.deepEqual(mutation.runtimeRefresh, { ok: true });
@@ -214,12 +244,12 @@ test("standalone status uses Router runtime and reports it unavailable when offl
     };
     const savedOffline = await fetch(`${apiBase}pool`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: mutationHeaders(origin),
       body: JSON.stringify({ ids: ["saved-while-offline"] }),
     }).then((response) => response.json());
     assert.equal(savedOffline.runtimeRefresh.ok, false);
     assert.doesNotMatch(savedOffline.runtimeRefresh.error, new RegExp(CALLER_KEY));
-    assert.match(savedOffline.runtimeRefresh.error, /\[REDACTED\]/);
+    assert.equal(savedOffline.runtimeRefresh.error, "Router runtime refresh failed.");
     assert.deepEqual(savedOffline.pool.ids, ["saved-while-offline"]);
   } finally {
     await close(server);
@@ -251,7 +281,7 @@ test("standalone configuration mutations never refresh the host bridge runtime",
   const apiBase = `${origin}${taskManagerPath(CALLER_KEY)}api/`;
   const post = (leaf, body = {}) => fetch(`${apiBase}${leaf}`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: mutationHeaders(origin),
     body: JSON.stringify(body),
   });
 
@@ -280,6 +310,82 @@ test("embedded mode keeps root routes and hides Router lifecycle routes", async 
     assert.equal((await fetch(`${origin}/`)).status, 200);
     assert.equal((await fetch(`${origin}/api/router/status`)).status, 404);
     assert.equal(deps.calls.length, 0);
+  } finally {
+    await close(server);
+  }
+});
+
+test("quiet test servers skip pricing sync and diagnostics while normal defaults schedule them", async () => {
+  let quietSyncs = 0;
+  const quietLogs = [];
+  const quietServer = await start({
+    mode: "embedded",
+    quiet: true,
+    pricingSyncDelayMs: 0,
+    syncPricing: async () => { quietSyncs += 1; return { ok: true, modelCount: 1 }; },
+    writeDiagnostic: (message) => quietLogs.push(message),
+  });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  await close(quietServer.server);
+  assert.equal(quietSyncs, 0);
+  assert.deepEqual(quietLogs, []);
+
+  let normalSyncs = 0;
+  const normalLogs = [];
+  const normalServer = await start({
+    mode: "embedded",
+    quiet: false,
+    pricingSyncDelayMs: 0,
+    syncPricing: async () => { normalSyncs += 1; return { ok: true, modelCount: 1 }; },
+    writeDiagnostic: (message) => normalLogs.push(message),
+  });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  await close(normalServer.server);
+  assert.equal(normalSyncs, 1);
+  assert.equal(normalLogs.some((message) => /task-manager UI/.test(message)), true);
+  assert.equal(normalLogs.some((message) => /pricing synced/.test(message)), true);
+});
+
+test("standalone browser errors never expose runtime or provider credentials", async () => {
+  const secrets = [
+    "CALLER_CAPABILITY_SENTINEL_1234567890",
+    "CTM_TOKEN_SENTINEL_1234567890",
+    "ACCESS_TOKEN_SENTINEL_1234567890",
+    "sk-provider-sentinel-1234567890",
+  ];
+  const secretText = secrets.join(" ");
+  const deps = dependencies({
+    runtimeClient: {
+      reload: async () => { throw new Error(secretText); },
+    },
+    serviceController: {
+      perform: async () => { throw new Error(secretText); },
+    },
+  });
+  const { server, origin } = await start({
+    mode: "standalone",
+    callerSecret: CALLER_KEY,
+    ...deps,
+  });
+  const apiBase = `${origin}${taskManagerPath(CALLER_KEY)}api/`;
+
+  try {
+    const saved = await fetch(`${apiBase}disable`, {
+      method: "POST",
+      headers: mutationHeaders(origin),
+      body: "{}",
+    }).then((response) => response.json());
+    assert.equal(saved.runtimeRefresh.error, "Router runtime refresh failed.");
+
+    const failed = await fetch(`${apiBase}router/restart`, {
+      method: "POST",
+      headers: mutationHeaders(origin),
+      body: "{}",
+    }).then((response) => response.json());
+    assert.equal(failed.error, "Task Manager request failed.");
+    for (const secret of secrets) {
+      assert.equal(JSON.stringify({ saved, failed }).includes(secret), false);
+    }
   } finally {
     await close(server);
   }

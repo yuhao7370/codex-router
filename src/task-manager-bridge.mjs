@@ -12,7 +12,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { protectPrivateFile } from "./file-security.mjs";
-import { STATE_DIR } from "./paths.mjs";
+import { STATE_DIR, TASK_MANAGER_CONFIG_PATH } from "./paths.mjs";
 
 const VERSION = 1;
 const DEFAULT_PORT = 6000;
@@ -32,10 +32,11 @@ const FAILOVER_TRIGGER_STATUSES = new Set([401, 402, 403, 429]);
 // skip it for a few minutes. 402 covers deactivated_workspace / payment
 // required, 401/403 cover revoked or banned credentials.
 const BLOCK_STATUSES = new Set([401, 402, 403]);
-const STATE_PATH = path.join(STATE_DIR, "task-manager.json");
+const STATE_PATH = TASK_MANAGER_CONFIG_PATH;
 const ERROR_LOG_PATH = path.join(STATE_DIR, "task-manager-errors.jsonl");
 
 const MAX_INJECTION_EVENTS = 100;
+const INJECTION_ROUTE = /\/(?:v1\/)?(?:responses(?:\/compact)?|images\/(?:edits|generations)|alpha\/search)$/;
 
 // The active account fetched from Codex_Task_Manager. `null` means the bridge
 // has no usable account right now, which makes the native path fall back to
@@ -362,7 +363,7 @@ export function recordInjection(accountId, pathname, fastSource) {
   injectionEvents.unshift({
     at: new Date().toISOString(),
     accountId,
-    path: pathname || "",
+    path: new URL(String(pathname || "/"), "http://127.0.0.1").pathname.match(INJECTION_ROUTE)?.[0] || "",
     ...(source ? { fast: true, fastSource: source } : {}),
   });
   if (injectionEvents.length > MAX_INJECTION_EVENTS) {
@@ -374,16 +375,32 @@ export function injectionStats() {
   return { count: injectionCount, recent: injectionEvents.slice(0, 20) };
 }
 
+function ctmHttpError(status) {
+  const safeStatus = Number(status);
+  const bounded = Number.isSafeInteger(safeStatus) && safeStatus >= 100 && safeStatus <= 599
+    ? safeStatus
+    : undefined;
+  const error = new Error(
+    bounded
+      ? `Codex_Task_Manager request failed (HTTP ${bounded}).`
+      : "Codex_Task_Manager request failed.",
+  );
+  if (bounded) error.status = bounded;
+  return error;
+}
+
 export async function testTaskManagerConnection() {
   const state = readTaskManagerConfig();
   try {
     const { status, body } = await requestJson(state.port, tokenFor(state), "/health");
-    return { ok: status === 200, status, body };
-  } catch (error) {
+    return status === 200
+      ? { ok: true, status, body }
+      : { ok: false, status, error: ctmHttpError(status).message };
+  } catch {
     return {
       ok: false,
       status: 0,
-      error: error instanceof Error ? error.message : String(error),
+      error: "Codex_Task_Manager request failed.",
     };
   }
 }
@@ -396,9 +413,7 @@ export async function listTaskManagerAccounts() {
     "/api/auth/accounts",
   );
   if (status !== 200) {
-    throw new Error(
-      `Codex_Task_Manager returned HTTP ${status}: ${body?.error || "unknown error"}`,
-    );
+    throw ctmHttpError(status);
   }
   return body;
 }
@@ -412,9 +427,7 @@ export async function selectTaskManagerAccount(id, { updateRuntime = true } = {}
     "POST",
   );
   if (status !== 200) {
-    throw new Error(
-      `Select account failed: ${body?.error || `HTTP ${status}`}`,
-    );
+    throw ctmHttpError(status);
   }
   if (updateRuntime) await refreshActiveAccount();
   return body;
@@ -433,7 +446,7 @@ export async function importTaskManagerAccount(
     authJson,
   );
   if (status !== 200) {
-    throw new Error(body?.error || `Codex_Task_Manager returned HTTP ${status}`);
+    throw ctmHttpError(status);
   }
   if (updateRuntime) await refreshActiveAccount();
   return body;
@@ -485,12 +498,12 @@ export async function refreshActiveAccount() {
     lastRefreshFailure = {
       kind: status === 409 ? "account" : "network",
       status,
-      error: body?.error || null,
+      error: ctmHttpError(status).message,
     };
-  } catch (error) {
+  } catch {
     lastRefreshFailure = {
       kind: "network",
-      error: error instanceof Error ? error.message : String(error),
+      error: "Codex_Task_Manager request failed.",
     };
   }
   cached = null;
@@ -758,7 +771,7 @@ export async function refreshPool() {
     { ids: state.pool },
   );
   if (status !== 200) {
-    throw new Error(body?.error || `Codex_Task_Manager returned HTTP ${status}`);
+    throw ctmHttpError(status);
   }
   poolCredentials = (body.accounts || [])
     .map((account) => {

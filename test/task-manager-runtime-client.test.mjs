@@ -29,14 +29,19 @@ test("runtime client uses only the protected task-manager leaf", async () => {
   assert.equal(seen[1].options.body, "{}");
 });
 
-test("runtime client surfaces the Router error response", async () => {
+test("runtime client exposes only the Router HTTP status", async () => {
+  const secret = "sk-provider-runtime-sentinel-1234567890";
   const client = createTaskManagerRuntimeClient({
     callerSecret: CALLER_KEY,
     fetchImpl: async () =>
-      new Response(JSON.stringify({ error: { message: "runtime unavailable" } }), {
+      new Response(JSON.stringify({ error: { message: secret } }), {
         status: 503,
       }),
   });
 
-  await assert.rejects(client.snapshot(), /runtime unavailable/);
+  await assert.rejects(client.snapshot(), (error) => {
+    assert.equal(error.message, "Router runtime request failed (HTTP 503).");
+    assert.equal(error.message.includes(secret), false);
+    return true;
+  });
 });

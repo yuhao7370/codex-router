@@ -9,6 +9,7 @@ import {
 } from "./caller-auth.mjs";
 import { openInBrowser } from "./open-browser.mjs";
 import { CALLER_SECRET_PATH, TASK_MANAGER_CONTROL_PORT } from "./paths.mjs";
+import { classifyTaskManagerPortOwner } from "./task-manager-install.mjs";
 
 const PROBE_TIMEOUT_MS = 2_000;
 const PRINT_WARNING =
@@ -56,19 +57,23 @@ export async function openTaskManager({
   openBrowser = openInBrowser,
   printOnly = false,
   readCallerSecret = callerSecret,
+  classifyOwner = classifyTaskManagerPortOwner,
   controlPort = TASK_MANAGER_CONTROL_PORT,
   writeOutput = (value) => process.stdout.write(value),
   writeWarning = (value) => process.stderr.write(value),
 } = {}) {
   const origin = `http://127.0.0.1:${controlPort}`;
-  let mode;
+  const mode = await classifyOwner({ controlPort });
+  if (mode !== "standalone" && mode !== "embedded") {
+    throw new Error(
+      `Task Manager port ${controlPort} is not owned by a recognized Router installation; refusing to open it.`,
+    );
+  }
   let url;
 
-  if (await standaloneHealth(fetchImpl, origin)) {
-    mode = "standalone";
+  if (mode === "standalone" && await standaloneHealth(fetchImpl, origin)) {
     url = taskManagerUrl(controlPort, assertCallerSecret(readCallerSecret().trim()));
-  } else if (await embeddedRootResponds(fetchImpl, origin)) {
-    mode = "embedded";
+  } else if (mode === "embedded" && await embeddedRootResponds(fetchImpl, origin)) {
     url = `${origin}/`;
   } else {
     throw new Error(

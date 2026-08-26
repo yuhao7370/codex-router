@@ -10,9 +10,10 @@ const callerKey = "TEST_DOCTOR_CALLER_CAPABILITY_MUST_NOT_APPEAR";
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 function healthyFixture(overrides = {}) {
+  const present = { known: true, present: true };
   return {
     platform: "win32",
-    standalone: true,
+    markerState: { known: true, exists: true, enabled: true, state: "enabled" },
     service: {
       installed: true,
       loaded: true,
@@ -20,6 +21,7 @@ function healthyFixture(overrides = {}) {
       canonical: true,
       healthy: true,
       pid: 4111,
+      listener: "owned",
     },
     health: {
       ok: true,
@@ -27,7 +29,14 @@ function healthyFixture(overrides = {}) {
       mode: "standalone",
       pid: 4111,
     },
-    privateState: { caller: true, marker: true, process: true },
+    components: {
+      task: present,
+      wrapper: present,
+      launcher: present,
+      shortcut: present,
+      process: present,
+    },
+    privateState: { caller: true, marker: true, process: true, config: true },
     routerMode: "standalone",
     ...overrides,
   };
@@ -55,9 +64,66 @@ test("standalone Task Manager reports four healthy doctor rows", () => {
   assertRow(rows, "Task Manager topology", "ok");
 });
 
-test("non-Windows and marker-disabled modes add no Task Manager warnings", () => {
+test("non-Windows and a missing marker with proven-absent components add no rows", () => {
+  const absent = { known: true, present: false };
   assert.deepEqual(taskManagerDoctorRows(healthyFixture({ platform: "linux" })), []);
-  assert.deepEqual(taskManagerDoctorRows(healthyFixture({ standalone: false })), []);
+  assert.deepEqual(taskManagerDoctorRows(healthyFixture({
+    markerState: { known: true, exists: false, enabled: false, state: "missing" },
+    service: {
+      installed: false,
+      loaded: false,
+      state: "stopped",
+      canonical: false,
+      healthy: false,
+      pid: null,
+      listener: "absent",
+    },
+    components: {
+      task: absent,
+      wrapper: absent,
+      launcher: absent,
+      shortcut: absent,
+      process: absent,
+    },
+  })), []);
+});
+
+test("missing, malformed, and disabled markers fail closed for every manager component", () => {
+  const absent = { known: true, present: false };
+  const present = { known: true, present: true };
+  const emptyComponents = {
+    task: absent,
+    wrapper: absent,
+    launcher: absent,
+    shortcut: absent,
+    process: absent,
+  };
+  const evidence = [
+    ["installed", { service: { ...healthyFixture().service, installed: true, loaded: false, state: "ready", healthy: false, pid: null } }],
+    ["running", { service: { ...healthyFixture().service, installed: true, loaded: true, state: "running" } }],
+    ...["task", "wrapper", "launcher", "shortcut", "process"].map((name) => [
+      name,
+      { service: { installed: false, loaded: false, state: "stopped", canonical: false, healthy: false, pid: null, listener: "absent" }, components: { ...emptyComponents, [name]: present } },
+    ]),
+  ];
+  for (const state of ["missing", "malformed", "disabled"]) {
+    const markerState = state === "missing"
+      ? { known: true, exists: false, enabled: false, state }
+      : state === "disabled"
+        ? { known: true, exists: true, enabled: false, state }
+        : { known: false, exists: true, enabled: false, state };
+    for (const [name, overrides] of evidence) {
+      const rows = taskManagerDoctorRows(healthyFixture({
+        markerState,
+        components: emptyComponents,
+        ...overrides,
+      }));
+      assertRow(rows, "Task Manager service", "fail");
+      assertRow(rows, "Task Manager privacy", "fail");
+      assertRow(rows, "Task Manager topology", "fail");
+      assert.doesNotMatch(JSON.stringify(rows), /4111|C:\\|_codex-router|sentinel/i, `${state}/${name}`);
+    }
+  }
 });
 
 test("an enabled marker with a missing or unknown task fails closed", () => {
@@ -109,11 +175,19 @@ test("manager health must match the recognized process identity", () => {
   );
 });
 
-test("every private Task Manager state file must be protected", () => {
-  for (const field of ["caller", "marker", "process"]) {
+test("a foreign control-port listener fails both service and topology rows", () => {
+  const rows = taskManagerDoctorRows(healthyFixture({
+    service: { ...healthyFixture().service, listener: "foreign", healthy: false },
+  }));
+  assertRow(rows, "Task Manager service", "fail");
+  assertRow(rows, "Task Manager topology", "fail");
+});
+
+test("every private Task Manager state file including token configuration must be protected", () => {
+  for (const field of ["caller", "marker", "process", "config"]) {
     assertSafeFailure(
       taskManagerDoctorRows(healthyFixture({
-        privateState: { caller: true, marker: true, process: true, [field]: false, callerKey },
+        privateState: { caller: true, marker: true, process: true, config: true, [field]: false, callerKey },
       })),
       "Task Manager privacy",
       "doctor --fix",

@@ -2,8 +2,9 @@ import http from "node:http";
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { MIMEType } from "node:util";
 
-import { authenticatedRoute, redactCallerUrl } from "./caller-auth.mjs";
+import { authenticatedRoute } from "./caller-auth.mjs";
 import {
   activeAccount,
   clearBlockedAccount,
@@ -139,7 +140,23 @@ async function statusPayload({ standalone, runtimeClient }) {
 }
 
 function safeError(error) {
-  return redactCallerUrl(error instanceof Error ? error.message : String(error)).slice(0, 500);
+  const status = Number(error?.status);
+  return Number.isSafeInteger(status) && status >= 100 && status <= 599
+    ? `Task Manager request failed (HTTP ${status}).`
+    : "Task Manager request failed.";
+}
+
+function isJsonMediaType(value) {
+  const raw = String(value || "");
+  const parameters = raw.split(";").slice(1);
+  if (parameters.some((parameter) => !parameter.trim() || !parameter.includes("="))) {
+    return false;
+  }
+  try {
+    return new MIMEType(raw).essence.toLowerCase() === "application/json";
+  } catch {
+    return false;
+  }
 }
 
 function sendJson(response, status, body) {
@@ -181,6 +198,10 @@ export function startTaskManagerUi({
   runtimeClient,
   serviceController,
   restartRouter,
+  quiet = false,
+  syncPricing = syncModelsDevPricing,
+  pricingSyncDelayMs = 5_000,
+  writeDiagnostic = (message) => console.error(message),
 } = {}) {
   const standalone = mode === "standalone";
   const mutationOptions = standalone ? { updateRuntime: false } : undefined;
@@ -195,8 +216,8 @@ export function startTaskManagerUi({
     try {
       await runtimeClient.reload();
       return { ok: true };
-    } catch (error) {
-      return { ok: false, error: safeError(error) };
+    } catch {
+      return { ok: false, error: "Router runtime refresh failed." };
     }
   };
   const refreshedStatus = async () => {
@@ -208,8 +229,8 @@ export function startTaskManagerUi({
     const timer = setTimeout(() => {
       Promise.resolve()
         .then(performRouterRestart)
-        .catch((error) => {
-          console.error(`[codex-router] task-manager restart failed: ${safeError(error)}`);
+        .catch(() => {
+          writeDiagnostic("[codex-router] task-manager restart failed");
         });
     }, 500);
     timer.unref();
@@ -222,7 +243,11 @@ export function startTaskManagerUi({
           response.setHeader(name, value);
         }
       }
-      const url = new URL(request.url, `http://${request.headers.host || `${HOST}:${port}`}`);
+      const address = server.address();
+      const boundPort = typeof address === "object" && address ? address.port : port;
+      const expectedHost = `${HOST}:${boundPort}`;
+      const expectedOrigin = `http://${expectedHost}`;
+      const url = new URL(request.url, expectedOrigin);
       if (standalone && request.method === "GET" && url.pathname === "/health") {
         return sendJson(response, 200, {
           ok: true,
@@ -243,18 +268,14 @@ export function startTaskManagerUi({
         return sendJson(response, 401, { error: "caller capability required" });
       }
       if (standalone && request.method === "POST") {
-        const expectedOrigin = `http://${request.headers.host}`;
-        if (request.headers.origin && request.headers.origin !== expectedOrigin) {
-          return sendJson(response, 403, { error: "cross-origin mutation refused" });
-        }
-        if (request.headers["sec-fetch-site"] === "cross-site") {
+        if (
+          request.headers.host !== expectedHost
+          || request.headers.origin !== expectedOrigin
+          || request.headers["sec-fetch-site"] !== "same-origin"
+        ) {
           return sendJson(response, 403, { error: "cross-site mutation refused" });
         }
-        if (
-          !String(request.headers["content-type"] || "")
-            .toLowerCase()
-            .startsWith("application/json")
-        ) {
+        if (!isJsonMediaType(request.headers["content-type"])) {
           return sendJson(response, 415, { error: "application/json required" });
         }
       }
@@ -464,24 +485,28 @@ export function startTaskManagerUi({
   server.listen(port, HOST, () => {
     const address = server.address();
     const boundPort = typeof address === "object" && address ? address.port : port;
-    console.error(`[codex-router] task-manager UI at http://127.0.0.1:${boundPort}`);
+    if (!quiet) {
+      writeDiagnostic(`[codex-router] task-manager UI at http://127.0.0.1:${boundPort}`);
+    }
   });
 
   // Refresh the models.dev price snapshot in the background without delaying
   // startup. The panel keeps working on seed prices while this is in flight.
-  const pricingTimer = setTimeout(() => {
-    syncModelsDevPricing()
+  const pricingTimer = quiet ? undefined : setTimeout(() => {
+    syncPricing()
       .then((result) => {
         if (result.ok) {
-          console.error(`[codex-router] models.dev pricing synced (${result.modelCount} models)`);
+          writeDiagnostic(`[codex-router] models.dev pricing synced (${result.modelCount} models)`);
         } else {
-          console.error(`[codex-router] models.dev pricing sync failed: ${result.error}`);
+          writeDiagnostic("[codex-router] models.dev pricing sync failed");
         }
       })
       .catch(() => {});
-  }, 5_000);
-  pricingTimer.unref();
-  server.once("close", () => clearTimeout(pricingTimer));
+  }, Math.max(0, Number(pricingSyncDelayMs) || 0));
+  pricingTimer?.unref();
+  server.once("close", () => {
+    if (pricingTimer) clearTimeout(pricingTimer);
+  });
 
   return server;
 }

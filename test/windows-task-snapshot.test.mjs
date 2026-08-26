@@ -485,3 +485,38 @@ test("manifest digest tampering is rejected against the trusted handle before mu
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("trusted manifest bytes pin task security, file ACL, and running state", async () => {
+  const cases = [
+    ["task-sddl", (manifest) => { manifest.sddl = "D:P(A;;FA;;;SY)"; }],
+    ["file-acl", (manifest) => { manifest.files[0].acl.value = "D:P(A;;FR;;;OW)"; }],
+    ["running-state", (manifest) => { manifest.running = false; }],
+  ];
+  for (const [name, tamper] of cases) {
+    const root = mkdtempSync(path.join(os.tmpdir(), `codex-router-manifest-${name}-`));
+    const launcher = path.join(root, "router.cmd");
+    writeFileSync(launcher, "before", "utf8");
+    const runners = windowsRunners();
+    try {
+      const snapshot = await snapshotWindowsTask({
+        taskName: TASK_NAME,
+        files: [launcher],
+        stateDir: path.join(root, "state"),
+        platform: "win32",
+        ...runners,
+      });
+      const manifestPath = path.join(snapshot.directory, "snapshot.json");
+      const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+      tamper(manifest);
+      writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
+      writeFileSync(launcher, "live", "utf8");
+      runners.calls.length = 0;
+
+      await assert.rejects(restoreWindowsTask(snapshot), /manifest|digest|trusted/i, name);
+      assert.equal(readFileSync(launcher, "utf8"), "live", name);
+      assert.deepEqual(mutatingRunnerCalls(runners.calls), [], name);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+});

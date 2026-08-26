@@ -17,17 +17,22 @@ export function taskManagerStandaloneState(
       || stats.size < 2
       || stats.size > MAX_STATE_BYTES
     ) {
-      return { known: false, exists: true, enabled: false };
+      return { known: false, exists: true, enabled: false, state: "malformed" };
     }
     const state = JSON.parse(readFileSync(statePath, "utf8"));
-    if (state?.version !== VERSION || state?.enabled !== true) {
-      return { known: false, exists: true, enabled: false };
+    if (state?.version !== VERSION || typeof state?.enabled !== "boolean") {
+      return { known: false, exists: true, enabled: false, state: "malformed" };
     }
-    return { known: true, exists: true, enabled: true };
+    return {
+      known: true,
+      exists: true,
+      enabled: state.enabled,
+      state: state.enabled ? "enabled" : "disabled",
+    };
   } catch (error) {
     return error?.code === "ENOENT"
-      ? { known: true, exists: false, enabled: false }
-      : { known: false, exists: true, enabled: false };
+      ? { known: true, exists: false, enabled: false, state: "missing" }
+      : { known: false, exists: true, enabled: false, state: "malformed" };
   }
 }
 

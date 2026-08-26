@@ -24,6 +24,7 @@ import {
   assertServiceWriteIsolated,
   skipServiceManagerCall,
 } from "./service-write-guard.mjs";
+import { windowsLoopbackPortOwner } from "./windows-listener-owner.mjs";
 
 const HOST_MANAGED = process.platform === "win32";
 const effectivePlatform = process.env.CODEX_ROUTER_SERVICE_PLATFORM || process.platform;
@@ -221,24 +222,31 @@ function powershell(script, options = {}) {
   throw lastError || new Error("PowerShell is unavailable.");
 }
 
-function taskQueryScript() {
-  const taskName = TASK_MANAGER_TASK_NAME.replaceAll("'", "''");
+function taskQueryScript(taskName = TASK_MANAGER_TASK_NAME) {
+  const escapedTaskName = taskName.replaceAll("'", "''");
   return [
     "$ErrorActionPreference = 'Stop'",
     "[Console]::OutputEncoding = [Text.Encoding]::UTF8",
-    `$task = @(Get-ScheduledTask -ErrorAction Stop | Where-Object { $_.TaskName -eq '${taskName}' -and $_.TaskPath -eq '\\' })`,
+    `$task = @(Get-ScheduledTask -ErrorAction Stop | Where-Object { $_.TaskName -eq '${escapedTaskName}' -and $_.TaskPath -eq '\\' })`,
     "if ($task.Count -eq 0) { [Console]::Out.Write('{\"exists\":false}'); exit 0 }",
     "if ($task.Count -ne 1) { throw 'Task name is ambiguous.' }",
     "$actions = @($task[0].Actions)",
     "$action = if ($actions.Count -gt 0) { $actions[0] } else { $null }",
-    "$payload = [ordered]@{ exists = $true; state = $task[0].State.ToString(); actionCount = $actions.Count; action = [ordered]@{ execute = [string]$action.Execute; argument = [string]$action.Arguments } }",
-    "[Console]::Out.Write(($payload | ConvertTo-Json -Compress -Depth 3))",
+    "$triggers = @($task[0].Triggers)",
+    "$trigger = if ($triggers.Count -gt 0) { $triggers[0] } else { $null }",
+    "$principal = $task[0].Principal",
+    "$settings = $task[0].Settings",
+    "$payload = [ordered]@{ exists = $true; state = $task[0].State.ToString(); currentUser = [Security.Principal.WindowsIdentity]::GetCurrent().Name; actionCount = $actions.Count; action = [ordered]@{ execute = [string]$action.Execute; argument = [string]$action.Arguments }; principal = [ordered]@{ userId = [string]$principal.UserId; logonType = $principal.LogonType.ToString(); runLevel = $principal.RunLevel.ToString() }; triggerCount = $triggers.Count; trigger = [ordered]@{ type = [string]$trigger.CimClass.CimClassName; userId = [string]$trigger.UserId; enabled = [bool]$trigger.Enabled }; settings = [ordered]@{ restartCount = [int]$settings.RestartCount; restartInterval = [string]$settings.RestartInterval; executionTimeLimit = [string]$settings.ExecutionTimeLimit; disallowStartIfOnBatteries = [bool]$settings.DisallowStartIfOnBatteries; stopIfGoingOnBatteries = [bool]$settings.StopIfGoingOnBatteries; multipleInstances = $settings.MultipleInstances.ToString() } }",
+    "[Console]::Out.Write(($payload | ConvertTo-Json -Compress -Depth 5))",
   ].join("; ");
 }
 
-export async function queryScheduledTask({ runPowerShell = powershell } = {}) {
+export async function queryScheduledTask({
+  taskName = TASK_MANAGER_TASK_NAME,
+  runPowerShell = powershell,
+} = {}) {
   try {
-    const output = runPowerShell(taskQueryScript(), {
+    const output = runPowerShell(taskQueryScript(taskName), {
       timeout: TASK_SCHEDULER_QUERY_TIMEOUT_MS,
     }).trim();
     const task = JSON.parse(output);
@@ -250,6 +258,11 @@ export async function queryScheduledTask({ runPowerShell = powershell } = {}) {
       || typeof task.action.execute !== "string"
       || typeof task.action.argument !== "string"
       || !Number.isSafeInteger(task.actionCount)
+      || typeof task.currentUser !== "string"
+      || !task.principal
+      || !task.trigger
+      || !task.settings
+      || !Number.isSafeInteger(task.triggerCount)
     ) {
       return { known: false };
     }
@@ -259,18 +272,41 @@ export async function queryScheduledTask({ runPowerShell = powershell } = {}) {
       state: task.state.toLowerCase(),
       actionCount: task.actionCount,
       action: task.action,
+      currentUser: task.currentUser,
+      principal: task.principal,
+      triggerCount: task.triggerCount,
+      trigger: task.trigger,
+      settings: task.settings,
     };
   } catch {
     return { known: false };
   }
 }
 
-export function taskActionIsCanonical(task, { stateDir = STATE_DIR } = {}) {
+export function scheduledTaskDefinitionIsCanonical(task, expectedAction) {
   if (!task?.exists || !task.action) return false;
-  if (task.actionCount !== undefined && task.actionCount !== 1) return false;
-  const expected = taskAction({ stateDir });
-  return normalized(task.action.execute) === normalized(expected.execute)
-    && normalized(task.action.argument) === normalized(expected.argument);
+  const currentUser = normalized(task.currentUser);
+  return task.actionCount === 1
+    && normalized(task.action.execute) === normalized(expectedAction?.execute)
+    && normalized(task.action.argument) === normalized(expectedAction?.argument)
+    && currentUser.length > 0
+    && normalized(task.principal?.userId) === currentUser
+    && normalized(task.principal?.logonType) === "interactive"
+    && normalized(task.principal?.runLevel) === "limited"
+    && task.triggerCount === 1
+    && normalized(task.trigger?.type) === "msft_tasklogontrigger"
+    && normalized(task.trigger?.userId) === currentUser
+    && task.trigger?.enabled === true
+    && task.settings?.restartCount === 999
+    && normalized(task.settings?.restartInterval) === "pt1m"
+    && normalized(task.settings?.executionTimeLimit) === "pt0s"
+    && task.settings?.disallowStartIfOnBatteries === false
+    && task.settings?.stopIfGoingOnBatteries === false
+    && normalized(task.settings?.multipleInstances) === "ignorenew";
+}
+
+export function taskActionIsCanonical(task, { stateDir = STATE_DIR } = {}) {
+  return scheduledTaskDefinitionIsCanonical(task, taskAction({ stateDir }));
 }
 
 function assertTaskReadable(task) {
@@ -434,6 +470,8 @@ export async function taskManagerServiceStatus({
   readProcessState = readTaskManagerProcessState,
   processOwns = taskManagerProcessOwns,
   readHealth = readManagerHealth,
+  readPortOwner = windowsLoopbackPortOwner,
+  controlPort = TASK_MANAGER_CONTROL_PORT,
 } = {}) {
   let task;
   try {
@@ -459,9 +497,23 @@ export async function taskManagerServiceStatus({
     && processOwns(processState, { platform, sourceRoot, stateDir }),
   );
   const pid = owned ? processState.pid : null;
-  const health = await readHealth();
+  const [health, portOwner] = await Promise.all([
+    readHealth(),
+    readPortOwner({ port: controlPort, platform }),
+  ]);
+  const listener = portOwner?.known !== true
+    ? "unknown"
+    : portOwner.pid === null
+      ? "absent"
+      : owned && portOwner.pid === pid
+        ? "owned"
+        : "foreign";
   const healthy = Boolean(
-    owned
+    installed
+    && loaded
+    && canonical
+    && owned
+    && listener === "owned"
     && health?.ok === true
     && health.service === "codex-router-task-manager"
     && health.mode === "standalone"
@@ -475,6 +527,7 @@ export async function taskManagerServiceStatus({
     canonical,
     healthy,
     pid,
+    listener,
   };
 }
 

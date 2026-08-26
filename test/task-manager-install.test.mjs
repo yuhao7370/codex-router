@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
+import path from "node:path";
 import test from "node:test";
 
 import {
+  assertRouterTaskReplaceable,
   classifyTaskManagerPortOwner,
   embeddedTaskManagerPageContract,
   parseCreatedTaskManagerComponents,
@@ -11,6 +13,44 @@ import {
   verifyEmbeddedTaskManager,
   windowsTaskManagerPortOwner,
 } from "../src/task-manager-install.mjs";
+
+function canonicalTask(action, overrides = {}) {
+  const currentUser = "EXAMPLE\\operator";
+  return {
+    known: true,
+    exists: true,
+    state: "running",
+    actionCount: 1,
+    action,
+    currentUser,
+    principal: { userId: currentUser, logonType: "interactive", runLevel: "limited" },
+    triggerCount: 1,
+    trigger: { type: "MSFT_TaskLogonTrigger", userId: currentUser, enabled: true },
+    settings: {
+      restartCount: 999,
+      restartInterval: "PT1M",
+      executionTimeLimit: "PT0S",
+      disallowStartIfOnBatteries: false,
+      stopIfGoingOnBatteries: false,
+      multipleInstances: "IgnoreNew",
+    },
+    ...overrides,
+  };
+}
+
+function managerTask(stateDir) {
+  return canonicalTask({
+    execute: "wscript.exe",
+    argument: `//B //NoLogo "${path.join(stateDir, "start-codex-router-task-manager-hidden.vbs")}"`,
+  });
+}
+
+function routerTask(stateDir) {
+  return canonicalTask({
+    execute: "wscript.exe",
+    argument: `//B //NoLogo "${path.join(stateDir, "start-codex-router-hidden.vbs")}"`,
+  });
+}
 
 function transactionDeps({
   owner = "embedded",
@@ -39,6 +79,7 @@ function transactionDeps({
     deps: {
       checkPortOwner: () => step("port-owner-check", owner),
       preflightManagerTask: () => step("manager-preflight"),
+      preflightRouterTask: () => step("router-preflight"),
       standaloneEnabled: () => previousStandalone,
       setStandaloneEnabled: (enabled) => {
         const name = enabled ? "marker-enable" : "marker-disable";
@@ -79,7 +120,7 @@ test("install commits in the fixed manager-before-Router order", async () => {
   const fixture = transactionDeps();
   await runTaskManagerInstall("install", fixture.deps);
   assert.deepEqual(fixture.calls, [
-    "port-owner-check", "manager-preflight", "snapshot-router", "snapshot-manager", "service-stop", "manager-install", "manager-health",
+    "port-owner-check", "manager-preflight", "router-preflight", "snapshot-router", "snapshot-manager", "service-stop", "manager-install", "manager-health",
     "shortcut-install", "marker-enable", "service-install", "router-health",
     "manager-snapshot-discard", "router-snapshot-discard",
   ]);
@@ -92,7 +133,7 @@ test("install failure restores marker, both exact generations, and a healthy Rou
     /service-install failed/,
   );
   assert.deepEqual(fixture.calls, [
-    "port-owner-check", "manager-preflight", "snapshot-router", "snapshot-manager", "service-stop", "manager-install", "manager-health",
+    "port-owner-check", "manager-preflight", "router-preflight", "snapshot-router", "snapshot-manager", "service-stop", "manager-install", "manager-health",
     "shortcut-install", "marker-enable", "service-install", "marker-disable", "manager-restore", "router-restore",
     "router-start-restored", "router-health", "embedded-health", "manager-snapshot-discard", "router-snapshot-discard",
   ]);
@@ -189,6 +230,7 @@ test("partial snapshot acquisition discards earlier evidence before any mutation
   assert.deepEqual(fixture.calls, [
     "port-owner-check",
     "manager-preflight",
+    "router-preflight",
     "snapshot-router",
     "snapshot-manager",
     "router-snapshot-discard",
@@ -218,6 +260,16 @@ test("a noncanonical same-name manager refuses before snapshots or Router stop",
   assert.deepEqual(fixture.calls, ["port-owner-check", "manager-preflight"]);
 });
 
+test("a foreign main Router task refuses before snapshots or service mutation", async () => {
+  const fixture = transactionDeps({ failAt: "router-preflight" });
+  await assert.rejects(runTaskManagerInstall("install", fixture.deps), /router-preflight failed/);
+  assert.deepEqual(fixture.calls, [
+    "port-owner-check",
+    "manager-preflight",
+    "router-preflight",
+  ]);
+});
+
 test("an unknown port 4111 owner refuses before every snapshot or mutation", async () => {
   const fixture = transactionDeps({ owner: "unknown" });
   await assert.rejects(
@@ -231,7 +283,7 @@ test("uninstall restores the embedded manager before commit and purge never rest
   const uninstall = transactionDeps({ owner: "standalone", previousStandalone: true });
   await runTaskManagerInstall("uninstall", uninstall.deps);
   assert.deepEqual(uninstall.calls, [
-    "port-owner-check", "manager-preflight", "snapshot-router", "snapshot-manager", "manager-uninstall", "shortcut-uninstall",
+    "port-owner-check", "manager-preflight", "router-preflight", "snapshot-router", "snapshot-manager", "manager-uninstall", "shortcut-uninstall",
     "marker-disable", "service-install", "embedded-health", "router-health",
     "manager-snapshot-discard", "router-snapshot-discard",
   ]);
@@ -304,13 +356,16 @@ test("selective purge restarts a wholly pre-existing standalone manager", async 
 
 test("production port classifier binds HTTP identities to the actual owning PID", async () => {
   const root = "C:/Router Root";
+  const stateDir = "C:/Router State";
   const managerState = { pid: 52 };
   const embeddedCalls = [];
   assert.equal(await classifyTaskManagerPortOwner({
     sourceRoot: root,
+    stateDir,
     readPortOwner: async () => ({ known: true, pid: 41 }),
     readManagerHealth: async () => undefined,
-    readRouterHealth: async () => ({ service: "codex-router", taskManagerMode: "embedded", pid: 41 }),
+    readManagerTask: async () => ({ known: true, exists: false }),
+    readRouterTask: async () => routerTask(stateDir),
     readProcessCommandLine: (pid) => {
       embeddedCalls.push(pid);
       return `node.exe "${root}/src/router.mjs"`;
@@ -321,6 +376,7 @@ test("production port classifier binds HTTP identities to the actual owning PID"
 
   assert.equal(await classifyTaskManagerPortOwner({
     sourceRoot: root,
+    stateDir,
     readPortOwner: async () => ({ known: true, pid: 52 }),
     readManagerHealth: async () => ({
       ok: true,
@@ -328,7 +384,8 @@ test("production port classifier binds HTTP identities to the actual owning PID"
       mode: "standalone",
       pid: 52,
     }),
-    readRouterHealth: async () => undefined,
+    readManagerTask: async () => managerTask(stateDir),
+    readRouterTask: async () => routerTask(stateDir),
     readProcessCommandLine: () => "unrelated",
     readManagerProcessState: () => managerState,
     managerProcessOwns: (state) => state === managerState,
@@ -336,6 +393,7 @@ test("production port classifier binds HTTP identities to the actual owning PID"
 
   assert.equal(await classifyTaskManagerPortOwner({
     sourceRoot: root,
+    stateDir,
     readPortOwner: async () => ({ known: true, pid: 99 }),
     readManagerHealth: async () => ({
       ok: true,
@@ -343,11 +401,84 @@ test("production port classifier binds HTTP identities to the actual owning PID"
       mode: "standalone",
       pid: 52,
     }),
-    readRouterHealth: async () => ({ service: "codex-router", taskManagerMode: "embedded", pid: 52 }),
+    readManagerTask: async () => managerTask(stateDir),
+    readRouterTask: async () => routerTask(stateDir),
     readProcessCommandLine: () => `node.exe "${root}/src/not-router.mjs"`,
     readManagerProcessState: () => managerState,
     managerProcessOwns: () => true,
   }), "unknown");
+});
+
+test("port classification refuses spoofed health and Router commands without canonical tasks", async () => {
+  const root = "C:/Router Root";
+  const stateDir = "C:/Router State";
+  const state = { pid: 52 };
+  assert.equal(await classifyTaskManagerPortOwner({
+    sourceRoot: root,
+    stateDir,
+    readPortOwner: async () => ({ known: true, pid: 52 }),
+    readManagerHealth: async () => ({
+      ok: true,
+      service: "codex-router-task-manager",
+      mode: "standalone",
+      pid: 52,
+    }),
+    readManagerTask: async () => canonicalTask(managerTask(stateDir).action, {
+      principal: { ...managerTask(stateDir).principal, runLevel: "highest" },
+    }),
+    readRouterTask: async () => ({ known: true, exists: false }),
+    readManagerProcessState: () => state,
+    managerProcessOwns: () => true,
+    readProcessCommandLine: () => "unrelated",
+  }), "unknown");
+
+  assert.equal(await classifyTaskManagerPortOwner({
+    sourceRoot: root,
+    stateDir,
+    readPortOwner: async () => ({ known: true, pid: 52 }),
+    readManagerHealth: async () => ({
+      ok: true,
+      service: "codex-router-task-manager",
+      mode: "standalone",
+      pid: 52,
+    }),
+    readManagerTask: async () => ({ ...managerTask(stateDir), state: "ready" }),
+    readRouterTask: async () => ({ known: true, exists: false }),
+    readManagerProcessState: () => state,
+    managerProcessOwns: () => true,
+    readProcessCommandLine: () => "unrelated",
+  }), "unknown");
+
+  assert.equal(await classifyTaskManagerPortOwner({
+    sourceRoot: root,
+    stateDir,
+    readPortOwner: async () => ({ known: true, pid: 41 }),
+    readManagerHealth: async () => undefined,
+    readManagerTask: async () => ({ known: true, exists: false }),
+    readRouterTask: async () => canonicalTask(routerTask(stateDir).action, {
+      settings: { ...routerTask(stateDir).settings, multipleInstances: "parallel" },
+    }),
+    readManagerProcessState: () => undefined,
+    readProcessCommandLine: () => `node.exe "${root}/src/router.mjs"`,
+  }), "unknown");
+});
+
+test("main Router preflight accepts missing or canonical tasks and refuses drift", async () => {
+  const stateDir = "C:/Router State";
+  assert.equal((await assertRouterTaskReplaceable({
+    stateDir,
+    queryTask: async () => ({ known: true, exists: false }),
+  })).exists, false);
+  assert.equal((await assertRouterTaskReplaceable({
+    stateDir,
+    queryTask: async () => routerTask(stateDir),
+  })).exists, true);
+  await assert.rejects(assertRouterTaskReplaceable({
+    stateDir,
+    queryTask: async () => canonicalTask(routerTask(stateDir).action, {
+      trigger: { ...routerTask(stateDir).trigger, userId: "EXAMPLE\\other" },
+    }),
+  }), /noncanonical.*Codex Router/i);
 });
 
 test("Router topology is read only from the protected capability health leaf", async () => {
@@ -498,5 +629,6 @@ test("status exposes fail-closed component baselines instead of converting unkno
     launcher: { known: true, present: false },
     shortcut: { known: true, present: true },
     marker: { known: false, present: true },
+    process: { known: true, present: true },
   });
 });

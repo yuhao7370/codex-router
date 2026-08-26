@@ -49,17 +49,23 @@ test("failed operations release the controller for a later action", async () => 
   assert.equal((await controller.perform("start")).state, "stopped");
 });
 
-test("snapshot redacts caller URLs in observation failures", async () => {
-  const secret = "test-caller-secret-0123456789abcdef";
+test("snapshot uses fixed observation failures without credential-shaped details", async () => {
+  const secrets = [
+    "test-caller-secret-0123456789abcdef",
+    "ctm-token-sentinel-0123456789abcdef",
+    "access-token-sentinel-0123456789abcdef",
+    "sk-provider-sentinel-0123456789abcdef",
+  ];
   const controller = createRouterServiceController({
     readServiceStatus: async () => {
-      throw new Error(`status failed at http://127.0.0.1:4202/_codex-router/${secret}/v1/status`);
+      throw new Error(secrets.join(" "));
     },
-    readHealth: async () => ({ ok: false }),
+    readHealth: async () => { throw new Error(secrets.join(" ")); },
   });
 
   const result = await controller.snapshot();
   assert.equal(result.state, "failed");
-  assert.doesNotMatch(result.serviceError, new RegExp(secret));
-  assert.match(result.serviceError, /\[REDACTED\]/);
+  assert.equal(result.serviceError, "Router service status unavailable.");
+  assert.equal(result.healthError, "Router health unavailable.");
+  for (const secret of secrets) assert.equal(JSON.stringify(result).includes(secret), false);
 });

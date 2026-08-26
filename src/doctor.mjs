@@ -27,7 +27,7 @@ import { readHiddenModels } from "./model-picker-state.mjs";
 import { serviceFollowsHostApps } from "./presence-state.mjs";
 import { waitForRouterHealth } from "./router-health.mjs";
 import { taskManagerDoctorRows } from "./task-manager-doctor.mjs";
-import { taskManagerStandaloneEnabled } from "./task-manager-standalone-state.mjs";
+import { taskManagerStandaloneState } from "./task-manager-standalone-state.mjs";
 import {
   CALLER_SECRET_PATH,
   CODEX_AGENTS_DIR,
@@ -43,6 +43,7 @@ import {
   PORTS,
   SOURCE_ROOT,
   TASK_MANAGER_CONTROL_PORT,
+  TASK_MANAGER_CONFIG_PATH,
   TASK_MANAGER_PROCESS_STATE_PATH,
   TASK_MANAGER_STANDALONE_PATH,
   TARGET,
@@ -1170,24 +1171,26 @@ add(
   "Run ./bin/doctor --fix. If it still fails, create a support bundle.",
 );
 
-const standaloneTaskManager = taskManagerStandaloneEnabled();
-if (process.platform === "win32" && standaloneTaskManager) {
-  let managerService;
+if (process.platform === "win32") {
+  let managerInstall;
   try {
-    managerService = childJson("task-manager-service.mjs", ["status"]);
+    managerInstall = childJson("task-manager-install.mjs", ["status"]);
   } catch {
     // The projector fails closed without copying command output into doctor.
   }
   const protectedHealth = await readControlHealth();
   const managerRows = taskManagerDoctorRows({
     platform: process.platform,
-    standalone: standaloneTaskManager,
-    service: managerService,
+    markerState: taskManagerStandaloneState(),
+    service: managerInstall?.manager,
     health: await taskManagerHealth(),
+    components: managerInstall?.components,
     privateState: {
       caller: privateFileIsProtected(CALLER_SECRET_PATH),
       marker: privateFileIsProtected(TASK_MANAGER_STANDALONE_PATH),
       process: privateFileIsProtected(TASK_MANAGER_PROCESS_STATE_PATH),
+      config: !existsSync(TASK_MANAGER_CONFIG_PATH)
+        || privateFileIsProtected(TASK_MANAGER_CONFIG_PATH),
     },
     routerMode: protectedHealth.taskManagerMode,
   });

@@ -43,17 +43,29 @@ test("standalone state defaults closed and uses one private versioned marker", (
 });
 
 test("missing, malformed, and unrecognized standalone markers read disabled", () => {
-  for (const contents of [
-    "not json\n",
-    `${JSON.stringify({ version: 2, enabled: true })}\n`,
-    `${JSON.stringify({ version: 1, enabled: false })}\n`,
-  ]) {
+  for (const contents of ["not json\n", `${JSON.stringify({ version: 2, enabled: true })}\n`]) {
     writeFileSync(markerPath, contents, "utf8");
     assert.equal(taskManagerStandaloneEnabled(), false);
     assert.deepEqual(taskManagerStandaloneState(), {
       known: false,
       exists: true,
       enabled: false,
+      state: "malformed",
     });
   }
+
+  writeFileSync(markerPath, `${JSON.stringify({ version: 1, enabled: false })}\n`, "utf8");
+  assert.deepEqual(taskManagerStandaloneState(), {
+    known: true,
+    exists: true,
+    enabled: false,
+    state: "disabled",
+  });
+  rmSync(markerPath);
+  assert.deepEqual(taskManagerStandaloneState(), {
+    known: true,
+    exists: false,
+    enabled: false,
+    state: "missing",
+  });
 });

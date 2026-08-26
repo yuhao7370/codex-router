@@ -10,6 +10,7 @@ import {
   SOURCE_ROOT,
   STATE_DIR,
   TASK_MANAGER_CONTROL_PORT,
+  TASK_MANAGER_PROCESS_STATE_PATH,
   TASK_MANAGER_TASK_NAME,
   loopback,
 } from "./paths.mjs";
@@ -25,6 +26,7 @@ import {
   queryScheduledTask,
   stopOwnedManagerProcess,
   taskActionIsCanonical,
+  scheduledTaskDefinitionIsCanonical,
   taskManagerServiceComponentsStatus,
   taskManagerServiceStatus,
 } from "./task-manager-service-windows.mjs";
@@ -42,6 +44,7 @@ import {
   restoreWindowsTask,
   snapshotWindowsTask,
 } from "./windows-task-snapshot.mjs";
+import { windowsLoopbackPortOwner } from "./windows-listener-owner.mjs";
 
 const COMMANDS = new Set(["install", "uninstall", "purge", "purge-created", "status"]);
 const RECOGNIZED_PORT_OWNERS = new Set(["absent", "embedded", "standalone"]);
@@ -51,7 +54,6 @@ const HEALTH_TIMEOUT_MS = 300_000;
 const MANAGER_HEALTH_TIMEOUT_MS = 30_000;
 const POLL_MS = 250;
 const MAX_HTTP_BODY_BYTES = 64 * 1024;
-const PORT_OWNER_TIMEOUT_MS = 5_000;
 const CREATED_COMPONENT_KEYS = Object.freeze([
   "task",
   "wrapper",
@@ -109,57 +111,7 @@ function sleep(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
-export function windowsTaskManagerPortOwner({
-  port = TASK_MANAGER_CONTROL_PORT,
-  platform = process.platform,
-  spawn = spawnSync,
-  timeoutMs = PORT_OWNER_TIMEOUT_MS,
-} = {}) {
-  if (platform !== "win32") return { known: false, pid: null };
-  const script = [
-    "$ErrorActionPreference = 'Stop'",
-    "$Utf8 = [Text.UTF8Encoding]::new($false)",
-    "[Console]::InputEncoding = $Utf8",
-    "[Console]::OutputEncoding = [Text.Encoding]::UTF8",
-    "$OutputEncoding = $Utf8",
-    "$port = [int]$env:CODEX_ROUTER_CONTROL_PORT",
-    "$loopbackAddresses = @('127.0.0.1', '0.0.0.0', '::1', '::')",
-    // Query the normal Listen set first, then filter in memory. Passing a port
-    // with no match to Get-NetTCPConnection raises ObjectNotFound, which is not
-    // a query failure and must resolve to known absence rather than unknown.
-    "$listeners = @(Get-NetTCPConnection -State Listen -ErrorAction Stop | Where-Object { ([int]$_.LocalPort -eq $port) -and ($loopbackAddresses -contains [string]$_.LocalAddress) })",
-    "$owners = @($listeners | Select-Object -ExpandProperty OwningProcess -Unique)",
-    "if ($owners.Count -eq 0) { [Console]::Out.Write('{\"known\":true,\"pid\":null}'); exit 0 }",
-    "if ($owners.Count -ne 1 -or [int]$owners[0] -lt 1) { throw 'Port owner is ambiguous.' }",
-    "[Console]::Out.Write(([ordered]@{ known = $true; pid = [int]$owners[0] } | ConvertTo-Json -Compress))",
-  ].join("\n");
-  for (const executable of ["powershell.exe", "pwsh.exe"]) {
-    const result = spawn(
-      executable,
-      ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
-      {
-        encoding: "utf8",
-        timeout: timeoutMs,
-        maxBuffer: MAX_HTTP_BODY_BYTES,
-        windowsHide: true,
-        env: { ...process.env, CODEX_ROUTER_CONTROL_PORT: String(port) },
-        stdio: ["ignore", "pipe", "pipe"],
-      },
-    );
-    if (result?.status !== 0) continue;
-    try {
-      const parsed = JSON.parse(String(result.stdout));
-      if (parsed?.known !== true) continue;
-      if (parsed.pid === null) return { known: true, pid: null };
-      if (Number.isSafeInteger(parsed.pid) && parsed.pid > 0) {
-        return { known: true, pid: parsed.pid };
-      }
-    } catch {
-      // Try the other PowerShell host; malformed output is unknown, not absent.
-    }
-  }
-  return { known: false, pid: null };
-}
+export const windowsTaskManagerPortOwner = windowsLoopbackPortOwner;
 
 async function boundedJson(response, maxBytes = MAX_HTTP_BODY_BYTES) {
   const length = Number(response.headers.get("content-length"));
@@ -226,27 +178,33 @@ function commandLineHasExactEntrypoint(commandLine, entrypoint) {
 export async function classifyTaskManagerPortOwner({
   readPortOwner = windowsTaskManagerPortOwner,
   readManagerHealth = () => fetchHealth(loopback(TASK_MANAGER_CONTROL_PORT, "/health")),
-  readRouterHealth = readProtectedTaskManagerRouterHealth,
   readProcessCommandLine = (pid) => processCommandLine(pid, { platform: "win32" }),
   readManagerProcessState = readTaskManagerProcessState,
   managerProcessOwns = taskManagerProcessOwns,
+  readManagerTask = () => queryScheduledTask({ taskName: TASK_MANAGER_TASK_NAME }),
+  readRouterTask = () => queryScheduledTask({ taskName: ROUTER_TASK_NAME }),
   sourceRoot = SOURCE_ROOT,
   stateDir = STATE_DIR,
+  controlPort = TASK_MANAGER_CONTROL_PORT,
 } = {}) {
-  const owner = await readPortOwner();
+  const owner = await readPortOwner({ port: controlPort, platform: "win32" });
   if (owner?.known !== true) return "unknown";
   if (owner.pid === null) return "absent";
   if (!Number.isSafeInteger(owner.pid) || owner.pid < 1) return "unknown";
 
-  const [managerHealth, routerHealth] = await Promise.all([
+  const [managerHealth, managerTask, routerTask] = await Promise.all([
     readManagerHealth(),
-    readRouterHealth(),
+    readManagerTask(),
+    readRouterTask(),
   ]);
   if (
     managerHealth?.ok === true
     && managerHealth.service === "codex-router-task-manager"
     && managerHealth.mode === "standalone"
     && managerHealth.pid === owner.pid
+    && managerTask?.known === true
+    && managerTask.state === "running"
+    && taskActionIsCanonical(managerTask, { stateDir })
   ) {
     const state = readManagerProcessState();
     if (
@@ -258,9 +216,8 @@ export async function classifyTaskManagerPortOwner({
     return "unknown";
   }
   if (
-    routerHealth?.service === "codex-router"
-    && routerHealth.taskManagerMode === "embedded"
-    && routerHealth.pid === owner.pid
+    routerTask?.known === true
+    && scheduledTaskDefinitionIsCanonical(routerTask, routerTaskAction({ stateDir }))
     && commandLineHasExactEntrypoint(
       readProcessCommandLine(owner.pid),
       path.join(sourceRoot, "src", "router.mjs"),
@@ -378,7 +335,7 @@ export async function taskManagerInstallStatus({
       manager: { installed: false, loaded: false, state: "unsupported" },
       shortcut: { installed: false },
       components: Object.fromEntries(
-        CREATED_COMPONENT_KEYS.map((key) => [key, { known: false, present: null }]),
+        [...CREATED_COMPONENT_KEYS, "process"].map((key) => [key, { known: false, present: null }]),
       ),
     };
   }
@@ -389,15 +346,18 @@ export async function taskManagerInstallStatus({
   ]);
   const marker = readMarkerState();
   const shortcut = readPath(shortcutPath);
+  const processState = readPath(TASK_MANAGER_PROCESS_STATE_PATH);
   return {
     supported: true,
     standalone: marker.enabled,
+    marker,
     manager,
     shortcut: { installed: shortcut.present, path: shortcutPath },
     components: {
       ...serviceComponents,
       shortcut,
       marker: { known: marker.known, present: marker.exists },
+      process: processState,
     },
   };
 }
@@ -416,6 +376,27 @@ export async function assertManagerTaskReplaceable({
     throw new Error(
       `Refusing to replace the noncanonical Scheduled Task "${TASK_MANAGER_TASK_NAME}" before stopping Router.`,
     );
+  }
+  return task;
+}
+
+function routerTaskAction({ stateDir = STATE_DIR } = {}) {
+  return {
+    execute: "wscript.exe",
+    argument: `//B //NoLogo "${path.join(stateDir, "start-codex-router-hidden.vbs")}"`,
+  };
+}
+
+export async function assertRouterTaskReplaceable({
+  queryTask = queryScheduledTask,
+  stateDir = STATE_DIR,
+} = {}) {
+  const task = await queryTask({ taskName: ROUTER_TASK_NAME });
+  if (task?.known !== true) {
+    throw new Error(`Task Scheduler could not identify "${ROUTER_TASK_NAME}"; refusing before snapshots.`);
+  }
+  if (task.exists && !scheduledTaskDefinitionIsCanonical(task, routerTaskAction({ stateDir }))) {
+    throw new Error(`Refusing to adopt or replace the noncanonical Scheduled Task "${ROUTER_TASK_NAME}".`);
   }
   return task;
 }
@@ -445,6 +426,7 @@ function defaultDependencies() {
   return {
     checkPortOwner: classifyTaskManagerPortOwner,
     preflightManagerTask: assertManagerTaskReplaceable,
+    preflightRouterTask: assertRouterTaskReplaceable,
     standaloneEnabled: taskManagerStandaloneEnabled,
     setStandaloneEnabled: setTaskManagerStandaloneEnabled,
     snapshotRouterTaskAndLaunchers: () => snapshotWindowsTask({
@@ -605,6 +587,7 @@ async function rollbackInstall(deps, previousStandalone, routerSnapshot, manager
 async function install(deps) {
   await assertRecognizedPortOwner(deps);
   await deps.preflightManagerTask();
+  await deps.preflightRouterTask();
   const previousStandalone = deps.standaloneEnabled();
   const { routerSnapshot, managerSnapshot } = await captureSnapshots(deps);
   try {
@@ -636,6 +619,7 @@ async function install(deps) {
 async function uninstall(deps) {
   await assertRecognizedPortOwner(deps);
   await deps.preflightManagerTask();
+  await deps.preflightRouterTask();
   const previousStandalone = deps.standaloneEnabled();
   const { routerSnapshot, managerSnapshot } = await captureSnapshots(deps);
   try {

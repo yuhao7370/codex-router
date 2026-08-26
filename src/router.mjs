@@ -472,6 +472,7 @@ async function compressedNativeBody(body, headers) {
 // means `fetch` never sees an extra key, and the seat stays available for local
 // usage attribution without being forwarded to ChatGPT.
 const nativeSeats = new WeakMap();
+const authenticatedRequestRoutes = new WeakMap();
 
 function nativeHeaders(request, fastContext) {
   const headers = {
@@ -496,7 +497,7 @@ function nativeHeaders(request, fastContext) {
     const injectedFast = !nativeFast && fastContext?.fastAccounts?.has(seatId);
     recordInjection(
       seatId,
-      request.url,
+      authenticatedRequestRoutes.get(request),
       nativeFast ? "native" : injectedFast ? "injected" : undefined,
     );
   } else {
@@ -3935,6 +3936,7 @@ async function handleRequest(request, response) {
     return;
   }
   requestUrl.pathname = route;
+  authenticatedRequestRoutes.set(request, requestUrl.pathname);
 
   if (
     isTaskManagerRouterRoute(route) &&

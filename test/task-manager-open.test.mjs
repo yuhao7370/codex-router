@@ -20,6 +20,7 @@ test("standalone health opens the capability URL without printing the capability
   const requested = [];
   const result = await openTaskManager({
     controlPort: CONTROL_PORT,
+    classifyOwner: async () => "standalone",
     readCallerSecret: () => CALLER_KEY,
     fetchImpl: async (url, options) => {
       requested.push([String(url), options?.method]);
@@ -46,6 +47,7 @@ test("an embedded root is opened when health is absent", async () => {
   const requested = [];
   const result = await openTaskManager({
     controlPort: CONTROL_PORT,
+    classifyOwner: async () => "embedded",
     readCallerSecret: () => {
       throw new Error("embedded mode must not need the caller capability");
     },
@@ -57,7 +59,7 @@ test("an embedded root is opened when health is absent", async () => {
     writeOutput: () => {},
   });
 
-  assert.deepEqual(requested, [`${ORIGIN}/health`, `${ORIGIN}/`]);
+  assert.deepEqual(requested, [`${ORIGIN}/`]);
   assert.deepEqual(opened, [`${ORIGIN}/`]);
   assert.deepEqual(result, { url: `${ORIGIN}/`, mode: "embedded" });
 });
@@ -66,6 +68,7 @@ test("non-manager health falls back to a responding embedded root", async () => 
   const opened = [];
   const result = await openTaskManager({
     controlPort: CONTROL_PORT,
+    classifyOwner: async () => "embedded",
     readCallerSecret: () => CALLER_KEY,
     fetchImpl: async (url) => String(url).endsWith("/health")
       ? response(200, { ok: true, service: "codex-router", mode: "router" })
@@ -83,6 +86,7 @@ test("a stopped manager fails before launching a browser", async () => {
   await assert.rejects(
     openTaskManager({
       controlPort: CONTROL_PORT,
+      classifyOwner: async () => "standalone",
       readCallerSecret: () => CALLER_KEY,
       fetchImpl: async () => {
         throw new Error("connection refused");
@@ -103,6 +107,7 @@ test("--print is a warned deliberate capability disclosure and does not launch",
   let opened = false;
   const result = await openTaskManager({
     controlPort: CONTROL_PORT,
+    classifyOwner: async () => "standalone",
     printOnly: true,
     readCallerSecret: () => CALLER_KEY,
     fetchImpl: async () => response(200, {
@@ -122,4 +127,31 @@ test("--print is a warned deliberate capability disclosure and does not launch",
   assert.equal(output.join("").trim(), result.url);
   assert.equal(output.join("").includes(CALLER_KEY), true);
   assert.match(warnings.join(""), /password/i);
+});
+
+test("a spoofed listener fails ownership before reading or opening the capability", async () => {
+  const calls = [];
+  await assert.rejects(
+    openTaskManager({
+      controlPort: CONTROL_PORT,
+      classifyOwner: async () => {
+        calls.push("ownership");
+        return "unknown";
+      },
+      fetchImpl: async () => response(200, {
+        ok: true,
+        service: "codex-router-task-manager",
+        mode: "standalone",
+        pid: 123,
+      }),
+      readCallerSecret: () => {
+        calls.push("caller-secret");
+        return CALLER_KEY;
+      },
+      openBrowser: async () => calls.push("browser"),
+      writeOutput: () => {},
+    }),
+    /owned|recognized Router installation/i,
+  );
+  assert.deepEqual(calls, ["ownership"]);
 });

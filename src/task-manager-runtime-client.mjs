@@ -14,11 +14,13 @@ export function createTaskManagerRuntimeClient({
       body: method === "POST" ? "{}" : undefined,
       signal: AbortSignal.timeout(5_000),
     });
-    const body = await response.json().catch(() => ({}));
     if (!response.ok) {
-      throw new Error(body?.error?.message || `Router returned HTTP ${response.status}.`);
+      await response.body?.cancel().catch(() => {});
+      const error = new Error(`Router runtime request failed (HTTP ${response.status}).`);
+      error.status = response.status;
+      throw error;
     }
-    return body;
+    return response.json().catch(() => ({}));
   };
 
   return {

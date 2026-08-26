@@ -134,6 +134,63 @@ test("runtime snapshots omit credentials and reread the shared error log", async
   }
 });
 
+test("CTM failures and injection telemetry retain status and route leaf only", async () => {
+  const secrets = [
+    "CALLER_CAPABILITY_SENTINEL_1234567890",
+    "CTM_TOKEN_SENTINEL_1234567890",
+    "ACCESS_TOKEN_SENTINEL_1234567890",
+    "sk-provider-sentinel-1234567890",
+  ];
+  const server = http.createServer((_request, response) => {
+    response.writeHead(503, { "content-type": "application/json" });
+    response.end(JSON.stringify({ error: secrets.join(" ") }));
+  });
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  const address = server.address();
+  assert.ok(typeof address === "object" && address);
+  const noRuntime = { updateRuntime: false };
+
+  try {
+    bridge.clearErrorLog();
+    bridge.setTaskManagerPort(address.port, noRuntime);
+    bridge.setTaskManagerToken(secrets[1], noRuntime);
+    bridge.setTaskManagerPool(["seat-a"], noRuntime);
+    bridge.setTaskManagerEnabled(true, noRuntime);
+    const messages = [];
+    for (const operation of [
+      () => bridge.listTaskManagerAccounts(),
+      () => bridge.selectTaskManagerAccount("seat-a", noRuntime),
+      () => bridge.importTaskManagerAccount({ access_token: secrets[2] }, noRuntime),
+      () => bridge.refreshPool(),
+    ]) {
+      await assert.rejects(operation(), (error) => {
+        messages.push(error.message);
+        return true;
+      });
+    }
+    const connection = await bridge.testTaskManagerConnection();
+    await bridge.refreshActiveAccount();
+    bridge.recordInjection(
+      "seat-a",
+      `/_codex-router/${secrets[0]}/v1/responses?access_token=${secrets[2]}`,
+    );
+    const runtime = bridge.taskManagerRuntimeSnapshot();
+    assert.equal(runtime.injections.recent[0].path, "/v1/responses");
+    const exposed = JSON.stringify({ messages, connection, runtime, errors: bridge.errorLog() });
+    assert.ok(messages.every((message) => message === "Codex_Task_Manager request failed (HTTP 503)."));
+    for (const secret of secrets) assert.equal(exposed.includes(secret), false, secret);
+  } finally {
+    bridge.setTaskManagerEnabled(false, noRuntime);
+    bridge.setTaskManagerPool([], noRuntime);
+    bridge.setTaskManagerToken("", noRuntime);
+    bridge.clearErrorLog();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
 test("runtime mutation suppression leaves host caches untouched until Router reload", async () => {
   const requests = [];
   const server = http.createServer((request, response) => {

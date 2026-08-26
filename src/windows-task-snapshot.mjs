@@ -266,7 +266,11 @@ function readManifest(handle) {
   ) {
     throw new Error("Windows task snapshot manifest is not a bounded regular file.");
   }
-  const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+  const rawManifest = readFileSync(manifestPath);
+  if (sha256(rawManifest) !== handle.manifestSha256) {
+    throw new Error("Windows task snapshot manifest failed its trusted digest.");
+  }
+  const manifest = JSON.parse(rawManifest.toString("utf8"));
   if (
     manifest?.version !== VERSION
     || manifest.taskName !== handle.taskName
@@ -506,6 +510,7 @@ export async function snapshotWindowsTask({
       taskName,
       exists: manifest.exists,
       xmlSha256,
+      manifestSha256: sha256(Buffer.from(manifestContents, "utf8")),
       files: records.map(({ path: target, existed, backupName, bytes, sha256: digest }) => ({
         path: target,
         existed,
