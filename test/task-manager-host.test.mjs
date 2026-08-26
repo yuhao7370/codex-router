@@ -98,7 +98,7 @@ test("standalone host serves minimal public health and shuts down cleanly", asyn
   );
 });
 
-test("standalone host preserves a replacement process record during shutdown", async () => {
+test("standalone host preserves a newer process generation during shutdown", async () => {
   const stateDir = mkdtempSync(path.join(os.tmpdir(), "task-manager-host-replacement-"));
   const processStatePath = path.join(stateDir, "task-manager-process.json");
   writeFileSync(path.join(stateDir, "caller-secret"), `${CALLER_KEY}\n`, { mode: 0o600 });
@@ -115,7 +115,7 @@ test("standalone host preserves a replacement process record during shutdown", a
     const original = JSON.parse(readFileSync(processStatePath, "utf8"));
     const replacement = {
       ...original,
-      processIdentity: `replacement|${original.processIdentity}`,
+      startedAt: original.startedAt + 1,
     };
     writeFileSync(processStatePath, `${JSON.stringify(replacement, null, 2)}\n`);
 

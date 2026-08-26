@@ -335,7 +335,7 @@ export function stopOwnedManagerProcess({
 } = {}) {
   if (skipMutation()) return { skipped: true };
   const recorded = readProcessState();
-  if (!recorded || recorded.pid === process.pid) return { state: "gone", cleared: false };
+  if (!recorded) return { state: "gone", cleared: false };
 
   const clearUnchanged = (state) => {
     if (!processStateMatches(readProcessState(), recorded)) {
@@ -351,6 +351,9 @@ export function stopOwnedManagerProcess({
   }
   if (initial !== "owned") {
     throw new Error("The Task Manager process identity is unknown; refusing to stop or clear it.");
+  }
+  if (recorded.pid === process.pid) {
+    throw new Error("The Task Manager process record names the current service CLI process; refusing to self-kill.");
   }
 
   let killFailed = false;

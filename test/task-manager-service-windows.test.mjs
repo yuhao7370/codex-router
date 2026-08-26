@@ -242,6 +242,7 @@ const recordedProcess = Object.freeze({
   commandLine: 'node.exe "C:/router/src/task-manager-host.mjs"',
   sourceRoot: "C:/router",
   stateDir: "C:/state",
+  startedAt: 1_000,
 });
 
 function stopOptions(overrides = {}) {
@@ -272,6 +273,42 @@ test("stale gone and PID-reused records clear without killing a process", () => 
     assert.equal(killed, false, evidence);
     assert.equal(cleared, true, evidence);
   }
+});
+
+test("a stale record reused by the current service CLI PID still clears on replaced evidence", () => {
+  const selfRecord = { ...recordedProcess, pid: process.pid };
+  let evidenceCalls = 0;
+  let killed = false;
+  let cleared = false;
+  stopOwnedManagerProcess(stopOptions({
+    readProcessState: () => selfRecord,
+    processEvidence: () => {
+      evidenceCalls += 1;
+      return "replaced";
+    },
+    killProcess: () => { killed = true; },
+    clearProcessState: () => { cleared = true; },
+  }));
+  assert.equal(evidenceCalls, 1);
+  assert.equal(killed, false);
+  assert.equal(cleared, true);
+});
+
+test("an owned current service CLI PID is refused instead of self-killed", () => {
+  const selfRecord = { ...recordedProcess, pid: process.pid };
+  let killed = false;
+  let cleared = false;
+  assert.throws(
+    () => stopOwnedManagerProcess(stopOptions({
+      readProcessState: () => selfRecord,
+      processEvidence: () => "owned",
+      killProcess: () => { killed = true; },
+      clearProcessState: () => { cleared = true; },
+    })),
+    /current service CLI process/i,
+  );
+  assert.equal(killed, false);
+  assert.equal(cleared, false);
 });
 
 test("failed taskkill preserves a still-owned record after a bounded wait", () => {
@@ -310,6 +347,24 @@ test("a replacement process record is preserved after taskkill", () => {
   assert.throws(
     () => stopOwnedManagerProcess(stopOptions({
       readProcessState: () => current,
+      killProcess: () => { current = replacement; },
+      clearProcessState: () => { cleared = true; },
+    })),
+    /process record changed/i,
+  );
+  assert.equal(current, replacement);
+  assert.equal(cleared, false);
+});
+
+test("a process record differing only by startedAt is preserved after taskkill", () => {
+  const replacement = { ...recordedProcess, startedAt: recordedProcess.startedAt + 1 };
+  const evidence = ["owned", "gone"];
+  let current = recordedProcess;
+  let cleared = false;
+  assert.throws(
+    () => stopOwnedManagerProcess(stopOptions({
+      readProcessState: () => current,
+      processEvidence: () => evidence.shift(),
       killProcess: () => { current = replacement; },
       clearProcessState: () => { cleared = true; },
     })),

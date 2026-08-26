@@ -10,6 +10,7 @@ import {
   readTaskManagerProcessState,
   taskManagerProcessEvidence,
   taskManagerProcessOwns,
+  taskManagerProcessStateMatches,
   writeTaskManagerProcessState,
 } from "../src/task-manager-process.mjs";
 
@@ -109,6 +110,20 @@ test("manager process evidence distinguishes owned, gone, replaced, and unknown"
     identity,
     commandLine: () => undefined,
   }), "unknown");
+});
+
+test("manager process generations differ when only startedAt changes", () => {
+  const state = buildTaskManagerProcessState({
+    pid: 42,
+    sourceRoot,
+    stateDir,
+    identity,
+    commandLine,
+  });
+  assert.equal(
+    taskManagerProcessStateMatches(state, { ...state, startedAt: state.startedAt + 1 }),
+    false,
+  );
 });
 
 test("manager process state is private, readable, and removable", () => {

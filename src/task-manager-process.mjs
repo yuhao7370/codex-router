@@ -124,7 +124,9 @@ function validProcessState(state) {
     && typeof state.sourceRoot === "string"
     && state.sourceRoot
     && typeof state.stateDir === "string"
-    && state.stateDir,
+    && state.stateDir
+    && Number.isSafeInteger(state.startedAt)
+    && state.startedAt > 0,
   );
 }
 
@@ -132,11 +134,14 @@ export function taskManagerProcessStateMatches(left, right) {
   return Boolean(
     validProcessState(left)
     && validProcessState(right)
+    && left.version === right.version
+    && left.managed === right.managed
     && left.pid === right.pid
     && left.processIdentity === right.processIdentity
     && left.commandLine === right.commandLine
-    && normalized(left.sourceRoot) === normalized(right.sourceRoot)
-    && normalized(left.stateDir) === normalized(right.stateDir),
+    && left.sourceRoot === right.sourceRoot
+    && left.stateDir === right.stateDir
+    && left.startedAt === right.startedAt,
   );
 }
 
