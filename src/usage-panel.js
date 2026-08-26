@@ -24,8 +24,17 @@
     });
   }
 
+  function endpoint(path) {
+    return new URL(String(path).replace(/^\/+/, ""), document.baseURI);
+  }
+
   async function api(path, options) {
-    const response = await fetch(path, options);
+    const request = { ...(options || {}) };
+    if (request.method === "POST") {
+      request.headers = { "Content-Type": "application/json", ...(request.headers || {}) };
+      if (request.body === undefined) request.body = "{}";
+    }
+    const response = await fetch(endpoint(path), request);
     let body = null;
     try {
       body = await response.json();
@@ -247,7 +256,7 @@
       if (loading) return;
       loading = true;
       try {
-        render(await api("/api/usage?range=" + encodeURIComponent(range)));
+        render(await api("api/usage?range=" + encodeURIComponent(range)));
       } catch (error) {
         // Keep the last snapshot on transient failures.
       }
@@ -275,7 +284,7 @@
     q('[data-role="sync"]').addEventListener("click", async function () {
       setResult(true, "正在同步…");
       try {
-        const result = await api("/api/usage/sync", { method: "POST" });
+        const result = await api("api/usage/sync", { method: "POST" });
         setResult(
           Boolean(result.ok),
           result.ok

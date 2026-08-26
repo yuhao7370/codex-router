@@ -134,6 +134,119 @@ test("runtime snapshots omit credentials and reread the shared error log", async
   }
 });
 
+test("runtime mutation suppression leaves host caches untouched until Router reload", async () => {
+  const requests = [];
+  const server = http.createServer((request, response) => {
+    requests.push(request.url);
+    let body;
+    if (request.url === "/api/auth/current") {
+      body = {
+        id: "current-id",
+        account_id: "current-account",
+        email: "current@example.com",
+        access_token: "current-secret",
+        usage: { plan: "pro", weekly_used_percent: 20 },
+      };
+    } else if (request.url === "/api/auth/credentials") {
+      body = {
+        accounts: [{
+          id: "pool-1",
+          account_id: "pool-account",
+          email: "pool@example.com",
+          access_token: "pool-secret",
+          usage: { plan: "pro", weekly_used_percent: 10 },
+        }],
+      };
+    } else {
+      body = { ok: true, id: "mutated-account" };
+    }
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify(body));
+  });
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  const address = server.address();
+  assert.ok(typeof address === "object" && address);
+  const noRuntime = { updateRuntime: false };
+
+  try {
+    bridge.setTaskManagerPort(address.port, noRuntime);
+    bridge.setTaskManagerToken("manager-secret", noRuntime);
+    bridge.setTaskManagerEnabled(true, noRuntime);
+    bridge.setTaskManagerPool(["pool-1"], noRuntime);
+    bridge.setTaskManagerFailover(true, noRuntime);
+    assert.deepEqual(
+      {
+        enabled: bridge.readTaskManagerConfig().enabled,
+        token: bridge.readTaskManagerConfig().token,
+        pool: bridge.readTaskManagerConfig().pool,
+      },
+      { enabled: true, token: "manager-secret", pool: ["pool-1"] },
+    );
+    await bridge.reloadTaskManagerRuntime();
+    assert.equal(bridge.activeAccount().id, "current-id");
+    assert.equal(bridge.poolStatus().accounts[0].accountId, "pool-1");
+
+    requests.length = 0;
+    await bridge.selectTaskManagerAccount("selected", noRuntime);
+    assert.equal(bridge.activeAccount()?.id, "current-id", "suppressed select cleared cache");
+    await bridge.importTaskManagerAccount({ tokens: {} }, noRuntime);
+    assert.deepEqual(requests, [
+      "/api/auth/switch?id=selected",
+      "/api/auth/import",
+    ]);
+    assert.equal(bridge.activeAccount()?.id, "current-id", "suppressed import cleared cache");
+
+    requests.length = 0;
+    await bridge.selectTaskManagerAccount("selected");
+    await bridge.importTaskManagerAccount({ tokens: {} });
+    assert.deepEqual(requests, [
+      "/api/auth/switch?id=selected",
+      "/api/auth/current",
+      "/api/auth/import",
+      "/api/auth/current",
+    ]);
+
+    bridge.setTaskManagerPort(address.port);
+    assert.equal(bridge.activeAccount(), null, "embedded setter must retain runtime effects");
+    await bridge.reloadTaskManagerRuntime();
+
+    assert.equal(bridge.nextInjectionAccount().id, "pool-1");
+    bridge.notifyAccountFailure(429, false, false, "pool-1");
+    assert.equal(bridge.nextInjectionAccount().id, "current-id");
+    bridge.setTaskManagerFailover(false, noRuntime);
+    assert.equal(bridge.nextInjectionAccount().id, "current-id");
+    await bridge.reloadTaskManagerRuntime();
+    assert.equal(
+      bridge.nextInjectionAccount().id,
+      "pool-1",
+      "Router reload must clear disabled failover failure memory",
+    );
+
+    const beforeSuppressedWrites = requests.length;
+    bridge.setTaskManagerEnabled(false, noRuntime);
+    bridge.setTaskManagerPool([], noRuntime);
+    bridge.setTaskManagerPort(address.port, noRuntime);
+    bridge.setTaskManagerToken("manager-secret", noRuntime);
+    assert.equal(requests.length, beforeSuppressedWrites);
+    assert.equal(bridge.activeAccount().id, "current-id");
+    assert.equal(bridge.poolStatus().accounts[0].accountId, "pool-1");
+
+    await bridge.reloadTaskManagerRuntime();
+    assert.equal(bridge.activeAccount(), null);
+    assert.deepEqual(bridge.poolStatus().accounts, []);
+  } finally {
+    bridge.setTaskManagerEnabled(false);
+    bridge.setTaskManagerPool([]);
+    bridge.setTaskManagerFailover(false);
+    bridge.setTaskManagerToken("");
+    bridge.clearErrorLog();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
 test("poll intervals default, persist, and clamp", () => {
   assert.equal(bridge.readTaskManagerConfig().logIntervalMs, 2000);
   assert.equal(bridge.readTaskManagerConfig().accountsIntervalMs, 15000);

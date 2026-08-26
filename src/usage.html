@@ -24,16 +24,16 @@
 <div class="page">
   <div class="page-head">
     <h1>用量统计</h1>
-    <a href="/">返回控制台</a>
+    <a href="./">返回控制台</a>
   </div>
   <div id="usage-root"></div>
 </div>
-<script src="/usage-panel.js"></script>
+<script src="usage-panel.js"></script>
 <script>
   (async function () {
     var pollIntervalMs = 5000;
     try {
-      var status = await fetch('/api/status').then(function (response) { return response.json(); });
+      var status = await fetch('api/status').then(function (response) { return response.json(); });
       pollIntervalMs = status.usageIntervalMs || 5000;
     } catch (error) {}
     UsagePanel.init(document.getElementById('usage-root'), { pollIntervalMs: pollIntervalMs });

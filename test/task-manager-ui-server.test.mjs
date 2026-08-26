@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { once } from "node:events";
+import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -85,9 +86,16 @@ test("standalone routes require the caller capability and send hardened response
     assert.equal(health.headers.get("access-control-allow-origin"), null);
 
     assert.equal((await fetch(`${origin}/`)).status, 401);
-    const page = await fetch(`${origin}${taskManagerPath(CALLER_KEY)}`);
+    const capabilityUrl = `${origin}${taskManagerPath(CALLER_KEY)}`;
+    const page = await fetch(capabilityUrl);
     assert.equal(page.status, 200);
     assert.equal(page.headers.get("cache-control"), "no-store");
+    const pageHtml = await page.text();
+    for (const match of pageHtml.matchAll(/(?:href|src)=["']([^"']+)["']/g)) {
+      const asset = new URL(match[1], capabilityUrl);
+      assert.ok(asset.pathname.startsWith(taskManagerPath(CALLER_KEY)), asset.pathname);
+      assert.equal((await fetch(asset)).status, 200, asset.pathname);
+    }
     assert.equal(
       (
         await fetch(
@@ -215,6 +223,52 @@ test("standalone status uses Router runtime and reports it unavailable when offl
     assert.deepEqual(savedOffline.pool.ids, ["saved-while-offline"]);
   } finally {
     await close(server);
+  }
+});
+
+test("standalone configuration mutations never refresh the host bridge runtime", async () => {
+  const requests = [];
+  const ctm = http.createServer((request, response) => {
+    requests.push(request.url);
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({ account_id: "host-cache", access_token: "must-not-load" }));
+  });
+  await new Promise((resolve, reject) => {
+    ctm.once("error", reject);
+    ctm.listen(0, "127.0.0.1", resolve);
+  });
+  const address = ctm.address();
+  assert.ok(typeof address === "object" && address);
+  let reloads = 0;
+  const deps = dependencies({
+    runtimeClient: { reload: async () => { reloads += 1; } },
+  });
+  const { server, origin } = await start({
+    mode: "standalone",
+    callerSecret: CALLER_KEY,
+    ...deps,
+  });
+  const apiBase = `${origin}${taskManagerPath(CALLER_KEY)}api/`;
+  const post = (leaf, body = {}) => fetch(`${apiBase}${leaf}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+
+  try {
+    assert.equal((await post("disable")).status, 200);
+    assert.equal((await post("port", { port: address.port })).status, 200);
+    assert.equal((await post("token", { token: "manager-secret" })).status, 200);
+    assert.equal((await post("enable")).status, 200);
+    assert.deepEqual(requests, []);
+    assert.equal(reloads, 4);
+
+    assert.equal((await post("failover", { enabled: false })).status, 200);
+    assert.equal(reloads, 5, "standalone failover changes must reload Router memory");
+  } finally {
+    await post("disable").catch(() => {});
+    await close(server);
+    await close(ctm);
   }
 });
 

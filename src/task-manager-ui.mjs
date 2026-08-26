@@ -183,6 +183,7 @@ export function startTaskManagerUi({
   restartRouter,
 } = {}) {
   const standalone = mode === "standalone";
+  const mutationOptions = standalone ? { updateRuntime: false } : undefined;
   const performRouterRestart =
     restartRouter ||
     (standalone
@@ -387,22 +388,22 @@ export function startTaskManagerUi({
         });
       }
       if (request.method === "POST" && route === "/api/enable") {
-        setTaskManagerEnabled(true);
-        await refreshActiveAccount();
+        setTaskManagerEnabled(true, mutationOptions);
+        if (!standalone) await refreshActiveAccount();
         return sendJson(response, 200, await refreshedStatus());
       }
       if (request.method === "POST" && route === "/api/disable") {
-        setTaskManagerEnabled(false);
+        setTaskManagerEnabled(false, mutationOptions);
         return sendJson(response, 200, await refreshedStatus());
       }
       if (request.method === "POST" && route === "/api/failover") {
         const body = await readJsonBody(request);
-        setTaskManagerFailover(Boolean(body.enabled));
-        return sendJson(response, 200, await readStatus());
+        setTaskManagerFailover(Boolean(body.enabled), mutationOptions);
+        return sendJson(response, 200, await refreshedStatus());
       }
       if (request.method === "POST" && route === "/api/pool") {
         const body = await readJsonBody(request);
-        setTaskManagerPool(body.ids || []);
+        setTaskManagerPool(body.ids || [], mutationOptions);
         return sendJson(response, 200, await refreshedStatus());
       }
       if (request.method === "POST" && route === "/api/unblock") {
@@ -427,12 +428,12 @@ export function startTaskManagerUi({
       }
       if (request.method === "POST" && route === "/api/select") {
         const body = await readJsonBody(request);
-        await selectTaskManagerAccount(body.id);
+        await selectTaskManagerAccount(body.id, mutationOptions);
         return sendJson(response, 200, await refreshedStatus());
       }
       if (request.method === "POST" && route === "/api/import") {
         const body = await readJsonBody(request);
-        const account = await importTaskManagerAccount(body);
+        const account = await importTaskManagerAccount(body, mutationOptions);
         const runtimeRefresh = await refreshRuntime();
         return sendJson(
           response,
@@ -442,14 +443,14 @@ export function startTaskManagerUi({
       }
       if (request.method === "POST" && route === "/api/port") {
         const body = await readJsonBody(request);
-        setTaskManagerPort(body.port);
-        await refreshActiveAccount();
+        setTaskManagerPort(body.port, mutationOptions);
+        if (!standalone) await refreshActiveAccount();
         return sendJson(response, 200, await refreshedStatus());
       }
       if (request.method === "POST" && route === "/api/token") {
         const body = await readJsonBody(request);
-        setTaskManagerToken(body.token || "");
-        await refreshActiveAccount();
+        setTaskManagerToken(body.token || "", mutationOptions);
+        if (!standalone) await refreshActiveAccount();
         return sendJson(response, 200, await refreshedStatus());
       }
       sendJson(response, 404, { error: "not found" });

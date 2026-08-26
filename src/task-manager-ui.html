@@ -267,8 +267,8 @@
       <div class="sub">Codex_Task_Manager 账号代理控制台</div>
     </div>
     <div class="header-actions">
-      <a class="pill" href="/usage" target="_blank">用量独立页</a>
-      <a class="pill" href="/converter" target="_blank">打开转换器</a>
+      <a class="pill" href="usage" target="_blank">用量独立页</a>
+      <a class="pill" href="converter" target="_blank">打开转换器</a>
       <div id="header-status" class="pill">…</div>
     </div>
   </header>
@@ -341,7 +341,7 @@
     <div class="side">
       <div class="card">
         <div class="card-head"><h2>导入账号</h2></div>
-        <p class="hint">粘贴 auth.json，或直接粘贴 sub2api 导出的 JSON（会自动转换）。<a href="/converter" target="_blank">打开独立转换器</a></p>
+        <p class="hint">粘贴 auth.json，或直接粘贴 sub2api 导出的 JSON（会自动转换）。<a href="converter" target="_blank">打开独立转换器</a></p>
         <textarea id="import-input" placeholder='{"tokens":{"access_token":"..."}}'></textarea>
         <div class="field">
           <input type="file" id="import-file" accept=".json,application/json">
@@ -400,10 +400,19 @@
   </div>
 </div>
 
-<script src="/usage-panel.js"></script>
+<script src="usage-panel.js"></script>
 <script>
+  function endpoint(path) {
+    return new URL(String(path).replace(/^\/+/, ''), document.baseURI);
+  }
+
   async function api(path, options) {
-    const response = await fetch(path, options);
+    const request = { ...(options || {}) };
+    if (request.method === 'POST') {
+      request.headers = { 'Content-Type': 'application/json', ...(request.headers || {}) };
+      if (request.body === undefined) request.body = '{}';
+    }
+    const response = await fetch(endpoint(path), request);
     let body = null;
     try { body = await response.json(); } catch (e) {}
     if (!response.ok) {
@@ -488,7 +497,7 @@
   }
 
   async function loadStatus() {
-    const status = await api('/api/status');
+    const status = await api('api/status');
     el('enabled-badge').textContent = status.enabled ? '已启用' : '未启用';
     el('enabled-badge').className = 'badge ' + (status.enabled ? 'on' : 'off');
     const headerStatus = el('header-status');
@@ -577,7 +586,7 @@
           if (input.checked) pendingChecks.add(input.getAttribute('data-id'));
         }
       }
-      const payload = await api('/api/accounts');
+      const payload = await api('api/accounts');
       const body = el('accounts-body');
       body.textContent = '';
       const accounts = Array.isArray(payload.accounts) ? payload.accounts : [];
@@ -624,7 +633,7 @@
       for (const btn of document.querySelectorAll('.select-btn')) {
         btn.addEventListener('click', async function () {
           try {
-            await api('/api/select', {
+            await api('api/select', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ id: btn.getAttribute('data-id') }),
@@ -638,7 +647,7 @@
       for (const btn of document.querySelectorAll('.unblock-btn')) {
         btn.addEventListener('click', async function () {
           try {
-            await api('/api/unblock', {
+            await api('api/unblock', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ id: btn.getAttribute('data-id') }),
@@ -655,7 +664,7 @@
           if (input.checked) fastAccounts.add(id);
           else fastAccounts.delete(id);
           try {
-            await api('/api/fast-accounts', {
+            await api('api/fast-accounts', {
               method: 'POST', headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ ids: [...fastAccounts] }),
             });
@@ -676,16 +685,16 @@
   }
 
   el('enable-btn').addEventListener('click', async function () {
-    try { await api('/api/enable', { method: 'POST' }); await loadStatus(); }
+    try { await api('api/enable', { method: 'POST' }); await loadStatus(); }
     catch (error) { setResult('test-result', false, '启用失败：' + error.message); }
   });
   el('disable-btn').addEventListener('click', async function () {
-    try { await api('/api/disable', { method: 'POST' }); await loadStatus(); }
+    try { await api('api/disable', { method: 'POST' }); await loadStatus(); }
     catch (error) { setResult('test-result', false, '停用失败：' + error.message); }
   });
   el('test-btn').addEventListener('click', async function () {
     try {
-      const result = await api('/api/test', { method: 'POST' });
+      const result = await api('api/test', { method: 'POST' });
       setResult('test-result', result.ok, result.ok ? '连接正常' : JSON.stringify(result));
     } catch (error) {
       setResult('test-result', false, '测试失败：' + error.message);
@@ -694,7 +703,7 @@
   el('refresh-accounts').addEventListener('click', loadAccounts);
   el('save-port').addEventListener('click', async function () {
     try {
-      await api('/api/port', {
+      await api('api/port', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ port: Number(el('port-input').value) }),
       });
@@ -703,7 +712,7 @@
   });
   el('save-token').addEventListener('click', async function () {
     try {
-      await api('/api/token', {
+      await api('api/token', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ token: el('token-input').value }),
       });
@@ -713,7 +722,7 @@
   });
   el('clear-token').addEventListener('click', async function () {
     try {
-      await api('/api/token', {
+      await api('api/token', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ token: '' }),
       });
@@ -733,7 +742,7 @@
       const raw = el('import-input').value.trim();
       if (!raw) { setResult('import-result', false, '请先粘贴或选择 JSON'); return; }
       const authJson = normalizeImport(raw);
-      const imported = await api('/api/import', {
+      const imported = await api('api/import', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(authJson),
       });
@@ -748,7 +757,7 @@
 
   el('failover-toggle').addEventListener('change', async function () {
     try {
-      await api('/api/failover', {
+      await api('api/failover', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ enabled: el('failover-toggle').checked }),
       });
@@ -769,7 +778,7 @@
   el('save-pool').addEventListener('click', async function () {
     try {
       const ids = checkedPoolIds();
-      await api('/api/pool', {
+      await api('api/pool', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ids: ids }),
       });
@@ -783,7 +792,7 @@
 
   el('clear-pool').addEventListener('click', async function () {
     try {
-      await api('/api/pool', {
+      await api('api/pool', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ids: [] }),
       });
@@ -797,7 +806,7 @@
 
   el('clear-errors').addEventListener('click', async function () {
     try {
-      await api('/api/errors/clear', { method: 'POST' });
+      await api('api/errors/clear', { method: 'POST' });
       await loadStatus();
     } catch (error) {
       setResult('test-result', false, '清除错误日志失败：' + error.message);
@@ -832,7 +841,7 @@
 
   el('save-intervals').addEventListener('click', async function () {
     try {
-      const status = await api('/api/intervals', {
+      const status = await api('api/intervals', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           logIntervalMs: Math.round(Number(el('log-interval-input').value) * 1000),
@@ -857,7 +866,7 @@
 
   el('save-capacity').addEventListener('click', async function () {
     try {
-      const status = await api('/api/capacity-retry', {
+      const status = await api('api/capacity-retry', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           enabled: el('capacity-toggle').checked,
@@ -874,7 +883,7 @@
   el('sync-models-btn').addEventListener('click', async function () {
     setResult('sync-models-result', true, '正在更新…');
     try {
-      const result = await api('/api/local-router/models/sync', { method: 'POST' });
+      const result = await api('api/local-router/models/sync', { method: 'POST' });
       setResult('sync-models-result', Boolean(result.ok), result.message);
     } catch (error) {
       setResult('sync-models-result', false, '更新失败：' + error.message);
@@ -884,7 +893,7 @@
   el('prune-models-btn').addEventListener('click', async function () {
     setResult('sync-models-result', true, '正在清理…');
     try {
-      const result = await api('/api/local-router/models/prune', { method: 'POST' });
+      const result = await api('api/local-router/models/prune', { method: 'POST' });
       setResult('sync-models-result', Boolean(result.ok), result.message);
     } catch (error) {
       setResult('sync-models-result', false, '清理失败：' + error.message);
@@ -914,7 +923,7 @@
   el('usage-toggle').addEventListener('change', async function () {
     const visible = el('usage-toggle').checked;
     try {
-      await api('/api/usage-panel', {
+      await api('api/usage-panel', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ visible: visible }),
       });
@@ -924,7 +933,7 @@
 
   async function boot() {
     try {
-      const status = await api('/api/status');
+      const status = await api('api/status');
       currentPool = new Set(
         status.pool && Array.isArray(status.pool.ids) ? status.pool.ids : [],
       );

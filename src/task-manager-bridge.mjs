@@ -185,48 +185,57 @@ function writeTaskManagerConfig(next) {
   return state;
 }
 
-export function setTaskManagerEnabled(enabled) {
+export function setTaskManagerEnabled(enabled, { updateRuntime = true } = {}) {
   const state = writeTaskManagerConfig({ enabled: Boolean(enabled) });
-  if (state.enabled) {
-    refreshActiveAccount().catch(() => {});
-  } else {
-    cached = null;
+  if (updateRuntime) {
+    if (state.enabled) {
+      refreshActiveAccount().catch(() => {});
+    } else {
+      cached = null;
+    }
   }
   return state;
 }
 
-export function setTaskManagerPort(port) {
+export function setTaskManagerPort(port, { updateRuntime = true } = {}) {
   const value = Number(port);
   if (!Number.isInteger(value) || value < 1 || value > 65_535) {
     throw new Error("Port must be an integer between 1 and 65535.");
   }
-  cached = null;
+  if (updateRuntime) cached = null;
   return writeTaskManagerConfig({ port: value });
 }
 
-export function setTaskManagerToken(token) {
+export function setTaskManagerToken(token, { updateRuntime = true } = {}) {
   const value = String(token || "").trim();
-  cached = null;
+  if (updateRuntime) cached = null;
   return writeTaskManagerConfig({ token: value });
 }
 
-export function setTaskManagerFailover(failover) {
+function clearFailoverRuntime() {
+  failoverPending = false;
+  accountFailureMemory.clear();
+}
+
+export function setTaskManagerFailover(
+  failover,
+  { updateRuntime = true } = {},
+) {
   const state = writeTaskManagerConfig({ failover: Boolean(failover) });
-  if (!state.failover) {
-    failoverPending = false;
-    accountFailureMemory.clear();
-  }
+  if (updateRuntime && !state.failover) clearFailoverRuntime();
   return state;
 }
 
-export function setTaskManagerPool(ids) {
+export function setTaskManagerPool(ids, { updateRuntime = true } = {}) {
   const value = (Array.isArray(ids) ? ids : [])
     .map((id) => String(id))
     .filter(Boolean);
-  poolCredentials = [];
-  poolCursor = 0;
+  if (updateRuntime) {
+    poolCredentials = [];
+    poolCursor = 0;
+  }
   const state = writeTaskManagerConfig({ pool: value });
-  if (state.enabled && value.length) {
+  if (updateRuntime && state.enabled && value.length) {
     refreshPool().catch(() => {});
   }
   return state;
@@ -394,7 +403,7 @@ export async function listTaskManagerAccounts() {
   return body;
 }
 
-export async function selectTaskManagerAccount(id) {
+export async function selectTaskManagerAccount(id, { updateRuntime = true } = {}) {
   const state = readTaskManagerConfig();
   const { status, body } = await requestJson(
     state.port,
@@ -407,11 +416,14 @@ export async function selectTaskManagerAccount(id) {
       `Select account failed: ${body?.error || `HTTP ${status}`}`,
     );
   }
-  await refreshActiveAccount();
+  if (updateRuntime) await refreshActiveAccount();
   return body;
 }
 
-export async function importTaskManagerAccount(authJson) {
+export async function importTaskManagerAccount(
+  authJson,
+  { updateRuntime = true } = {},
+) {
   const state = readTaskManagerConfig();
   const { status, body } = await requestJson(
     state.port,
@@ -423,7 +435,7 @@ export async function importTaskManagerAccount(authJson) {
   if (status !== 200) {
     throw new Error(body?.error || `Codex_Task_Manager returned HTTP ${status}`);
   }
-  await refreshActiveAccount();
+  if (updateRuntime) await refreshActiveAccount();
   return body;
 }
 
@@ -509,6 +521,11 @@ export function taskManagerRuntimeSnapshot() {
 }
 
 export async function reloadTaskManagerRuntime() {
+  const state = readTaskManagerConfig();
+  cached = null;
+  poolCredentials = [];
+  poolCursor = 0;
+  if (!state.failover) clearFailoverRuntime();
   await refreshActiveAccount();
   await refreshPool();
   return taskManagerRuntimeSnapshot();
