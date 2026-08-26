@@ -74,3 +74,54 @@ test("service operation lock rejects overlap and releases afterward", { timeout:
     rmSync(stateDir, { recursive: true, force: true });
   }
 });
+
+test("different named service locks run together while matching names conflict", { timeout: 5_000 }, async () => {
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), "codex-router-named-service-lock-"));
+  let releaseRouter;
+  const routerCanFinish = new Promise((resolve) => {
+    releaseRouter = resolve;
+  });
+  let markRouterEntered;
+  const routerEntered = new Promise((resolve) => {
+    markRouterEntered = resolve;
+  });
+
+  const router = withServiceOperationLock(async () => {
+    markRouterEntered();
+    await routerCanFinish;
+  }, {
+    stateDir,
+    lockName: "router",
+    waitMs: 100,
+    retryMs: 10,
+    staleMs: 5_000,
+  });
+
+  try {
+    await routerEntered;
+    assert.equal(
+      await withServiceOperationLock(async () => "manager", {
+        stateDir,
+        lockName: "task-manager",
+        waitMs: 50,
+        retryMs: 10,
+        staleMs: 5_000,
+      }),
+      "manager",
+    );
+    await assert.rejects(
+      withServiceOperationLock(async () => "second router", {
+        stateDir,
+        lockName: "router",
+        waitMs: 50,
+        retryMs: 10,
+        staleMs: 5_000,
+      }),
+      /Another background-service operation is still running/,
+    );
+  } finally {
+    releaseRouter();
+    await router.catch(() => {});
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});

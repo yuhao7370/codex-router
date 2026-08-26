@@ -9,13 +9,14 @@ export async function withServiceOperationLock(
   operation,
   {
     stateDir = STATE_DIR,
+    lockName = "service-operation",
     waitMs = 15_000,
     retryMs = 100,
     staleMs = 90_000,
   } = {},
 ) {
   mkdirSync(stateDir, { recursive: true, mode: 0o700 });
-  const target = path.join(stateDir, "service-operation");
+  const target = path.join(stateDir, lockName);
   const retries = Math.max(0, Math.ceil(waitMs / retryMs) - 1);
   let release;
   try {

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -10,6 +10,9 @@ import { openPort } from "./port-pool.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const CALLER_KEY = "test-router-caller-capability-with-sufficient-length";
+const SIGNAL_PROXY = `data:text/javascript,${encodeURIComponent(
+  'process.on("message",(signal)=>{if(signal==="SIGTERM")process.emit("SIGTERM")})',
+)}`;
 
 async function waitForHealth(origin, child, errors) {
   const deadline = Date.now() + 5_000;
@@ -30,16 +33,22 @@ async function waitForHealth(origin, child, errors) {
 
 async function stopChild(child) {
   if (child.exitCode !== null || child.signalCode !== null) return;
-  child.kill("SIGTERM");
+  if (child.connected) child.send("SIGTERM");
+  else child.kill("SIGTERM");
   await new Promise((resolve) => child.once("exit", resolve));
 }
 
 test("standalone host serves minimal public health and shuts down cleanly", async () => {
   const stateDir = mkdtempSync(path.join(os.tmpdir(), "task-manager-host-"));
+  const processStatePath = path.join(stateDir, "task-manager-process.json");
   writeFileSync(path.join(stateDir, "caller-secret"), `${CALLER_KEY}\n`, { mode: 0o600 });
   const controlPort = await openPort();
   const isolatedRouterPort = await openPort();
-  const child = spawn(process.execPath, [path.join(root, "src", "task-manager-host.mjs")], {
+  const child = spawn(process.execPath, [
+    "--import",
+    SIGNAL_PROXY,
+    path.join(root, "src", "task-manager-host.mjs"),
+  ], {
     cwd: root,
     env: {
       ...process.env,
@@ -47,7 +56,7 @@ test("standalone host serves minimal public health and shuts down cleanly", asyn
       MODEL_ROUTER_CONTROL_PORT: String(controlPort),
       MODEL_ROUTER_PORT: String(isolatedRouterPort),
     },
-    stdio: ["ignore", "ignore", "pipe"],
+    stdio: ["ignore", "ignore", "pipe", "ipc"],
   });
   child.stderr.setEncoding("utf8");
   let stderr = "";
@@ -67,8 +76,10 @@ test("standalone host serves minimal public health and shuts down cleanly", asyn
       mode: "standalone",
       pid: child.pid,
     });
+    assert.equal(JSON.parse(readFileSync(processStatePath, "utf8")).pid, child.pid);
   } finally {
     await stopChild(child);
+    assert.equal(existsSync(processStatePath), false);
     rmSync(stateDir, { recursive: true, force: true });
   }
 
