@@ -438,6 +438,21 @@ function writePoolConfig(stateDir, ctmPort) {
   );
 }
 
+function writeFastConfig(stateDir, ctmPort) {
+  mkdirSync(stateDir, { recursive: true });
+  writeFileSync(
+    path.join(stateDir, "task-manager.json"),
+    JSON.stringify({
+      enabled: true,
+      port: ctmPort,
+      token: "test-token",
+      pool: [],
+      fastAccounts: ["seat-a"],
+    }),
+    "utf8",
+  );
+}
+
 async function mockCtm(accounts) {
   let credentialsRequests = 0;
   const server = http.createServer((request, response) => {
@@ -488,6 +503,68 @@ const CAPACITY_SSE = [
   "",
   "",
 ].join("\n");
+
+test("native fast stays distinct from account-injected fast", async () => {
+  const accounts = [
+    {
+      id: "seat-a",
+      account_id: "acct-a",
+      access_token: "tok-a",
+      email: "a@example.com",
+      usage: { weekly_used_percent: 0, plan: "plus" },
+    },
+  ];
+  const ctm = await mockCtm(accounts);
+  const received = [];
+  const native = await mockServer(async (request, response) => {
+    received.push(JSON.parse((await readBody(request)).text));
+    response.writeHead(200, { "Content-Type": "application/json" });
+    response.end(JSON.stringify({ id: `resp-${received.length}`, output: [] }));
+  });
+  const stateDir = stateDirectory();
+  writeFastConfig(stateDir, ctm.port);
+  const routerPort = await openPort();
+  const controlPort = await openPort();
+  const router = startRouter({ nativePort: native.port, routerPort, controlPort, stateDir });
+
+  try {
+    await waitFor(`${routerBase(routerPort)}/models`, router);
+    await waitUntil(async () => {
+      const response = await fetch(`http://127.0.0.1:${controlPort}/api/status`);
+      return response.ok && Boolean((await response.json()).account);
+    }, "the active account was never populated");
+
+    for (const serviceTier of ["priority", "fast", "default"]) {
+      const response = await fetch(`${routerBase(routerPort)}/responses`, {
+        method: "POST",
+        headers: { Authorization: "Bearer caller", "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "gpt-5.6-sol",
+          service_tier: serviceTier,
+          input: "native turn",
+        }),
+      });
+      assert.equal(response.status, 200, await response.text());
+    }
+
+    assert.deepEqual(
+      received.map((body) => body.service_tier),
+      ["priority", "fast", "priority"],
+    );
+    const status = await fetch(`http://127.0.0.1:${controlPort}/api/status`).then((response) =>
+      response.json()
+    );
+    assert.deepEqual(
+      status.injections.recent.slice(0, 3).map((event) => event.fastSource),
+      ["injected", "native", "native"],
+    );
+  } finally {
+    await stopChild(router);
+    await closeServer(native.server);
+    await closeServer(ctm.server);
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
 
 test("a single selected account relays a capacity 200 SSE without retrying", async () => {
   const attempts = [];

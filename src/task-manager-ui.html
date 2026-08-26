@@ -323,7 +323,7 @@
       <p class="hint" id="pool-hint">轮询池：未启用（勾选账号并保存后启用均匀派发）</p>
       <div class="table-wrap">
       <table>
-        <thead><tr><th>池</th><th>邮箱</th><th>ID</th><th>来源</th><th>状态</th><th>额度</th><th>fast</th><th></th></tr></thead>
+        <thead><tr><th>池</th><th>邮箱</th><th>ID</th><th>来源</th><th>状态</th><th>额度</th><th>注入 fast</th><th></th></tr></thead>
         <tbody id="accounts-body"></tbody>
       </table>
       </div>
@@ -546,9 +546,9 @@
           const info = accountIndex.get(e.accountId);
           const email = (info && info.email) ? info.email : shortId(e.accountId);
           const plan = (info && info.plan) ? ' · ' + info.plan : '';
-          const speed = e.fast
-            ? (e.accountId === 'native' ? ' · 原生fast' : ' · fast')
-            : ' · 标准';
+          const speed = e.fastSource === 'native'
+            ? ' · 原生 fast'
+            : (e.fastSource === 'injected' || e.fast ? ' · 注入 fast' : ' · 标准');
           return formatTime(e.at) + '  ' + email + plan + speed;
         }).join(String.fromCharCode(10))
       : '暂无注入记录';
@@ -660,7 +660,7 @@
               body: JSON.stringify({ ids: [...fastAccounts] }),
             });
           } catch (error) {
-            setResult('accounts-error', false, '保存 fast 失败：' + error.message);
+            setResult('accounts-error', false, '保存注入 fast 失败：' + error.message);
           }
         });
       }

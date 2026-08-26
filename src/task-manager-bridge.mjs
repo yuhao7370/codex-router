@@ -347,13 +347,14 @@ function requestJson(port, token, pathname, method = "GET", body) {
   });
 }
 
-export function recordInjection(accountId, pathname, fast = false) {
+export function recordInjection(accountId, pathname, fastSource) {
+  const source = fastSource === "native" || fastSource === "injected" ? fastSource : undefined;
   injectionCount += 1;
   injectionEvents.unshift({
     at: new Date().toISOString(),
     accountId,
     path: pathname || "",
-    ...(fast ? { fast: true } : {}),
+    ...(source ? { fast: true, fastSource: source } : {}),
   });
   if (injectionEvents.length > MAX_INJECTION_EVENTS) {
     injectionEvents.length = MAX_INJECTION_EVENTS;

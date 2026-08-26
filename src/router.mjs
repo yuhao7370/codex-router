@@ -362,7 +362,7 @@ async function compressedNativeBody(body, headers) {
 // usage attribution without being forwarded to ChatGPT.
 const nativeSeats = new WeakMap();
 
-function nativeHeaders(request) {
+function nativeHeaders(request, fastContext) {
   const headers = {
     "Content-Type": "application/json",
     "Accept-Encoding": "identity",
@@ -381,13 +381,13 @@ function nativeHeaders(request) {
     }
     nativeSeats.set(headers, account.id || account.accountId || undefined);
     const seatId = nativeSeats.get(headers);
-    const config = readTaskManagerConfig();
-    const fast = Boolean(
-      seatId &&
-        Array.isArray(config.fastAccounts) &&
-        config.fastAccounts.includes(seatId),
+    const nativeFast = fastContext?.nativeFast === true;
+    const injectedFast = !nativeFast && fastContext?.fastAccounts?.has(seatId);
+    recordInjection(
+      seatId,
+      request.url,
+      nativeFast ? "native" : injectedFast ? "injected" : undefined,
     );
-    recordInjection(seatId, request.url, fast);
   }
   return headers;
 }
@@ -1752,7 +1752,7 @@ async function handleResponses(request, response, requestUrl) {
     let routedBody;
     let nativeContentEncoding;
     let capacityAttempts = 5;
-    let nativeFast = false;
+    let injectedFast = false;
     let nativeBodyFor = null;
     let nativeInjectAccount = null;
     let namespacesFlattened = false;
@@ -1847,17 +1847,20 @@ async function handleResponses(request, response, requestUrl) {
       const fastAccounts = new Set(
         Array.isArray(taskConfig.fastAccounts) ? taskConfig.fastAccounts : [],
       );
+      const nativeFast = ["fast", "priority"].includes(
+        String(native.service_tier || "").toLowerCase(),
+      );
 
-      // Fast mode only changes one body field, so cache at most two compressed
-      // variants and pick the right one per injected account. This keeps the
-      // body reusable across account-switch retries without recompressing it.
+      // Injected fast only changes one body field, so cache at most two
+      // compressed variants and pick the right one per account. A request that
+      // arrived as fast/priority keeps its original value and is never injected.
       const bodyVariants = new Map();
-      nativeBodyFor = async (fast) => {
-        const key = fast ? "fast" : "normal";
+      nativeBodyFor = async (injectFast) => {
+        const key = injectFast ? "injected-fast" : "original";
         let variant = bodyVariants.get(key);
         if (!variant) {
           const body = { ...native };
-          if (fast) body.service_tier = "priority";
+          if (injectFast) body.service_tier = "priority";
           const probe = {};
           const bytes = await compressedNativeBody(
             Buffer.from(JSON.stringify(body), "utf8"),
@@ -1872,13 +1875,13 @@ async function handleResponses(request, response, requestUrl) {
         return variant;
       };
       nativeInjectAccount = () => {
-        headers = nativeHeaders(request);
+        headers = nativeHeaders(request, { nativeFast, fastAccounts });
         nativeAccountId = injectedAccountId(headers);
-        return fastAccounts.has(nativeAccountId);
+        return !nativeFast && fastAccounts.has(nativeAccountId);
       };
 
-      nativeFast = nativeInjectAccount();
-      const initialVariant = await nativeBodyFor(nativeFast);
+      injectedFast = nativeInjectAccount();
+      const initialVariant = await nativeBodyFor(injectedFast);
       routedBody = initialVariant.routedBody;
       nativeContentEncoding = initialVariant.contentEncoding;
       if (nativeContentEncoding) headers["Content-Encoding"] = nativeContentEncoding;
@@ -1976,10 +1979,10 @@ async function handleResponses(request, response, requestUrl) {
         await sleep(capacityBackoffMs, controller.signal);
         capacityBackoffMs = Math.min(capacityBackoffMs * 2, 8_000);
         controller.signal.throwIfAborted();
-        const nextFast = nativeInjectAccount();
-        if (nextFast !== nativeFast) {
-          nativeFast = nextFast;
-          const nextVariant = await nativeBodyFor(nativeFast);
+        const nextInjectedFast = nativeInjectAccount();
+        if (nextInjectedFast !== injectedFast) {
+          injectedFast = nextInjectedFast;
+          const nextVariant = await nativeBodyFor(injectedFast);
           routedBody = nextVariant.routedBody;
           nativeContentEncoding = nextVariant.contentEncoding;
         }
