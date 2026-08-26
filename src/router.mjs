@@ -1008,6 +1008,10 @@ async function healthPayload() {
     ok: degraded.length === 0,
     service: "codex-router",
     version: VERSION,
+    // Process identity is protected topology data. The public /health
+    // projection below intentionally omits it, while the caller-capability
+    // leaf lets installation bind port ownership to this exact Router child.
+    pid: process.pid,
     router: "ready",
     taskManagerMode:
       process.env.CODEX_ROUTER_TASK_MANAGER_STANDALONE === "1"

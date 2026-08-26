@@ -2,8 +2,11 @@ import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
   chmodSync,
+  closeSync,
   lstatSync,
   mkdirSync,
+  openSync,
+  readSync,
   readFileSync,
   rmSync,
   statSync,
@@ -142,9 +145,9 @@ function explicitFiles(files) {
   return resolved;
 }
 
-function statOrMissing(target) {
+function statOrMissing(target, inspect = lstatSync) {
   try {
-    return lstatSync(target);
+    return inspect(target);
   } catch (error) {
     if (error?.code === "ENOENT") return undefined;
     throw error;
@@ -285,13 +288,42 @@ function readSnapshotCopy(target, expectedBytes, label, { allowEmpty = false } =
   if (
     stats.isSymbolicLink()
     || !stats.isFile()
-    || stats.size !== expectedBytes
-    || (!allowEmpty && stats.size < 1)
     || stats.size > MAX_WINDOWS_TASK_SNAPSHOT_BYTES
   ) {
     throw new Error(`Windows task snapshot ${label} is not one bounded exact copy.`);
   }
-  return readFileSync(target);
+  const descriptor = openSync(target, "r");
+  try {
+    const bounded = Buffer.allocUnsafe(MAX_WINDOWS_TASK_SNAPSHOT_BYTES + 1);
+    let bytes = 0;
+    while (bytes < bounded.length) {
+      const read = readSync(descriptor, bounded, bytes, bounded.length - bytes, null);
+      if (read === 0) break;
+      bytes += read;
+    }
+    if (
+      bytes !== expectedBytes
+      || (!allowEmpty && bytes < 1)
+      || bytes > MAX_WINDOWS_TASK_SNAPSHOT_BYTES
+    ) {
+      throw new Error(`Windows task snapshot ${label} is not one bounded exact copy.`);
+    }
+    return Buffer.from(bounded.subarray(0, bytes));
+  } finally {
+    closeSync(descriptor);
+  }
+}
+
+function validateSnapshotAcl(target, acl, platform) {
+  if (platform !== "win32") {
+    if (acl?.kind !== "mode" || !Number.isSafeInteger(acl.value)) {
+      throw new Error(`Snapshot ACL is invalid for ${target}.`);
+    }
+    return;
+  }
+  if (acl?.kind !== "sddl" || typeof acl.value !== "string" || !acl.value) {
+    throw new Error(`Snapshot ACL is invalid for ${target}.`);
+  }
 }
 
 function removeFile(target) {
@@ -318,6 +350,8 @@ export async function snapshotWindowsTask({
   runSchtasks: invokeSchtasks = runSchtasksCommand,
   runPowerShell: invokePowerShell = runPowerShell,
   randomId = randomUUID,
+  lstat: inspect = lstatSync,
+  readFile = readFileSync,
 } = {}) {
   if (!taskNameIsSafe(taskName)) throw new Error("Windows task snapshots require one exact root task name.");
   const trustedFiles = explicitFiles(files);
@@ -355,18 +389,28 @@ export async function snapshotWindowsTask({
     const records = [];
     for (let index = 0; index < trustedFiles.length; index += 1) {
       const target = trustedFiles[index];
-      const stats = statOrMissing(target);
+      const stats = statOrMissing(target, inspect);
       if (stats?.isSymbolicLink() || (stats && !stats.isFile())) {
         throw new Error(`Refusing to snapshot a non-regular launcher file: ${target}`);
       }
       const existed = Boolean(stats);
-      if (existed && stats.size > MAX_WINDOWS_TASK_SNAPSHOT_BYTES) {
+      const contents = existed ? readFile(target) : null;
+      if (existed && !Buffer.isBuffer(contents)) {
+        throw new Error(`Launcher snapshot must be captured as raw bytes: ${target}`);
+      }
+      if (contents && contents.length > MAX_WINDOWS_TASK_SNAPSHOT_BYTES) {
         throw new Error(`Launcher snapshot exceeds the snapshot maximum: ${target}`);
       }
       const backupName = existed ? `file-${index}.bin` : null;
       const acl = existed ? readFileAcl(target, dependencies) : null;
-      if (existed) writePrivateFile(path.join(directory, backupName), readFileSync(target));
-      records.push({ path: target, existed, backupName, bytes: existed ? stats.size : 0, acl });
+      if (existed) writePrivateFile(path.join(directory, backupName), contents);
+      records.push({
+        path: target,
+        existed,
+        backupName,
+        bytes: contents?.length || 0,
+        acl,
+      });
     }
 
     const manifest = {
@@ -419,9 +463,34 @@ export async function restoreWindowsTask(snapshot) {
   assertSnapshotDirectory(handle.directory, handle.root);
   const manifest = readManifest(handle);
   const dependencies = handle.dependencies;
+  const preparedFiles = manifest.files.map((record) => {
+    if (!record.existed) return { record, contents: null };
+    validateSnapshotAcl(record.path, record.acl, dependencies.platform);
+    return {
+      record,
+      contents: readSnapshotCopy(
+        path.join(handle.directory, record.backupName),
+        record.bytes,
+        `copy ${record.backupName}`,
+        { allowEmpty: true },
+      ),
+    };
+  });
+  const taskXml = manifest.exists
+    ? readSnapshotCopy(
+        path.join(handle.directory, manifest.xmlName),
+        manifest.xmlBytes,
+        "task XML",
+      )
+    : null;
   const current = parseTaskMetadata(dependencies.runPowerShell(taskMetadataScript(), {
     env: { ...process.env, CODEX_ROUTER_TASK: handle.taskName },
   }));
+
+  const restoreXmlPath = manifest.exists
+    ? path.join(handle.directory, "restore-task.xml")
+    : null;
+  if (restoreXmlPath) writePrivateFile(restoreXmlPath, taskXml);
 
   if (current.exists) {
     invokeIgnoringFailure(() => dependencies.runSchtasks(
@@ -434,30 +503,19 @@ export async function restoreWindowsTask(snapshot) {
     );
   }
 
-  for (const record of manifest.files) {
+  for (const { record, contents } of preparedFiles) {
     if (!record.existed) {
       removeFile(record.path);
       continue;
     }
-    const backupPath = path.join(handle.directory, record.backupName);
-    writePrivateFile(
-      record.path,
-      readSnapshotCopy(
-        backupPath,
-        record.bytes,
-        `copy ${record.backupName}`,
-        { allowEmpty: true },
-      ),
-    );
+    writePrivateFile(record.path, contents);
     restoreFileAcl(record.path, record.acl, dependencies);
   }
 
   if (!manifest.exists) return snapshot;
 
-  const xmlPath = path.join(handle.directory, manifest.xmlName);
-  readSnapshotCopy(xmlPath, manifest.xmlBytes, "task XML");
   dependencies.runSchtasks(
-    ["/Create", "/TN", handle.taskName, "/XML", xmlPath, "/F"],
+    ["/Create", "/TN", handle.taskName, "/XML", restoreXmlPath, "/F"],
     { mutating: true },
   );
   dependencies.runPowerShell(taskSddlRestoreScript(), {

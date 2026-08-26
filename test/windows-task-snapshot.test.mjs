@@ -274,3 +274,82 @@ test("restore refuses an unknown current Scheduler state before changing explici
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("restore validates every sidecar in memory before the first task or launcher mutation", async () => {
+  for (const corrupt of ["launcher", "xml"]) {
+    const root = mkdtempSync(path.join(os.tmpdir(), `codex-router-corrupt-${corrupt}-`));
+    const launcher = path.join(root, "router.cmd");
+    writeFileSync(launcher, "before", "utf8");
+    const runners = windowsRunners({ exists: true, currentExists: true, running: true });
+    try {
+      const snapshot = await snapshotWindowsTask({
+        taskName: TASK_NAME,
+        files: [launcher],
+        stateDir: path.join(root, "state"),
+        platform: "win32",
+        ...runners,
+      });
+      const corruptPath = corrupt === "launcher"
+        ? path.join(snapshot.directory, snapshot.files[0].backupName)
+        : path.join(snapshot.directory, snapshot.xmlName);
+      if (corrupt === "launcher") writeFileSync(corruptPath, "x", "utf8");
+      else rmSync(corruptPath);
+      writeFileSync(launcher, "leave changed", "utf8");
+      runners.calls.length = 0;
+
+      await assert.rejects(restoreWindowsTask(snapshot), /snapshot|ENOENT|exact copy/i);
+      assert.equal(readFileSync(launcher, "utf8"), "leave changed");
+      assert.deepEqual(
+        runners.calls.filter(({ kind, args }) =>
+          kind === "schtasks" && ["/End", "/Delete", "/Create", "/Run"].includes(args[0])),
+        [],
+      );
+      assert.equal(runners.calls.some(({ kind }) => kind === "restore-file-acl"), false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("snapshot bounds and records the one file buffer read, never a stale stat size", async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "codex-router-growing-snapshot-"));
+  const target = path.join(root, "growing.cmd");
+  const fakeStats = {
+    size: 1,
+    isFile: () => true,
+    isSymbolicLink: () => false,
+  };
+  const runners = windowsRunners({ exists: false, currentExists: false });
+  try {
+    await assert.rejects(
+      snapshotWindowsTask({
+        taskName: TASK_NAME,
+        files: [target],
+        stateDir: path.join(root, "oversized-state"),
+        platform: "win32",
+        lstat: () => fakeStats,
+        readFile: () => Buffer.alloc(MAX_WINDOWS_TASK_SNAPSHOT_BYTES + 1),
+        ...runners,
+      }),
+      /launcher snapshot exceeds|maximum/i,
+    );
+
+    const exactBytes = Buffer.from("grew after stat", "utf8");
+    const snapshot = await snapshotWindowsTask({
+      taskName: TASK_NAME,
+      files: [target],
+      stateDir: path.join(root, "exact-state"),
+      platform: "win32",
+      lstat: () => fakeStats,
+      readFile: () => Buffer.from(exactBytes),
+      ...windowsRunners({ exists: false, currentExists: false }),
+    });
+    assert.equal(snapshot.files[0].bytes, exactBytes.length);
+    assert.deepEqual(
+      readFileSync(path.join(snapshot.directory, snapshot.files[0].backupName)),
+      exactBytes,
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

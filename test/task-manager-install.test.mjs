@@ -58,6 +58,7 @@ function transactionDeps({
       installRouterService: () => step("service-install"),
       waitForRouterHealth: () => step("router-health"),
       waitForEmbeddedTaskManager: () => step("embedded-health"),
+      verifyRestoredStandaloneManager: () => step("restored-manager-health"),
       discardSnapshot: (snapshot) => step(`${snapshot.kind}-snapshot-discard`),
       restoreManagerTaskLaunchersAndShortcut: (snapshot) => {
         assert.equal(snapshot, managerSnapshot);
@@ -93,7 +94,7 @@ test("install failure restores marker, both exact generations, and a healthy Rou
   assert.deepEqual(fixture.calls, [
     "port-owner-check", "manager-preflight", "snapshot-router", "snapshot-manager", "service-stop", "manager-install", "manager-health",
     "shortcut-install", "marker-enable", "service-install", "marker-disable", "manager-restore", "router-restore",
-    "router-start-restored", "router-health", "manager-snapshot-discard", "router-snapshot-discard",
+    "router-start-restored", "router-health", "embedded-health", "manager-snapshot-discard", "router-snapshot-discard",
   ]);
 });
 
@@ -106,6 +107,7 @@ test("rollback attempts every Router recovery step and reports every error", asy
       "router-restore",
       "router-start-restored",
       "router-health",
+      "embedded-health",
     ],
   });
   await assert.rejects(
@@ -120,16 +122,18 @@ test("rollback attempts every Router recovery step and reports every error", asy
         "router-restore failed",
         "router-start-restored failed",
         "router-health failed",
+        "embedded-health failed",
       ]) assert.match(messages, new RegExp(expected));
       return true;
     },
   );
-  assert.deepEqual(fixture.calls.slice(-5), [
+  assert.deepEqual(fixture.calls.slice(-6), [
     "marker-disable",
     "manager-restore",
     "router-restore",
     "router-start-restored",
     "router-health",
+    "embedded-health",
   ]);
   assert.equal(fixture.calls.some((call) => call.endsWith("snapshot-discard")), false);
 });
@@ -147,6 +151,18 @@ test("health is the commit point and both snapshot cleanups are independent", as
   assert.equal(fixture.calls.includes("marker-disable"), false);
 });
 
+test("standalone rollback verifies the restored manager before discarding evidence", async () => {
+  const fixture = transactionDeps({ previousStandalone: true, failAt: "service-install" });
+  await assert.rejects(runTaskManagerInstall("install", fixture.deps), /service-install failed/);
+  assert.deepEqual(fixture.calls.slice(-4), [
+    "router-health",
+    "restored-manager-health",
+    "manager-snapshot-discard",
+    "router-snapshot-discard",
+  ]);
+  assert.equal(fixture.calls.includes("embedded-health"), false);
+});
+
 test("successful recovery discards both snapshots and reports only failed cleanup evidence", async () => {
   const fixture = transactionDeps({
     failAt: ["service-install", "manager-snapshot-discard"],
@@ -161,7 +177,7 @@ test("successful recovery discards both snapshots and reports only failed cleanu
     },
   );
   assert.deepEqual(fixture.calls.slice(-3), [
-    "router-health",
+    "embedded-health",
     "manager-snapshot-discard",
     "router-snapshot-discard",
   ]);
@@ -294,7 +310,7 @@ test("production port classifier binds HTTP identities to the actual owning PID"
     sourceRoot: root,
     readPortOwner: async () => ({ known: true, pid: 41 }),
     readManagerHealth: async () => undefined,
-    readRouterHealth: async () => ({ service: "codex-router", taskManagerMode: "embedded" }),
+    readRouterHealth: async () => ({ service: "codex-router", taskManagerMode: "embedded", pid: 41 }),
     readProcessCommandLine: (pid) => {
       embeddedCalls.push(pid);
       return `node.exe "${root}/src/router.mjs"`;
@@ -327,7 +343,7 @@ test("production port classifier binds HTTP identities to the actual owning PID"
       mode: "standalone",
       pid: 52,
     }),
-    readRouterHealth: async () => ({ service: "codex-router", taskManagerMode: "embedded" }),
+    readRouterHealth: async () => ({ service: "codex-router", taskManagerMode: "embedded", pid: 52 }),
     readProcessCommandLine: () => `node.exe "${root}/src/not-router.mjs"`,
     readManagerProcessState: () => managerState,
     managerProcessOwns: () => true,
@@ -345,11 +361,13 @@ test("Router topology is read only from the protected capability health leaf", a
         ok: true,
         service: "codex-router",
         taskManagerMode: "embedded",
+        pid: 1234,
       }), { status: 200, headers: { "content-type": "application/json" } });
     },
   });
   assert.match(requested, new RegExp(`/_codex-router/${secret}/v1/health$`));
   assert.equal(health.taskManagerMode, "embedded");
+  assert.equal(health.pid, 1234);
 });
 
 test("Windows port-owner probe is bounded, UTF-8, and fail-closed", () => {
@@ -367,6 +385,51 @@ test("Windows port-owner probe is bounded, UTF-8, and fail-closed", () => {
   assert.match(invocation.args.at(-1), /OutputEncoding.*UTF8/);
   assert.match(invocation.args.at(-1), /Get-NetTCPConnection/);
   assert.match(invocation.args.at(-1), /4111|CODEX_ROUTER_CONTROL_PORT/);
+});
+
+test("production owner probe distinguishes absent, wildcard, multiple, and failed queries", async () => {
+  const absent = windowsTaskManagerPortOwner({
+    platform: "win32",
+    spawn: () => ({ status: 0, stdout: JSON.stringify({ known: true, pid: null }) }),
+  });
+  assert.deepEqual(absent, { known: true, pid: null });
+  let healthRead = false;
+  assert.equal(await classifyTaskManagerPortOwner({
+    readPortOwner: () => absent,
+    readManagerHealth: async () => { healthRead = true; },
+    readRouterHealth: async () => { healthRead = true; },
+  }), "absent");
+  assert.equal(healthRead, false);
+
+  let wildcardScript;
+  const wildcard = windowsTaskManagerPortOwner({
+    platform: "win32",
+    spawn: (_command, args) => {
+      wildcardScript = args.at(-1);
+      return { status: 0, stdout: JSON.stringify({ known: true, pid: 71 }) };
+    },
+  });
+  assert.deepEqual(wildcard, { known: true, pid: 71 });
+  for (const address of ["127.0.0.1", "0.0.0.0", "::1", "::"]) {
+    assert.ok(wildcardScript.includes(`'${address}'`), address);
+  }
+  assert.doesNotMatch(wildcardScript, /Get-NetTCPConnection[^\n]+-LocalPort/);
+
+  for (const result of [
+    { status: 1, stdout: "", stderr: "multiple owners" },
+    { status: null, stdout: "", error: new Error("query failed") },
+  ]) {
+    let calls = 0;
+    const owner = windowsTaskManagerPortOwner({
+      platform: "win32",
+      spawn: () => { calls += 1; return result; },
+    });
+    assert.deepEqual(owner, { known: false, pid: null });
+    assert.equal(calls, 2);
+    assert.equal(await classifyTaskManagerPortOwner({
+      readPortOwner: () => owner,
+    }), "unknown");
+  }
 });
 
 test("embedded verification requires exact ownership plus root and non-standalone health contracts", async () => {

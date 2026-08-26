@@ -271,6 +271,7 @@ test("router requires the configured path capability before any model route", as
     CODEX_ROUTER_GATEWAY_HEALTH_URL: `http://127.0.0.1:${gateway.port}/health`,
     CODEX_ROUTER_SESSION_INDEX: sessionIndex,
     CODEX_ROUTER_QUIET: "1",
+    CODEX_ROUTER_TASK_MANAGER_STANDALONE: "1",
   });
 
   try {
@@ -412,6 +413,7 @@ test("router requires the configured path capability before any model route", as
     const protectedHealth = await fetch(`${routerBase(routerPort)}/health`);
     assert.equal(protectedHealth.status, 200);
     const protectedPayload = await protectedHealth.json();
+    assert.equal(protectedPayload.pid, router.pid);
     assert.equal(protectedPayload.oauth.credential_present, true);
     assert.ok(healthAuth.every((value) => value === `Bearer ${INTERNAL_KEY}`));
   } finally {

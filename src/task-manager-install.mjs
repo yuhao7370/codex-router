@@ -123,7 +123,11 @@ export function windowsTaskManagerPortOwner({
     "[Console]::OutputEncoding = [Text.Encoding]::UTF8",
     "$OutputEncoding = $Utf8",
     "$port = [int]$env:CODEX_ROUTER_CONTROL_PORT",
-    "$listeners = @(Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction Stop | Where-Object { $_.LocalAddress -eq '127.0.0.1' })",
+    "$loopbackAddresses = @('127.0.0.1', '0.0.0.0', '::1', '::')",
+    // Query the normal Listen set first, then filter in memory. Passing a port
+    // with no match to Get-NetTCPConnection raises ObjectNotFound, which is not
+    // a query failure and must resolve to known absence rather than unknown.
+    "$listeners = @(Get-NetTCPConnection -State Listen -ErrorAction Stop | Where-Object { ([int]$_.LocalPort -eq $port) -and ($loopbackAddresses -contains [string]$_.LocalAddress) })",
     "$owners = @($listeners | Select-Object -ExpandProperty OwningProcess -Unique)",
     "if ($owners.Count -eq 0) { [Console]::Out.Write('{\"known\":true,\"pid\":null}'); exit 0 }",
     "if ($owners.Count -ne 1 -or [int]$owners[0] -lt 1) { throw 'Port owner is ambiguous.' }",
@@ -256,6 +260,7 @@ export async function classifyTaskManagerPortOwner({
   if (
     routerHealth?.service === "codex-router"
     && routerHealth.taskManagerMode === "embedded"
+    && routerHealth.pid === owner.pid
     && commandLineHasExactEntrypoint(
       readProcessCommandLine(owner.pid),
       path.join(sourceRoot, "src", "router.mjs"),
@@ -456,6 +461,7 @@ function defaultDependencies() {
     uninstallManagerService: () => runNodeCommand("task-manager-service.mjs", "uninstall"),
     purgeManagerServiceComponents: purgeTaskManagerCreatedServiceComponents,
     waitForManagerHealth,
+    verifyRestoredStandaloneManager: waitForManagerHealth,
     installShortcut: () => installTaskManagerShortcut(),
     uninstallShortcut: () => uninstallTaskManagerShortcut(),
     installRouterService: () => runNodeCommand("service.mjs", "install"),
@@ -581,6 +587,17 @@ async function rollbackInstall(deps, previousStandalone, routerSnapshot, manager
     deps.restoreRouterTaskAndLaunchers(routerSnapshot));
   await attempt("restored Router start failed", () => deps.startRestoredRouterTask());
   await attempt("restored Router health failed", () => deps.waitForRouterHealth());
+  if (previousStandalone) {
+    await attempt(
+      "restored standalone Task Manager health failed",
+      () => deps.verifyRestoredStandaloneManager(),
+    );
+  } else {
+    await attempt(
+      "restored embedded Task Manager topology failed",
+      () => deps.waitForEmbeddedTaskManager(),
+    );
+  }
   if (errors.length) return errors;
   return discardSnapshots(deps, routerSnapshot, managerSnapshot);
 }
