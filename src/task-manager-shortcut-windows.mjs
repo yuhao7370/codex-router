@@ -27,7 +27,7 @@ function shortcutSpec(env = process.env) {
   };
 }
 
-function runPowerShell(script, args) {
+function runPowerShell(script, env) {
   execFileSync(
     POWERSHELL,
     [
@@ -38,9 +38,8 @@ function runPowerShell(script, args) {
       "Bypass",
       "-Command",
       script,
-      ...args,
     ],
-    { encoding: "utf8", windowsHide: true },
+    { encoding: "utf8", env, windowsHide: true },
   );
 }
 
@@ -66,13 +65,19 @@ export function installTaskManagerShortcut({
       "[Console]::OutputEncoding = $Utf8",
       "$OutputEncoding = $Utf8",
       "$Shell = New-Object -ComObject WScript.Shell",
-      "$Shortcut = $Shell.CreateShortcut([string]$args[0])",
-      "$Shortcut.TargetPath = [string]$args[1]",
-      "$Shortcut.Arguments = [string]$args[2]",
-      "$Shortcut.WorkingDirectory = [string]$args[3]",
+      "$Shortcut = $Shell.CreateShortcut([string]$env:CODEX_ROUTER_SHORTCUT_PATH)",
+      "$Shortcut.TargetPath = [string]$env:CODEX_ROUTER_SHORTCUT_TARGET",
+      "$Shortcut.Arguments = [string]$env:CODEX_ROUTER_SHORTCUT_ARGUMENTS",
+      "$Shortcut.WorkingDirectory = [string]$env:CODEX_ROUTER_SHORTCUT_WORKING_DIRECTORY",
       "$Shortcut.Save()",
     ].join("; "),
-    [spec.path, spec.target, spec.arguments, spec.workingDirectory],
+    {
+      ...env,
+      CODEX_ROUTER_SHORTCUT_PATH: spec.path,
+      CODEX_ROUTER_SHORTCUT_TARGET: spec.target,
+      CODEX_ROUTER_SHORTCUT_ARGUMENTS: spec.arguments,
+      CODEX_ROUTER_SHORTCUT_WORKING_DIRECTORY: spec.workingDirectory,
+    },
   );
   return { ...spec, installed: true, skipped: false };
 }

@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -65,3 +67,52 @@ test("uninstall removes only the rendered shortcut path", () => {
   assert.deepEqual(removed, [path.join(startMenu, "Codex Router Task Manager.lnk")]);
   assert.equal(result.path, removed[0]);
 });
+
+test(
+  "real PowerShell creates and removes only an isolated shortcut",
+  { skip: process.platform !== "win32" },
+  () => {
+    const temporary = mkdtempSync(path.join(os.tmpdir(), "task-manager-shortcut-"));
+    const startMenu = path.join(temporary, "Start Menu", "Programs");
+    const shortcutPath = path.join(startMenu, "Codex Router Task Manager.lnk");
+    const env = { ...process.env, CODEX_ROUTER_START_MENU_DIR: startMenu };
+    for (const name of [
+      "NODE_TEST_CONTEXT",
+      "MODEL_ROUTER_SKIP_SERVICE_MANAGER",
+      "CODEX_ROUTER_SKIP_LAUNCHCTL",
+    ]) {
+      delete env[name];
+    }
+
+    try {
+      installTaskManagerShortcut({ env });
+      assert.equal(existsSync(shortcutPath), true);
+
+      const inspectEnv = {
+        ...process.env,
+        CODEX_ROUTER_TEST_SHORTCUT_PATH: shortcutPath,
+      };
+      const inspectScript = [
+        "$ErrorActionPreference = 'Stop'",
+        "$Utf8 = [Text.UTF8Encoding]::new($false)",
+        "[Console]::OutputEncoding = $Utf8",
+        "$OutputEncoding = $Utf8",
+        "$Shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut([string]$env:CODEX_ROUTER_TEST_SHORTCUT_PATH)",
+        "[pscustomobject]@{ target = $Shortcut.TargetPath; arguments = $Shortcut.Arguments; workingDirectory = $Shortcut.WorkingDirectory } | ConvertTo-Json -Compress",
+      ].join("; ");
+      const inspected = JSON.parse(execFileSync(
+        "powershell.exe",
+        ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", inspectScript],
+        { encoding: "utf8", env: inspectEnv, windowsHide: true },
+      ));
+      assert.match(inspected.target, /powershell\.exe$/i);
+      assert.match(inspected.arguments, /codex-router\.ps1.+task-manager.+open/i);
+      assert.equal(path.resolve(inspected.workingDirectory), root);
+
+      uninstallTaskManagerShortcut({ env });
+      assert.equal(existsSync(shortcutPath), false);
+    } finally {
+      rmSync(temporary, { recursive: true, force: true });
+    }
+  },
+);
