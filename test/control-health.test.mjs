@@ -20,6 +20,7 @@ test("control health preserves the safe UI contract without returning capability
           service: "codex-router",
           version: "test-version",
           router: "ready",
+          taskManagerMode: "standalone",
           degraded: ["gateway"],
           activity: { state: "generating", activeCount: 1, active: [{ model: "test/model" }] },
           gateway: { reachable: false, enabled: true, credential: CALLER_SECRET },
@@ -28,6 +29,8 @@ test("control health preserves the safe UI contract without returning capability
           grokOauth: { reachable: true, enabled: false },
           credential: CALLER_SECRET,
           callerUrl: `http://127.0.0.1:43210/${CALLER_SECRET}`,
+          pid: 4321,
+          sourceRoot: `C:/private/${CALLER_SECRET}`,
         }),
       };
     },
@@ -43,6 +46,7 @@ test("control health preserves the safe UI contract without returning capability
     service: "codex-router",
     version: "test-version",
     router: "ready",
+    taskManagerMode: "standalone",
     degraded: ["gateway"],
     activity: { state: "generating", activeCount: 1, active: [{ model: "test/model" }] },
     gateway: { reachable: false, enabled: true },
@@ -51,6 +55,29 @@ test("control health preserves the safe UI contract without returning capability
     grokOauth: { reachable: true, enabled: false },
   });
   assert.doesNotMatch(JSON.stringify(result), new RegExp(CALLER_SECRET));
+  assert.equal("pid" in result, false);
+  assert.equal("sourceRoot" in result, false);
+});
+
+test("control health projects only recognized Task Manager topology modes", async () => {
+  for (const [taskManagerMode, expected] of [
+    ["standalone", "standalone"],
+    ["embedded", "embedded"],
+    ["unknown", undefined],
+    [CALLER_SECRET, undefined],
+    [null, undefined],
+  ]) {
+    const result = await readControlHealth({
+      readCallerSecret: () => CALLER_SECRET,
+      fetchImpl: async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({ service: "codex-router", taskManagerMode }),
+      }),
+    });
+    assert.equal(result.taskManagerMode, expected);
+    assert.doesNotMatch(JSON.stringify(result), new RegExp(CALLER_SECRET));
+  }
 });
 
 test("control health fails closed before fetch when the caller capability is unavailable", async () => {

@@ -4,6 +4,7 @@ import path from "node:path";
 
 import { validCallerSecret } from "./caller-auth.mjs";
 import { codexAuthStatus, findCodexBinary, runCodex } from "./codex-binary.mjs";
+import { readControlHealth } from "./control-health.mjs";
 import { commandOnPath, spawnableCommand } from "./spawnable-command.mjs";
 import { routedCodexAgentStatus } from "./codex-agent-catalog.mjs";
 import { privateFileIsProtected } from "./file-security.mjs";
@@ -1177,6 +1178,7 @@ if (process.platform === "win32" && standaloneTaskManager) {
   } catch {
     // The projector fails closed without copying command output into doctor.
   }
+  const protectedHealth = await readControlHealth();
   const managerRows = taskManagerDoctorRows({
     platform: process.platform,
     standalone: standaloneTaskManager,
@@ -1187,7 +1189,7 @@ if (process.platform === "win32" && standaloneTaskManager) {
       marker: privateFileIsProtected(TASK_MANAGER_STANDALONE_PATH),
       process: privateFileIsProtected(TASK_MANAGER_PROCESS_STATE_PATH),
     },
-    routerMode: health.payload?.taskManagerMode,
+    routerMode: protectedHealth.taskManagerMode,
   });
   for (const row of managerRows) add(row.status, row.label, row.detail, row.remedy);
 }

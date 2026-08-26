@@ -1,9 +1,13 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 import { taskManagerDoctorRows } from "../src/task-manager-doctor.mjs";
 
 const callerKey = "TEST_DOCTOR_CALLER_CAPABILITY_MUST_NOT_APPEAR";
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 function healthyFixture(overrides = {}) {
   return {
@@ -115,4 +119,12 @@ test("every private Task Manager state file must be protected", () => {
       "doctor --fix",
     );
   }
+});
+
+test("doctor reads standalone topology only through protected control health", () => {
+  const source = readFileSync(path.join(root, "src", "doctor.mjs"), "utf8");
+  assert.match(source, /import \{ readControlHealth \} from "\.\/control-health\.mjs"/);
+  assert.match(source, /await readControlHealth\(\)/);
+  assert.match(source, /routerMode:\s*protectedHealth\.taskManagerMode/);
+  assert.doesNotMatch(source, /routerMode:\s*health\.payload\?\.taskManagerMode/);
 });

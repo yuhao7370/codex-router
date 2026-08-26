@@ -52,6 +52,9 @@ export async function readControlHealth({
       ...(typeof body.service === "string" ? { service: body.service } : {}),
       ...(typeof body.version === "string" ? { version: body.version } : {}),
       ...(typeof body.router === "string" ? { router: body.router } : {}),
+      ...(["standalone", "embedded"].includes(body.taskManagerMode)
+        ? { taskManagerMode: body.taskManagerMode }
+        : {}),
       ...(Array.isArray(body.degraded) ? { degraded: body.degraded } : {}),
       ...(body.activity && typeof body.activity === "object" ? { activity: body.activity } : {}),
       ...(safeService(body.gateway) ? { gateway: safeService(body.gateway) } : {}),
