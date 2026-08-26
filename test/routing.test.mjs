@@ -15,7 +15,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { zstdCompressSync, zstdDecompressSync } from "node:zlib";
 
-import { callerBaseUrl } from "../src/caller-auth.mjs";
+import { callerBaseUrl, taskManagerUrl } from "../src/caller-auth.mjs";
 import {
   CHECKPOINT_WARNING,
   decodeCompaction,
@@ -417,6 +417,36 @@ test("router requires the configured path capability before any model route", as
   } finally {
     await stopChild(router);
     await closeServer(gateway.server);
+  }
+});
+
+test("task manager runtime requires the configured caller capability", async () => {
+  const testRoot = mkdtempSync(path.join(os.tmpdir(), "router-task-manager-runtime-"));
+  const routerPort = await openPort();
+  let controlPort = await openPort();
+  while (controlPort === routerPort) controlPort = await openPort();
+  const router = run("router.mjs", {
+    CODEX_ROUTER_PORT: String(routerPort),
+    CODEX_ROUTER_CONTROL_PORT: String(controlPort),
+    CODEX_ROUTER_STATE_DIR: testRoot,
+    CODEX_ROUTER_QUIET: "1",
+  });
+
+  try {
+    await waitFor(`${routerBase(routerPort)}/models`, router);
+    const runtime = await fetch(`${taskManagerUrl(routerPort, CALLER_KEY)}runtime`);
+    assert.equal(runtime.status, 200);
+    const body = await runtime.json();
+    assert.equal(JSON.stringify(body).includes("accessToken"), false);
+    assert.equal(JSON.stringify(body).includes("access_token"), false);
+
+    const unauthenticated = await fetch(
+      `http://127.0.0.1:${routerPort}/_codex-router/wrong-caller-capability-with-sufficient-length/task-manager/runtime`,
+    );
+    assert.equal(unauthenticated.status, 401);
+  } finally {
+    await stopChild(router);
+    rmSync(testRoot, { recursive: true, force: true });
   }
 });
 

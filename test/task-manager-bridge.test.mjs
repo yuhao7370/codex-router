@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 
@@ -79,6 +80,58 @@ test("failure attribution accepts the request's injected account", () => {
   assert.equal(bridge.errorLog()[0].accountId, "seat-from-request");
   bridge.clearErrorLog();
   bridge.setTaskManagerEnabled(false);
+});
+
+test("runtime snapshots omit credentials and reread the shared error log", async () => {
+  const server = http.createServer((_request, response) => {
+    const body = JSON.stringify({
+      account_id: "account-1",
+      email: "account@example.com",
+      access_token: "upstream-secret",
+      usage: {
+        plan: "pro",
+        weekly_used_percent: 25,
+        fetched_at: 1_777_000_000,
+      },
+    });
+    response.writeHead(200, { "Content-Type": "application/json" });
+    response.end(body);
+  });
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+
+  try {
+    const address = server.address();
+    assert.ok(typeof address === "object" && address);
+    bridge.setTaskManagerPort(address.port);
+    bridge.setTaskManagerToken("manager-secret");
+    bridge.setTaskManagerEnabled(true);
+    await bridge.refreshActiveAccount();
+    writeFileSync(
+      path.join(dir, "task-manager-errors.jsonl"),
+      `${JSON.stringify({ at: "2026-08-26T00:00:00.000Z", type: "capacity", message: "full" })}\n`,
+    );
+
+    const snapshot = bridge.taskManagerRuntimeSnapshot();
+    assert.deepEqual(snapshot.account, {
+      accountId: "account-1",
+      email: "account@example.com",
+      plan: "pro",
+      remainingPercent: 75,
+      fetchedAt: 1_777_000_000,
+    });
+    assert.equal(snapshot.errors[0].message, "full");
+    assert.equal(JSON.stringify(snapshot).includes("accessToken"), false);
+    assert.equal(JSON.stringify(snapshot).includes("access_token"), false);
+    assert.equal(JSON.stringify(snapshot).includes("upstream-secret"), false);
+    assert.equal(JSON.stringify(snapshot).includes("manager-secret"), false);
+  } finally {
+    bridge.setTaskManagerEnabled(false);
+    bridge.setTaskManagerToken("");
+    await new Promise((resolve) => server.close(resolve));
+  }
 });
 
 test("poll intervals default, persist, and clamp", () => {

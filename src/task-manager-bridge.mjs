@@ -89,7 +89,7 @@ function recordErrorLog(entry) {
 }
 
 export function errorLog() {
-  return errorLogEntries;
+  return loadErrorLog();
 }
 
 export function clearErrorLog() {
@@ -487,6 +487,31 @@ export async function refreshActiveAccount() {
 
 export function activeAccount() {
   return cached;
+}
+
+export function taskManagerRuntimeSnapshot() {
+  const account = activeAccount();
+  return {
+    account: account
+      ? {
+          accountId: account.accountId,
+          email: account.email || "",
+          plan: account.plan || "",
+          remainingPercent: account.remainingPercent ?? null,
+          fetchedAt: account.fetchedAt ?? null,
+        }
+      : null,
+    pool: poolStatus(),
+    failover: failoverStatus(),
+    errors: errorLog(),
+    injections: injectionStats(),
+  };
+}
+
+export async function reloadTaskManagerRuntime() {
+  await refreshActiveAccount();
+  await refreshPool();
+  return taskManagerRuntimeSnapshot();
 }
 
 async function chooseFallbackAccount() {

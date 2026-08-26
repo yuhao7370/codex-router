@@ -31,6 +31,10 @@ import {
 import { handlePanelRequest, isPanelRoute } from "./desktop-panel.mjs";
 import { handleGeminiRequest, isGeminiRoute } from "./gemini-surface.mjs";
 import {
+  handleTaskManagerRouterRequest,
+  isTaskManagerRouterRoute,
+} from "./task-manager-router-api.mjs";
+import {
   applyKeepAliveTimeouts,
   endStreamedResponse,
   finishResponse,
@@ -3923,6 +3927,13 @@ async function handleRequest(request, response) {
     return;
   }
   requestUrl.pathname = route;
+
+  if (
+    isTaskManagerRouterRoute(route) &&
+    (await handleTaskManagerRouterRequest(request, response, route, { writeJson }))
+  ) {
+    return;
+  }
 
   // Behind the caller capability, like every other local endpoint: the panel
   // reads the same data the tray does, so it is gated the same way.
