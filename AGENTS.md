@@ -131,7 +131,10 @@ user.
 8. Run `bin/model-router codex doctor` (or
    `./model-router.ps1 codex doctor` on Windows). Core config, config privacy,
    catalog, caller capability, internal key, service, router health, and
-   selected credentials must be `OK`. Unselected credentials may be `WARN`.
+   selected credentials must be `OK`. On Windows, manager core rows (`Task
+   Manager service`, `Task Manager health`, `Task Manager privacy`, and `Task
+   Manager topology`) and Router core rows (`Background service` and `Router
+   health`) must all be `OK`. Unselected credentials may be `WARN`.
 9. If a managed layer fails, use `model-router codex doctor --fix`; add
    `--migrate-known` only for a recognized older installation. Repair rebuilds
    the Node and Python dependencies unconditionally, unlike a normal install or

@@ -460,6 +460,25 @@ no processes at all. When it is not, the shim starts the service, waits up to
 
 The shim is a bash script and is not available on Windows.
 
+## Windows Task Manager service
+
+Windows Codex installs `Codex Router Task Manager` and `Codex Router` as
+separate login tasks. Stopping Router leaves the manager available for Start,
+Restart, and diagnostics. The manager starts hidden and never opens a browser
+at login; opening its authenticated local page is always an explicit action.
+
+```text
+Open:       .\codex-router.ps1 task-manager open
+Status:     .\codex-router.ps1 task-manager service status
+Repair:     .\codex-router.ps1 task-manager service install
+Restore UI: .\codex-router.ps1 task-manager service uninstall
+```
+
+Installation and repair refuse unknown ownership of port 4111. They do not
+stop or replace an unrecognized listener. `Restore UI` removes the standalone
+manager and restores Router's embedded Task Manager page; it does not remove
+the Control Center.
+
 ## Update and rollback
 
 ```sh

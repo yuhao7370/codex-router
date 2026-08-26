@@ -45,6 +45,17 @@ function runJson(script, args = []) {
   }
 }
 
+function publicTaskManagerServiceStatus() {
+  const status = runJson("task-manager-service.mjs", ["status"]);
+  return {
+    installed: status.installed ?? null,
+    loaded: status.loaded ?? null,
+    state: status.state ?? "unknown",
+    canonical: status.canonical ?? null,
+    healthy: status.healthy ?? false,
+  };
+}
+
 function commandVersion(command, args) {
   try {
     return execFileSync(command, args, {
@@ -199,6 +210,7 @@ export function createSupportBundle(options = {}) {
     doctor: runJson("doctor.mjs", ["--json"]),
     config: runJson("config-manager.mjs", ["status"]),
     service: runJson("service.mjs", ["status"]),
+    taskManagerService: publicTaskManagerServiceStatus(),
     selection,
     credentialSources,
     ownership: detectLegacyInstallations(),

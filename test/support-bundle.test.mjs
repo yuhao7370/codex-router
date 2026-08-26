@@ -69,6 +69,12 @@ model_catalog_json = ${JSON.stringify(path.join(stateDir, "merged-models.json"))
     assert.doesNotMatch(contents, new RegExp(callerSentinel));
     assert.match(bundle.config.openai_base_url, /\[REDACTED\]/);
     assert.equal("redactedLogTail" in bundle, false);
+    assert.deepEqual(
+      Object.keys(bundle.taskManagerService),
+      ["installed", "loaded", "state", "canonical", "healthy"],
+    );
+    assert.equal("pid" in bundle.taskManagerService, false);
+    assert.equal("path" in bundle.taskManagerService, false);
   } finally {
     rmSync(testRoot, { recursive: true, force: true });
   }

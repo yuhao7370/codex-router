@@ -708,6 +708,34 @@ test("Windows installer baselines fail closed and preserve partial Task Manager 
   assert.match(windows, /CODEX_ROUTER_TASK_MANAGER_REQUIRE_EMBEDDED/);
 });
 
+test("Windows operator docs cover the independent Task Manager service", () => {
+  const install = readScript("docs", "INSTALL.md");
+  const troubleshooting = readScript("docs", "TROUBLESHOOTING.md");
+  const agents = readScript("AGENTS.md");
+  const documentation = `${install}\n${troubleshooting}`;
+
+  for (const command of [
+    ".\\codex-router.ps1 task-manager open",
+    ".\\codex-router.ps1 task-manager service status",
+    ".\\codex-router.ps1 task-manager service install",
+    ".\\codex-router.ps1 task-manager service uninstall",
+  ]) {
+    assert.match(documentation, new RegExp(command.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  }
+  assert.match(documentation, /Codex Router Task Manager/);
+  assert.match(documentation, /Codex Router/);
+  assert.match(documentation, /separate login tasks/i);
+  assert.match(documentation, /stopping Router leaves the manager available/i);
+  assert.match(documentation, /never opens a browser at login/i);
+  assert.match(documentation, /unknown (?:owner|ownership).*4111|4111.*unknown (?:owner|ownership)/i);
+  assert.match(agents, /Task\s+Manager service/);
+  assert.match(agents, /Task\s+Manager health/);
+  assert.match(agents, /Task\s+Manager privacy/);
+  assert.match(agents, /Task\s+Manager topology/);
+  assert.match(agents, /Background service/);
+  assert.match(agents, /Router\s+health/);
+});
+
 // The manifest names the checkout that owns the generated state, and the
 // desktop app resolves its source root from it. Recording it only after the
 // health wait meant a timeout left the manifest naming the previous owner

@@ -25,6 +25,8 @@ import {
 import { readHiddenModels } from "./model-picker-state.mjs";
 import { serviceFollowsHostApps } from "./presence-state.mjs";
 import { waitForRouterHealth } from "./router-health.mjs";
+import { taskManagerDoctorRows } from "./task-manager-doctor.mjs";
+import { taskManagerStandaloneEnabled } from "./task-manager-standalone-state.mjs";
 import {
   CALLER_SECRET_PATH,
   CODEX_AGENTS_DIR,
@@ -39,7 +41,11 @@ import {
   MERGED_CATALOG_PATH,
   PORTS,
   SOURCE_ROOT,
+  TASK_MANAGER_CONTROL_PORT,
+  TASK_MANAGER_PROCESS_STATE_PATH,
+  TASK_MANAGER_STANDALONE_PATH,
   TARGET,
+  loopback,
 } from "./paths.mjs";
 import { CODEX_APP_TOOLS } from "./codex-app-tools.mjs";
 import {
@@ -177,6 +183,20 @@ function childJson(script, args = []) {
       stdio: ["ignore", "pipe", "ignore"],
     }),
   );
+}
+
+async function taskManagerHealth() {
+  try {
+    const response = await fetch(loopback(TASK_MANAGER_CONTROL_PORT, "/health"), {
+      signal: AbortSignal.timeout(4_000),
+    });
+    const payload = await response.json();
+    return payload && typeof payload === "object"
+      ? { ...payload, ok: response.ok }
+      : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function repair() {
@@ -1148,6 +1168,29 @@ add(
         : `not ready on 127.0.0.1:${PORTS.router} after ${serviceLoaded ? 30 : 2} seconds; ${health.error}`,
   "Run ./bin/doctor --fix. If it still fails, create a support bundle.",
 );
+
+const standaloneTaskManager = taskManagerStandaloneEnabled();
+if (process.platform === "win32" && standaloneTaskManager) {
+  let managerService;
+  try {
+    managerService = childJson("task-manager-service.mjs", ["status"]);
+  } catch {
+    // The projector fails closed without copying command output into doctor.
+  }
+  const managerRows = taskManagerDoctorRows({
+    platform: process.platform,
+    standalone: standaloneTaskManager,
+    service: managerService,
+    health: await taskManagerHealth(),
+    privateState: {
+      caller: privateFileIsProtected(CALLER_SECRET_PATH),
+      marker: privateFileIsProtected(TASK_MANAGER_STANDALONE_PATH),
+      process: privateFileIsProtected(TASK_MANAGER_PROCESS_STATE_PATH),
+    },
+    routerMode: health.payload?.taskManagerMode,
+  });
+  for (const row of managerRows) add(row.status, row.label, row.detail, row.remedy);
+}
 
 // A healthy router that no client can reach looks identical to a healthy
 // router, which is why this sits directly under the health check. When a

@@ -429,6 +429,21 @@ Get-ScheduledTask -TaskName "Codex Router"
 ./codex-router.ps1 doctor --fix
 ```
 
+Windows uses two separate login tasks: `Codex Router Task Manager` owns the
+local management page, while `Codex Router` owns routing. Stopping Router leaves
+the manager available, and the manager never opens a browser at login.
+
+```text
+Open:       .\codex-router.ps1 task-manager open
+Status:     .\codex-router.ps1 task-manager service status
+Repair:     .\codex-router.ps1 task-manager service install
+Restore UI: .\codex-router.ps1 task-manager service uninstall
+```
+
+Repair fails closed when port 4111 has unknown ownership; identify that process
+instead of killing or replacing it. `Restore UI` removes the standalone manager
+and restores the embedded Router Task Manager page.
+
 The task runs `start-codex-router-hidden.vbs` from the state directory under
 `wscript.exe`, which starts `start-codex-router.cmd` without a console window,
 so a missing window is not a sign that the router is down. Read `router.log` in
