@@ -17,6 +17,10 @@ test("Windows process identity probes are bounded", () => {
   assert.equal(invocation.command, "powershell.exe");
   assert.equal(invocation.options.windowsHide, true);
   assert.equal(invocation.options.timeout, 5_000);
+  assert.match(
+    invocation.args.at(-1),
+    /\[Console\]::OutputEncoding = \[Text\.Encoding\]::UTF8/,
+  );
 });
 
 test("Windows command-line fallback bounds both CIM and WMI probes", () => {
@@ -34,6 +38,9 @@ test("Windows command-line fallback bounds both CIM and WMI probes", () => {
   assert.equal(invocations.length, 2);
   assert.match(invocations[0].args.at(-1), /Get-CimInstance/);
   assert.match(invocations[1].args.at(-1), /Get-WmiObject/);
+  assert.ok(invocations.every(({ args }) => (
+    /\[Console\]::OutputEncoding = \[Text\.Encoding\]::UTF8/.test(args.at(-1))
+  )));
   assert.ok(invocations.every(({ options }) => options.timeout === 5_000));
 });
 

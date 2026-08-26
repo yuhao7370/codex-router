@@ -1,6 +1,7 @@
 import { spawnSync } from "node:child_process";
 
 const WINDOWS_PROCESS_PROBE_TIMEOUT_MS = 5_000;
+const WINDOWS_UTF8_OUTPUT = "[Console]::OutputEncoding = [Text.Encoding]::UTF8; ";
 
 // A PID alone is not an identity: the operating system reuses them, and a
 // router that remembers only a number can eventually send a signal to whatever
@@ -17,7 +18,7 @@ export function processStartIdentity(
   try {
     if (platform === "win32") {
       const script =
-        `$p = Get-Process -Id ${pid} -ErrorAction Stop; ` +
+        `${WINDOWS_UTF8_OUTPUT}$p = Get-Process -Id ${pid} -ErrorAction Stop; ` +
         `[Console]::Out.Write($p.StartTime.ToUniversalTime().Ticks.ToString() + '|' + $p.Path)`;
       const result = spawn(
         "powershell.exe",
@@ -51,8 +52,8 @@ export function processCommandLine(
   try {
     if (platform === "win32") {
       const scripts = [
-        `$p = Get-CimInstance Win32_Process -Filter \"ProcessId = ${pid}\" -ErrorAction Stop; [Console]::Out.Write($p.CommandLine)`,
-        `$p = Get-WmiObject Win32_Process -Filter \"ProcessId = ${pid}\" -ErrorAction Stop; [Console]::Out.Write($p.CommandLine)`,
+        `${WINDOWS_UTF8_OUTPUT}$p = Get-CimInstance Win32_Process -Filter \"ProcessId = ${pid}\" -ErrorAction Stop; [Console]::Out.Write($p.CommandLine)`,
+        `${WINDOWS_UTF8_OUTPUT}$p = Get-WmiObject Win32_Process -Filter \"ProcessId = ${pid}\" -ErrorAction Stop; [Console]::Out.Write($p.CommandLine)`,
       ];
       for (const script of scripts) {
         const result = spawn(

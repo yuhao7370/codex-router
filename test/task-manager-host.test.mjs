@@ -38,12 +38,7 @@ async function stopChild(child) {
   await new Promise((resolve) => child.once("exit", resolve));
 }
 
-test("standalone host serves minimal public health and shuts down cleanly", async () => {
-  const stateDir = mkdtempSync(path.join(os.tmpdir(), "task-manager-host-"));
-  const processStatePath = path.join(stateDir, "task-manager-process.json");
-  writeFileSync(path.join(stateDir, "caller-secret"), `${CALLER_KEY}\n`, { mode: 0o600 });
-  const controlPort = await openPort();
-  const isolatedRouterPort = await openPort();
+function spawnHost({ stateDir, controlPort, routerPort }) {
   const child = spawn(process.execPath, [
     "--import",
     SIGNAL_PROXY,
@@ -54,7 +49,7 @@ test("standalone host serves minimal public health and shuts down cleanly", asyn
       ...process.env,
       MODEL_ROUTER_STATE_DIR: stateDir,
       MODEL_ROUTER_CONTROL_PORT: String(controlPort),
-      MODEL_ROUTER_PORT: String(isolatedRouterPort),
+      MODEL_ROUTER_PORT: String(routerPort),
     },
     stdio: ["ignore", "ignore", "pipe", "ipc"],
   });
@@ -63,12 +58,26 @@ test("standalone host serves minimal public health and shuts down cleanly", asyn
   child.stderr.on("data", (chunk) => {
     stderr += chunk;
   });
+  return { child, errors: () => stderr };
+}
+
+test("standalone host serves minimal public health and shuts down cleanly", async () => {
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), "task-manager-host-"));
+  const processStatePath = path.join(stateDir, "task-manager-process.json");
+  writeFileSync(path.join(stateDir, "caller-secret"), `${CALLER_KEY}\n`, { mode: 0o600 });
+  const controlPort = await openPort();
+  const isolatedRouterPort = await openPort();
+  const { child, errors } = spawnHost({
+    stateDir,
+    controlPort,
+    routerPort: isolatedRouterPort,
+  });
 
   try {
     const response = await waitForHealth(
       `http://127.0.0.1:${controlPort}`,
       child,
-      () => stderr,
+      errors,
     );
     assert.deepEqual(await response.json(), {
       ok: true,
@@ -85,6 +94,35 @@ test("standalone host serves minimal public health and shuts down cleanly", asyn
 
   assert.ok(
     child.exitCode === 0 || child.signalCode === "SIGTERM",
-    `unexpected host exit: code=${child.exitCode} signal=${child.signalCode}\n${stderr}`,
+    `unexpected host exit: code=${child.exitCode} signal=${child.signalCode}\n${errors()}`,
   );
+});
+
+test("standalone host preserves a replacement process record during shutdown", async () => {
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), "task-manager-host-replacement-"));
+  const processStatePath = path.join(stateDir, "task-manager-process.json");
+  writeFileSync(path.join(stateDir, "caller-secret"), `${CALLER_KEY}\n`, { mode: 0o600 });
+  const controlPort = await openPort();
+  const isolatedRouterPort = await openPort();
+  const { child, errors } = spawnHost({
+    stateDir,
+    controlPort,
+    routerPort: isolatedRouterPort,
+  });
+
+  try {
+    await waitForHealth(`http://127.0.0.1:${controlPort}`, child, errors);
+    const original = JSON.parse(readFileSync(processStatePath, "utf8"));
+    const replacement = {
+      ...original,
+      processIdentity: `replacement|${original.processIdentity}`,
+    };
+    writeFileSync(processStatePath, `${JSON.stringify(replacement, null, 2)}\n`);
+
+    await stopChild(child);
+    assert.deepEqual(JSON.parse(readFileSync(processStatePath, "utf8")), replacement);
+  } finally {
+    await stopChild(child);
+    rmSync(stateDir, { recursive: true, force: true });
+  }
 });

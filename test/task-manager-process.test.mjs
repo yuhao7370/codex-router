@@ -8,6 +8,7 @@ import {
   buildTaskManagerProcessState,
   clearTaskManagerProcessState,
   readTaskManagerProcessState,
+  taskManagerProcessEvidence,
   taskManagerProcessOwns,
   writeTaskManagerProcessState,
 } from "../src/task-manager-process.mjs";
@@ -76,6 +77,38 @@ test("manager process ownership requires this checkout and host entrypoint", () 
     }),
     false,
   );
+});
+
+test("manager process evidence distinguishes owned, gone, replaced, and unknown", () => {
+  const state = buildTaskManagerProcessState({
+    pid: 42,
+    sourceRoot,
+    stateDir,
+    identity,
+    commandLine,
+  });
+  const options = { sourceRoot, stateDir, commandLine };
+
+  assert.equal(taskManagerProcessEvidence(state, { ...options, identity }), "owned");
+  assert.equal(taskManagerProcessEvidence(state, {
+    ...options,
+    identity: () => undefined,
+    exists: () => false,
+  }), "gone");
+  assert.equal(taskManagerProcessEvidence(state, {
+    ...options,
+    identity: () => "replacement-ticks|node.exe",
+  }), "replaced");
+  assert.equal(taskManagerProcessEvidence(state, {
+    ...options,
+    identity: () => undefined,
+    exists: () => true,
+  }), "unknown");
+  assert.equal(taskManagerProcessEvidence(state, {
+    ...options,
+    identity,
+    commandLine: () => undefined,
+  }), "unknown");
 });
 
 test("manager process state is private, readable, and removable", () => {

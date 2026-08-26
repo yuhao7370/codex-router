@@ -16,7 +16,9 @@ import {
 import {
   clearTaskManagerProcessState,
   readTaskManagerProcessState,
+  taskManagerProcessEvidence,
   taskManagerProcessOwns,
+  taskManagerProcessStateMatches,
 } from "./task-manager-process.mjs";
 import {
   assertServiceWriteIsolated,
@@ -29,6 +31,9 @@ const MUTATING_COMMANDS = new Set(["install", "uninstall", "start", "stop", "res
 const RENDER_COMMANDS = new Set(["render-wrapper", "render-launcher", "render-task"]);
 const COMMANDS = new Set([...MUTATING_COMMANDS, "status", ...RENDER_COMMANDS]);
 const HEALTH_TIMEOUT_MS = 3_000;
+const TASK_SCHEDULER_QUERY_TIMEOUT_MS = 15_000;
+const PROCESS_STOP_TIMEOUT_MS = 15_000;
+const PROCESS_STOP_POLL_MS = 250;
 
 function wrapperPathFor(stateDir = STATE_DIR) {
   return path.join(stateDir, "start-codex-router-task-manager.cmd");
@@ -169,7 +174,12 @@ function removeLaunchers() {
 
 function powershell(script, options = {}) {
   let lastError;
+  const timeoutMs = Number.isFinite(options.timeout) && options.timeout > 0
+    ? options.timeout
+    : undefined;
+  const deadline = timeoutMs === undefined ? undefined : Date.now() + timeoutMs;
   for (const executable of ["powershell.exe", "pwsh.exe"]) {
+    if (deadline !== undefined && Date.now() >= deadline) break;
     try {
       return execFileSync(
         executable,
@@ -179,6 +189,9 @@ function powershell(script, options = {}) {
           windowsHide: true,
           stdio: ["ignore", "pipe", "pipe"],
           ...options,
+          ...(deadline === undefined
+            ? {}
+            : { timeout: Math.max(1, deadline - Date.now()) }),
         },
       );
     } catch (error) {
@@ -192,6 +205,7 @@ function taskQueryScript() {
   const taskName = TASK_MANAGER_TASK_NAME.replaceAll("'", "''");
   return [
     "$ErrorActionPreference = 'Stop'",
+    "[Console]::OutputEncoding = [Text.Encoding]::UTF8",
     `$task = @(Get-ScheduledTask -ErrorAction Stop | Where-Object { $_.TaskName -eq '${taskName}' -and $_.TaskPath -eq '\\' })`,
     "if ($task.Count -eq 0) { [Console]::Out.Write('{\"exists\":false}'); exit 0 }",
     "if ($task.Count -ne 1) { throw 'Task name is ambiguous.' }",
@@ -202,9 +216,11 @@ function taskQueryScript() {
   ].join("; ");
 }
 
-async function queryScheduledTask() {
+export async function queryScheduledTask({ runPowerShell = powershell } = {}) {
   try {
-    const output = powershell(taskQueryScript()).trim();
+    const output = runPowerShell(taskQueryScript(), {
+      timeout: TASK_SCHEDULER_QUERY_TIMEOUT_MS,
+    }).trim();
     const task = JSON.parse(output);
     if (task?.exists === false) return { known: true, exists: false };
     if (
@@ -292,42 +308,82 @@ function deleteScheduledTask() {
   schtasks(["/Delete", "/TN", TASK_MANAGER_TASK_NAME, "/F"]);
 }
 
-function sameProcessRecord(left, right) {
-  return Boolean(
-    left
-    && right
-    && left.pid === right.pid
-    && left.processIdentity === right.processIdentity,
-  );
+function sleep(milliseconds) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
 }
 
-function stopOwnedManagerProcess() {
-  if (managerMutationSkipped()) return;
-  const state = readTaskManagerProcessState();
-  if (
-    !state
-    || state.pid === process.pid
-    || !taskManagerProcessOwns(state, { platform: effectivePlatform })
-  ) {
-    return;
+function killManagerProcess(pid) {
+  execFileSync("taskkill.exe", ["/PID", String(pid), "/T", "/F"], {
+    encoding: "utf8",
+    windowsHide: true,
+    stdio: ["ignore", "ignore", "ignore"],
+    timeout: 5_000,
+  });
+}
+
+export function stopOwnedManagerProcess({
+  skipMutation = managerMutationSkipped,
+  readProcessState = readTaskManagerProcessState,
+  processEvidence = taskManagerProcessEvidence,
+  processStateMatches = taskManagerProcessStateMatches,
+  killProcess = killManagerProcess,
+  clearProcessState = clearTaskManagerProcessState,
+  now = Date.now,
+  sleep: wait = sleep,
+  timeoutMs = PROCESS_STOP_TIMEOUT_MS,
+  pollMs = PROCESS_STOP_POLL_MS,
+} = {}) {
+  if (skipMutation()) return { skipped: true };
+  const recorded = readProcessState();
+  if (!recorded || recorded.pid === process.pid) return { state: "gone", cleared: false };
+
+  const clearUnchanged = (state) => {
+    if (!processStateMatches(readProcessState(), recorded)) {
+      throw new Error("The Task Manager process record changed while stopping; refusing to clear it.");
+    }
+    clearProcessState();
+    return { state, cleared: true };
+  };
+  const evidenceOptions = { platform: effectivePlatform };
+  const initial = processEvidence(recorded, evidenceOptions);
+  if (initial === "gone" || initial === "replaced") {
+    return clearUnchanged(initial);
   }
+  if (initial !== "owned") {
+    throw new Error("The Task Manager process identity is unknown; refusing to stop or clear it.");
+  }
+
+  let killFailed = false;
   try {
-    execFileSync("taskkill.exe", ["/PID", String(state.pid), "/T", "/F"], {
-      encoding: "utf8",
-      windowsHide: true,
-      stdio: ["ignore", "ignore", "ignore"],
-      timeout: 5_000,
-    });
+    killProcess(recorded.pid);
   } catch {
-    // The process may already have exited. Its identity is checked again below.
+    killFailed = true;
   }
-  const current = readTaskManagerProcessState();
-  if (
-    sameProcessRecord(current, state)
-    && !taskManagerProcessOwns(current, { platform: effectivePlatform })
-  ) {
-    clearTaskManagerProcessState();
+
+  const interval = Number.isFinite(pollMs) && pollMs > 0
+    ? pollMs
+    : PROCESS_STOP_POLL_MS;
+  const budget = Number.isFinite(timeoutMs) && timeoutMs >= 0
+    ? timeoutMs
+    : PROCESS_STOP_TIMEOUT_MS;
+  const deadline = now() + budget;
+  let lastEvidence = "unknown";
+  while (true) {
+    const current = readProcessState();
+    if (!processStateMatches(current, recorded)) {
+      throw new Error("The Task Manager process record changed while stopping; refusing to clear it.");
+    }
+    lastEvidence = processEvidence(current, evidenceOptions);
+    if (lastEvidence === "gone" || lastEvidence === "replaced") {
+      return clearUnchanged(lastEvidence);
+    }
+    const remaining = deadline - now();
+    if (remaining <= 0) break;
+    wait(Math.min(interval, remaining));
   }
+  throw new Error(
+    `Task Manager process stop could not confirm it stopped (${lastEvidence}${killFailed ? ", taskkill failed" : ""}); preserving its process record.`,
+  );
 }
 
 async function readManagerHealth({

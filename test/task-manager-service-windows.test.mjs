@@ -6,7 +6,9 @@ import { spawnSync } from "node:child_process";
 import test from "node:test";
 
 import {
+  queryScheduledTask,
   runTaskManagerWindowsCommand,
+  stopOwnedManagerProcess,
   taskManagerServiceStatus,
 } from "../src/task-manager-service-windows.mjs";
 
@@ -109,6 +111,48 @@ test("install refuses an unrecognized same-name task before any mutation", async
   assert.deepEqual(calls, []);
 });
 
+test("a scheduler query failure refuses mutation before any write or command", async () => {
+  const calls = [];
+  await assert.rejects(
+    runTaskManagerWindowsCommand("install", {
+      queryTask: async () => ({ known: false }),
+      writeLaunchers: () => calls.push("write"),
+      registerTask: () => calls.push("register"),
+      startTask: () => calls.push("start"),
+      stopOwnedProcess: () => calls.push("stop-process"),
+    }),
+    /could not identify.*refusing/i,
+  );
+  assert.deepEqual(calls, []);
+});
+
+test("scheduler query uses a bounded UTF-8 PowerShell boundary", async () => {
+  let invocation;
+  const result = await queryScheduledTask({
+    runPowerShell: (script, options) => {
+      invocation = { script, options };
+      return '{"exists":false}';
+    },
+  });
+  assert.deepEqual(result, { known: true, exists: false });
+  assert.equal(invocation.options.timeout, 15_000);
+  assert.match(
+    invocation.script,
+    /\[Console\]::OutputEncoding = \[Text\.Encoding\]::UTF8/,
+  );
+});
+
+test("scheduler query timeout stays unknown", async () => {
+  assert.deepEqual(
+    await queryScheduledTask({
+      runPowerShell: () => {
+        throw Object.assign(new Error("timed out"), { code: "ETIMEDOUT" });
+      },
+    }),
+    { known: false },
+  );
+});
+
 test("status keeps a scheduler query failure unknown", async () => {
   const status = await taskManagerServiceStatus({
     queryTask: async () => ({ known: false }),
@@ -188,4 +232,89 @@ test("the platform dispatcher reports unsupported status without mutating non-Wi
   const status = JSON.parse(result.stdout);
   assert.equal(status.supported, false);
   assert.equal(status.state, "unsupported");
+});
+
+const recordedProcess = Object.freeze({
+  version: 1,
+  managed: true,
+  pid: 42,
+  processIdentity: "ticks|node.exe",
+  commandLine: 'node.exe "C:/router/src/task-manager-host.mjs"',
+  sourceRoot: "C:/router",
+  stateDir: "C:/state",
+});
+
+function stopOptions(overrides = {}) {
+  let now = 0;
+  return {
+    skipMutation: () => false,
+    readProcessState: () => recordedProcess,
+    processEvidence: () => "owned",
+    killProcess: () => {},
+    clearProcessState: () => {},
+    now: () => now,
+    sleep: (milliseconds) => { now += milliseconds; },
+    timeoutMs: 3,
+    pollMs: 1,
+    ...overrides,
+  };
+}
+
+test("stale gone and PID-reused records clear without killing a process", () => {
+  for (const evidence of ["gone", "replaced"]) {
+    let killed = false;
+    let cleared = false;
+    stopOwnedManagerProcess(stopOptions({
+      processEvidence: () => evidence,
+      killProcess: () => { killed = true; },
+      clearProcessState: () => { cleared = true; },
+    }));
+    assert.equal(killed, false, evidence);
+    assert.equal(cleared, true, evidence);
+  }
+});
+
+test("failed taskkill preserves a still-owned record after a bounded wait", () => {
+  let cleared = false;
+  assert.throws(
+    () => stopOwnedManagerProcess(stopOptions({
+      killProcess: () => { throw new Error("access denied"); },
+      clearProcessState: () => { cleared = true; },
+    })),
+    /could not confirm.*stopped/i,
+  );
+  assert.equal(cleared, false);
+});
+
+test("a transient unknown re-probe waits for positive gone evidence before clearing", () => {
+  const evidence = ["owned", "unknown", "gone"];
+  const events = [];
+  let now = 0;
+  stopOwnedManagerProcess(stopOptions({
+    processEvidence: () => evidence.shift(),
+    killProcess: () => events.push("kill"),
+    clearProcessState: () => events.push("clear"),
+    sleep: (milliseconds) => {
+      events.push("sleep");
+      now += milliseconds;
+    },
+    now: () => now,
+  }));
+  assert.deepEqual(events, ["kill", "sleep", "clear"]);
+});
+
+test("a replacement process record is preserved after taskkill", () => {
+  const replacement = { ...recordedProcess, processIdentity: "new-ticks|node.exe" };
+  let current = recordedProcess;
+  let cleared = false;
+  assert.throws(
+    () => stopOwnedManagerProcess(stopOptions({
+      readProcessState: () => current,
+      killProcess: () => { current = replacement; },
+      clearProcessState: () => { cleared = true; },
+    })),
+    /process record changed/i,
+  );
+  assert.equal(current, replacement);
+  assert.equal(cleared, false);
 });

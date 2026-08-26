@@ -7,16 +7,17 @@ import { createTaskManagerRuntimeClient } from "./task-manager-runtime-client.mj
 import {
   clearTaskManagerProcessState,
   readTaskManagerProcessState,
+  taskManagerProcessStateMatches,
   writeTaskManagerProcessState,
 } from "./task-manager-process.mjs";
 import { startTaskManagerUi } from "./task-manager-ui.mjs";
 
 const callerSecret = assertCallerSecret(readFileSync(CALLER_SECRET_PATH, "utf8").trim());
 const serviceController = createRouterServiceController();
-writeTaskManagerProcessState();
+const hostProcessState = writeTaskManagerProcessState();
 
 function clearOwnProcessState() {
-  if (readTaskManagerProcessState()?.pid === process.pid) {
+  if (taskManagerProcessStateMatches(readTaskManagerProcessState(), hostProcessState)) {
     clearTaskManagerProcessState();
   }
 }

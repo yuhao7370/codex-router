@@ -19,6 +19,15 @@ function safePid(pid) {
   return Number.isSafeInteger(pid) && pid > 0 ? pid : undefined;
 }
 
+function processExists(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === "ESRCH" ? false : undefined;
+  }
+}
+
 function entrypointFor(sourceRoot) {
   return normalized(path.join(sourceRoot, "src", "task-manager-host.mjs"));
 }
@@ -102,44 +111,70 @@ export function clearTaskManagerProcessState(
   }
 }
 
-export function taskManagerProcessOwns(
+function validProcessState(state) {
+  return Boolean(
+    state
+    && state.version === STATE_VERSION
+    && state.managed === true
+    && safePid(state.pid)
+    && typeof state.processIdentity === "string"
+    && state.processIdentity
+    && typeof state.commandLine === "string"
+    && state.commandLine
+    && typeof state.sourceRoot === "string"
+    && state.sourceRoot
+    && typeof state.stateDir === "string"
+    && state.stateDir,
+  );
+}
+
+export function taskManagerProcessStateMatches(left, right) {
+  return Boolean(
+    validProcessState(left)
+    && validProcessState(right)
+    && left.pid === right.pid
+    && left.processIdentity === right.processIdentity
+    && left.commandLine === right.commandLine
+    && normalized(left.sourceRoot) === normalized(right.sourceRoot)
+    && normalized(left.stateDir) === normalized(right.stateDir),
+  );
+}
+
+export function taskManagerProcessEvidence(
   state,
   {
     platform = process.platform,
     identity = processStartIdentity,
     commandLine = processCommandLine,
+    exists = processExists,
     sourceRoot = SOURCE_ROOT,
     stateDir = STATE_DIR,
   } = {},
 ) {
   const pid = safePid(state?.pid);
   if (
-    !state
-    || state.version !== STATE_VERSION
-    || state.managed !== true
+    !validProcessState(state)
     || !pid
-    || typeof state.processIdentity !== "string"
-    || !state.processIdentity
-    || typeof state.commandLine !== "string"
-    || !state.commandLine
-    || typeof state.sourceRoot !== "string"
-    || !state.sourceRoot
-    || typeof state.stateDir !== "string"
-    || !state.stateDir
-  ) {
-    return false;
-  }
-  if (
-    normalized(state.sourceRoot) !== normalized(path.resolve(sourceRoot))
+    || normalized(state.sourceRoot) !== normalized(path.resolve(sourceRoot))
     || normalized(state.stateDir) !== normalized(path.resolve(stateDir))
     || !commandLineHasEntrypoint(state.commandLine, state.sourceRoot)
-    || identity(pid, { platform }) !== state.processIdentity
   ) {
-    return false;
+    return "unknown";
   }
-  const liveCommandLine = commandLine(pid, { platform });
-  return Boolean(
-    liveCommandLine
-    && commandLineHasEntrypoint(liveCommandLine, state.sourceRoot),
-  );
+  try {
+    const liveIdentity = identity(pid, { platform });
+    if (!liveIdentity) return exists(pid) === false ? "gone" : "unknown";
+    if (liveIdentity !== state.processIdentity) return "replaced";
+    const liveCommandLine = commandLine(pid, { platform });
+    return liveCommandLine
+      && commandLineHasEntrypoint(liveCommandLine, state.sourceRoot)
+      ? "owned"
+      : "unknown";
+  } catch {
+    return "unknown";
+  }
+}
+
+export function taskManagerProcessOwns(state, options = {}) {
+  return taskManagerProcessEvidence(state, options) === "owned";
 }
