@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { unlinkSync } from "node:fs";
+import { lstatSync, unlinkSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -47,6 +47,26 @@ function processStatePathFor(stateDir = STATE_DIR) {
   return stateDir === STATE_DIR
     ? TASK_MANAGER_PROCESS_STATE_PATH
     : path.join(stateDir, "task-manager-process.json");
+}
+
+export function taskManagerServiceArtifactPaths(stateDir = STATE_DIR) {
+  return {
+    wrapper: wrapperPathFor(stateDir),
+    launcher: launcherPathFor(stateDir),
+  };
+}
+
+function artifactPresence(target) {
+  try {
+    const stats = lstatSync(target);
+    return stats.isFile() && !stats.isSymbolicLink()
+      ? { known: true, present: true }
+      : { known: false, present: null };
+  } catch (error) {
+    return error?.code === "ENOENT"
+      ? { known: true, present: false }
+      : { known: false, present: null };
+  }
 }
 
 function cmdEscape(value) {
@@ -456,6 +476,79 @@ export async function taskManagerServiceStatus({
     healthy,
     pid,
   };
+}
+
+export async function taskManagerServiceComponentsStatus({
+  stateDir = STATE_DIR,
+  queryTask = queryScheduledTask,
+  readArtifact = artifactPresence,
+} = {}) {
+  let task;
+  try {
+    task = await queryTask();
+  } catch {
+    task = { known: false };
+  }
+  const paths = taskManagerServiceArtifactPaths(stateDir);
+  return {
+    task: task?.known === true
+      ? { known: true, present: task.exists === true }
+      : { known: false, present: null },
+    wrapper: readArtifact(paths.wrapper),
+    launcher: readArtifact(paths.launcher),
+  };
+}
+
+function removeArtifact(target) {
+  try {
+    unlinkSync(target);
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+}
+
+export async function purgeTaskManagerCreatedServiceComponents(
+  components,
+  {
+    stateDir = STATE_DIR,
+    queryTask = queryScheduledTask,
+    endTask: end = endScheduledTask,
+    deleteTask: removeTask = deleteScheduledTask,
+    stopOwnedProcess = stopOwnedManagerProcess,
+    removeArtifact: remove = removeArtifact,
+    readArtifact = artifactPresence,
+    guardWrite = guardLauncherWrite,
+  } = {},
+) {
+  if (
+    !components
+    || typeof components.task !== "boolean"
+    || typeof components.wrapper !== "boolean"
+    || typeof components.launcher !== "boolean"
+  ) {
+    throw new Error("Created Task Manager service components must be explicit booleans.");
+  }
+  const task = await queryTask();
+  assertTaskCanonical(task, { stateDir });
+  if (!components.task && !task.exists) {
+    throw new Error("The pre-existing Task Manager task disappeared; refusing partial purge.");
+  }
+  const paths = taskManagerServiceArtifactPaths(stateDir);
+  for (const name of ["wrapper", "launcher"]) {
+    if (components[name]) continue;
+    const status = readArtifact(paths[name]);
+    if (status?.known !== true || status.present !== true) {
+      throw new Error(`The pre-existing Task Manager ${name} disappeared; refusing partial purge.`);
+    }
+  }
+  guardWrite();
+  if (task.exists) await end();
+  await stopOwnedProcess();
+  if (components.task && task.exists) await removeTask();
+
+  if (components.wrapper) remove(paths.wrapper);
+  if (components.launcher) remove(paths.launcher);
+  return { purged: { ...components } };
 }
 
 export async function runTaskManagerWindowsCommand(

@@ -136,8 +136,16 @@ test("the Windows service preserves an explicit credential-free native proxy", (
 test("the Windows service persists standalone Task Manager mode only while its private marker is enabled", () => {
   const testRoot = mkdtempSync(path.join(os.tmpdir(), "codex-router-manager-service-mode-"));
   try {
-    const disabled = render("service-windows.mjs", "win32", testRoot);
-    assert.doesNotMatch(disabled, /CODEX_ROUTER_TASK_MANAGER_STANDALONE/);
+    const disabled = serviceCommand(
+      "service-windows.mjs",
+      "win32",
+      testRoot,
+      "render",
+      "codex",
+      root,
+      { CODEX_ROUTER_TASK_MANAGER_STANDALONE: "1" },
+    );
+    assert.match(disabled, /set "CODEX_ROUTER_TASK_MANAGER_STANDALONE=0"/);
 
     const stateDir = windowsStateDir(testRoot);
     mkdirSync(stateDir, { recursive: true });

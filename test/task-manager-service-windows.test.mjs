@@ -6,10 +6,12 @@ import { spawnSync } from "node:child_process";
 import test from "node:test";
 
 import {
+  purgeTaskManagerCreatedServiceComponents,
   queryScheduledTask,
   runTaskManagerWindowsCommand,
   stopOwnedManagerProcess,
   taskManagerServiceStatus,
+  taskAction,
 } from "../src/task-manager-service-windows.mjs";
 
 const root = path.resolve(".");
@@ -220,6 +222,34 @@ test("status requires canonical task, owned process, and exact health identity",
   });
   assert.equal(wrongIdentity.healthy, false);
   assert.equal(wrongIdentity.pid, 42);
+});
+
+test("component purge stops exact ownership and removes only created service artifacts", async () => {
+  const calls = [];
+  await purgeTaskManagerCreatedServiceComponents(
+    { task: false, wrapper: false, launcher: true },
+    {
+      stateDir: "C:/state",
+      queryTask: async () => ({
+        known: true,
+        exists: true,
+        state: "running",
+        actionCount: 1,
+        action: taskAction({ stateDir: "C:/state" }),
+      }),
+      endTask: async () => calls.push("end"),
+      stopOwnedProcess: async () => calls.push("stop-owned"),
+      deleteTask: async () => calls.push("delete-task"),
+      removeArtifact: (target) => calls.push(path.basename(target)),
+      readArtifact: () => ({ known: true, present: true }),
+      guardWrite: () => {},
+    },
+  );
+  assert.deepEqual(calls, [
+    "end",
+    "stop-owned",
+    "start-codex-router-task-manager-hidden.vbs",
+  ]);
 });
 
 test("the platform dispatcher reports unsupported status without mutating non-Windows hosts", () => {

@@ -13,12 +13,18 @@ import test from "node:test";
 
 import {
   discardWindowsTaskSnapshot,
+  MAX_WINDOWS_TASK_SNAPSHOT_BYTES,
   restoreWindowsTask,
+  runSchtasksCommand,
   snapshotWindowsTask,
 } from "../src/windows-task-snapshot.mjs";
 
 const TASK_NAME = "Codex Router";
-const XML = "<?xml version=\"1.0\" encoding=\"UTF-16\"?><Task>exact</Task>\r\n";
+const XML = "<?xml version=\"1.0\" encoding=\"UTF-16\"?><Task><Command>C:\\用户\\启动器.vbs</Command></Task>\r\n";
+const XML_BYTES = Buffer.concat([
+  Buffer.from([0xff, 0xfe]),
+  Buffer.from(XML, "utf16le"),
+]);
 const SDDL = "D:P(A;;FA;;;SY)(A;;FA;;;OW)";
 const FILE_SDDL = "D:P(A;;FA;;;OW)";
 
@@ -32,8 +38,11 @@ function windowsRunners({
   let metadataReads = 0;
   const runSchtasks = (args) => {
     calls.push({ kind: "schtasks", args: [...args] });
-    if (args[0] === "/Query") return XML;
-    return "";
+    if (args[0] === "/Query") return Buffer.from(XML_BYTES);
+    if (args[0] === "/Create") {
+      calls.push({ kind: "created-xml", bytes: readFileSync(args[4]) });
+    }
+    return Buffer.alloc(0);
   };
   const runPowerShell = (_script, options = {}) => {
     const env = options.env || {};
@@ -57,7 +66,7 @@ function windowsRunners({
       });
       return "";
     }
-    calls.push({ kind: "task-metadata", taskName: env.CODEX_ROUTER_TASK });
+    calls.push({ kind: "task-metadata", taskName: env.CODEX_ROUTER_TASK, script: _script });
     if (metadataReads > 0 && currentError) throw currentError;
     const taskExists = metadataReads === 0 ? exists : currentExists;
     metadataReads += 1;
@@ -95,7 +104,7 @@ test("snapshot and restore preserve exact task definition, security, running sta
     assert.equal(snapshot.version, 1);
     assert.equal(snapshot.taskName, TASK_NAME);
     assert.equal(snapshot.exists, true);
-    assert.equal(snapshot.xml, XML);
+    assert.deepEqual(snapshot.xml, XML_BYTES);
     assert.equal(snapshot.sddl, SDDL);
     assert.equal(snapshot.running, true);
     assert.deepEqual(snapshot.files.map(({ path: target, existed }) => ({ path: target, existed })), [
@@ -123,6 +132,10 @@ test("snapshot and restore preserve exact task definition, security, running sta
       && args[2] === TASK_NAME
       && args.includes("/XML")
       && args.at(-1) === "/F"));
+    assert.deepEqual(
+      runners.calls.find(({ kind }) => kind === "created-xml")?.bytes,
+      XML_BYTES,
+    );
     assert.deepEqual(
       runners.calls.find(({ kind }) => kind === "restore-task-sddl"),
       { kind: "restore-task-sddl", taskName: TASK_NAME, sddl: SDDL },
@@ -184,6 +197,55 @@ test("an unreadable Scheduler state is never downgraded to missing", async () =>
         runSchtasks: () => { throw new Error("must not run"); },
       }),
       /access denied/,
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Scheduler enumeration includes hidden root tasks", async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "codex-router-hidden-task-snapshot-"));
+  const runners = windowsRunners({ exists: false, currentExists: false });
+  try {
+    await snapshotWindowsTask({
+      taskName: TASK_NAME,
+      files: [],
+      stateDir: path.join(root, "state"),
+      platform: "win32",
+      ...runners,
+    });
+    const query = runners.calls.find(({ kind }) => kind === "task-metadata");
+    assert.match(query.script, /GetTasks\(1\)/);
+    assert.doesNotMatch(query.script, /GetTasks\(0\)/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("the real schtasks runner boundary returns UTF-16 XML bytes without decoding", () => {
+  const encoded = XML_BYTES.toString("base64");
+  const output = runSchtasksCommand(
+    ["-e", `process.stdout.write(Buffer.from(${JSON.stringify(encoded)}, "base64"))`],
+    { executable: process.execPath },
+  );
+  assert.ok(Buffer.isBuffer(output));
+  assert.deepEqual(output, XML_BYTES);
+  assert.equal(output.subarray(0, 2).toString("hex"), "fffe");
+});
+
+test("snapshot creation and restoration share one maximum byte boundary", async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "codex-router-large-task-snapshot-"));
+  try {
+    await assert.rejects(
+      snapshotWindowsTask({
+        taskName: TASK_NAME,
+        files: [],
+        stateDir: path.join(root, "state"),
+        platform: "win32",
+        runPowerShell: () => JSON.stringify({ exists: true, running: false, sddl: SDDL }),
+        runSchtasks: () => Buffer.alloc(MAX_WINDOWS_TASK_SNAPSHOT_BYTES + 1),
+      }),
+      /too large|maximum/i,
     );
   } finally {
     rmSync(root, { recursive: true, force: true });

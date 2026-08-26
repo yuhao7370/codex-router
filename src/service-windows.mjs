@@ -93,9 +93,8 @@ function wrapper() {
       process.env.CODEX_ROUTER_NATIVE_RETRY_BACKOFF_MS || "100",
     CODEX_ROUTER_NATIVE_RETRY_BUDGET_MS:
       process.env.CODEX_ROUTER_NATIVE_RETRY_BUDGET_MS || "60000",
-    ...(taskManagerStandaloneEnabled()
-      ? { CODEX_ROUTER_TASK_MANAGER_STANDALONE: "1" }
-      : {}),
+    CODEX_ROUTER_TASK_MANAGER_STANDALONE:
+      taskManagerStandaloneEnabled() ? "1" : "0",
     ...serviceProxyEnvironment(),
     ...antigravityClientSecretEnvironment(),
     // The LiteLLM gateway is a Python process. Force UTF-8 output so its

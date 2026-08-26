@@ -16,6 +16,7 @@ process.env.MODEL_ROUTER_STATE_DIR = stateDir;
 const {
   setTaskManagerStandaloneEnabled,
   taskManagerStandaloneEnabled,
+  taskManagerStandaloneState,
 } = await import("../src/task-manager-standalone-state.mjs");
 const { privateFileIsProtected } = await import("../src/file-security.mjs");
 
@@ -49,5 +50,10 @@ test("missing, malformed, and unrecognized standalone markers read disabled", ()
   ]) {
     writeFileSync(markerPath, contents, "utf8");
     assert.equal(taskManagerStandaloneEnabled(), false);
+    assert.deepEqual(taskManagerStandaloneState(), {
+      known: false,
+      exists: true,
+      enabled: false,
+    });
   }
 });

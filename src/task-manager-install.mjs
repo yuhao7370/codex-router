@@ -1,10 +1,11 @@
 import { spawnSync } from "node:child_process";
-import { existsSync } from "node:fs";
-import net from "node:net";
+import { lstatSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { assertCallerSecret, callerBaseUrl } from "./caller-auth.mjs";
 import {
+  CALLER_SECRET_PATH,
   PORTS,
   SOURCE_ROOT,
   STATE_DIR,
@@ -12,13 +13,25 @@ import {
   TASK_MANAGER_TASK_NAME,
   loopback,
 } from "./paths.mjs";
-import { waitForRouterHealth as pollRouterHealth } from "./router-health.mjs";
+import { processCommandLine } from "./process-identity.mjs";
 import { withServiceOperationLock } from "./service-operation-lock.mjs";
 import {
   setTaskManagerStandaloneEnabled,
   taskManagerStandaloneEnabled,
+  taskManagerStandaloneState,
 } from "./task-manager-standalone-state.mjs";
-import { taskManagerServiceStatus } from "./task-manager-service-windows.mjs";
+import {
+  purgeTaskManagerCreatedServiceComponents,
+  queryScheduledTask,
+  stopOwnedManagerProcess,
+  taskActionIsCanonical,
+  taskManagerServiceComponentsStatus,
+  taskManagerServiceStatus,
+} from "./task-manager-service-windows.mjs";
+import {
+  readTaskManagerProcessState,
+  taskManagerProcessOwns,
+} from "./task-manager-process.mjs";
 import {
   installTaskManagerShortcut,
   taskManagerShortcutPath,
@@ -30,7 +43,7 @@ import {
   snapshotWindowsTask,
 } from "./windows-task-snapshot.mjs";
 
-const COMMANDS = new Set(["install", "uninstall", "purge", "status"]);
+const COMMANDS = new Set(["install", "uninstall", "purge", "purge-created", "status"]);
 const RECOGNIZED_PORT_OWNERS = new Set(["absent", "embedded", "standalone"]);
 const ROUTER_TASK_NAME = "Codex Router";
 const PROBE_TIMEOUT_MS = 3_000;
@@ -38,6 +51,14 @@ const HEALTH_TIMEOUT_MS = 300_000;
 const MANAGER_HEALTH_TIMEOUT_MS = 30_000;
 const POLL_MS = 250;
 const MAX_HTTP_BODY_BYTES = 64 * 1024;
+const PORT_OWNER_TIMEOUT_MS = 5_000;
+const CREATED_COMPONENT_KEYS = Object.freeze([
+  "task",
+  "wrapper",
+  "launcher",
+  "shortcut",
+  "marker",
+]);
 
 function routerFiles() {
   return [
@@ -88,25 +109,52 @@ function sleep(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
-function tcpListenerState({
+export function windowsTaskManagerPortOwner({
   port = TASK_MANAGER_CONTROL_PORT,
-  timeoutMs = PROBE_TIMEOUT_MS,
+  platform = process.platform,
+  spawn = spawnSync,
+  timeoutMs = PORT_OWNER_TIMEOUT_MS,
 } = {}) {
-  return new Promise((resolve) => {
-    const socket = net.createConnection({ host: "127.0.0.1", port });
-    let settled = false;
-    const finish = (state) => {
-      if (settled) return;
-      settled = true;
-      socket.destroy();
-      resolve(state);
-    };
-    socket.setTimeout(timeoutMs, () => finish("unknown"));
-    socket.once("connect", () => finish("listening"));
-    socket.once("error", (error) => {
-      finish(error?.code === "ECONNREFUSED" ? "absent" : "unknown");
-    });
-  });
+  if (platform !== "win32") return { known: false, pid: null };
+  const script = [
+    "$ErrorActionPreference = 'Stop'",
+    "$Utf8 = [Text.UTF8Encoding]::new($false)",
+    "[Console]::InputEncoding = $Utf8",
+    "[Console]::OutputEncoding = [Text.Encoding]::UTF8",
+    "$OutputEncoding = $Utf8",
+    "$port = [int]$env:CODEX_ROUTER_CONTROL_PORT",
+    "$listeners = @(Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction Stop | Where-Object { $_.LocalAddress -eq '127.0.0.1' })",
+    "$owners = @($listeners | Select-Object -ExpandProperty OwningProcess -Unique)",
+    "if ($owners.Count -eq 0) { [Console]::Out.Write('{\"known\":true,\"pid\":null}'); exit 0 }",
+    "if ($owners.Count -ne 1 -or [int]$owners[0] -lt 1) { throw 'Port owner is ambiguous.' }",
+    "[Console]::Out.Write(([ordered]@{ known = $true; pid = [int]$owners[0] } | ConvertTo-Json -Compress))",
+  ].join("\n");
+  for (const executable of ["powershell.exe", "pwsh.exe"]) {
+    const result = spawn(
+      executable,
+      ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+      {
+        encoding: "utf8",
+        timeout: timeoutMs,
+        maxBuffer: MAX_HTTP_BODY_BYTES,
+        windowsHide: true,
+        env: { ...process.env, CODEX_ROUTER_CONTROL_PORT: String(port) },
+        stdio: ["ignore", "pipe", "pipe"],
+      },
+    );
+    if (result?.status !== 0) continue;
+    try {
+      const parsed = JSON.parse(String(result.stdout));
+      if (parsed?.known !== true) continue;
+      if (parsed.pid === null) return { known: true, pid: null };
+      if (Number.isSafeInteger(parsed.pid) && parsed.pid > 0) {
+        return { known: true, pid: parsed.pid };
+      }
+    } catch {
+      // Try the other PowerShell host; malformed output is unknown, not absent.
+    }
+  }
+  return { known: false, pid: null };
 }
 
 async function boundedJson(response, maxBytes = MAX_HTTP_BODY_BYTES) {
@@ -143,31 +191,63 @@ async function fetchHealth(url, fetchImpl = globalThis.fetch) {
   }
 }
 
-async function inspectPortOwner({
-  listenerState = tcpListenerState,
+export async function readProtectedTaskManagerRouterHealth({
   fetchImpl = globalThis.fetch,
-  readManagerStatus = taskManagerServiceStatus,
+  readCallerSecret = () => readFileSync(CALLER_SECRET_PATH, "utf8"),
 } = {}) {
-  const listener = await listenerState();
-  if (listener !== "listening") return listener;
+  try {
+    const secret = assertCallerSecret(readCallerSecret().trim());
+    return fetchHealth(`${callerBaseUrl(PORTS.router, secret)}/health`, fetchImpl);
+  } catch {
+    return undefined;
+  }
+}
+
+function normalized(value) {
+  return String(value || "").replaceAll("\\", "/").toLowerCase();
+}
+
+function commandLineHasExactEntrypoint(commandLine, entrypoint) {
+  const expected = normalized(path.resolve(entrypoint));
+  const tokens = String(commandLine || "").match(/"[^"]*"|'[^']*'|[^\s]+/g) || [];
+  return tokens.some((token) => {
+    const unquoted = token.length > 1 && (
+      (token.startsWith('"') && token.endsWith('"'))
+      || (token.startsWith("'") && token.endsWith("'"))
+    ) ? token.slice(1, -1) : token;
+    return normalized(unquoted) === expected;
+  });
+}
+
+export async function classifyTaskManagerPortOwner({
+  readPortOwner = windowsTaskManagerPortOwner,
+  readManagerHealth = () => fetchHealth(loopback(TASK_MANAGER_CONTROL_PORT, "/health")),
+  readRouterHealth = readProtectedTaskManagerRouterHealth,
+  readProcessCommandLine = (pid) => processCommandLine(pid, { platform: "win32" }),
+  readManagerProcessState = readTaskManagerProcessState,
+  managerProcessOwns = taskManagerProcessOwns,
+  sourceRoot = SOURCE_ROOT,
+  stateDir = STATE_DIR,
+} = {}) {
+  const owner = await readPortOwner();
+  if (owner?.known !== true) return "unknown";
+  if (owner.pid === null) return "absent";
+  if (!Number.isSafeInteger(owner.pid) || owner.pid < 1) return "unknown";
 
   const [managerHealth, routerHealth] = await Promise.all([
-    fetchHealth(loopback(TASK_MANAGER_CONTROL_PORT, "/health"), fetchImpl),
-    fetchHealth(loopback(PORTS.router, "/health"), fetchImpl),
+    readManagerHealth(),
+    readRouterHealth(),
   ]);
   if (
     managerHealth?.ok === true
     && managerHealth.service === "codex-router-task-manager"
     && managerHealth.mode === "standalone"
-    && Number.isSafeInteger(managerHealth.pid)
-    && managerHealth.pid > 0
+    && managerHealth.pid === owner.pid
   ) {
-    const status = await readManagerStatus();
+    const state = readManagerProcessState();
     if (
-      status?.installed === true
-      && status.canonical === true
-      && status.healthy === true
-      && status.pid === managerHealth.pid
+      state?.pid === owner.pid
+      && managerProcessOwns(state, { platform: "win32", sourceRoot, stateDir })
     ) {
       return "standalone";
     }
@@ -176,6 +256,10 @@ async function inspectPortOwner({
   if (
     routerHealth?.service === "codex-router"
     && routerHealth.taskManagerMode === "embedded"
+    && commandLineHasExactEntrypoint(
+      readProcessCommandLine(owner.pid),
+      path.join(sourceRoot, "src", "router.mjs"),
+    )
   ) {
     return "embedded";
   }
@@ -204,15 +288,33 @@ async function waitForManagerHealth({
   throw new Error(`The standalone Task Manager did not become healthy (${last?.state || "unknown"}).`);
 }
 
-async function waitForEmbeddedTaskManager({
-  inspect = inspectPortOwner,
+export async function embeddedTaskManagerPageContract(fetchImpl = globalThis.fetch) {
+  try {
+    const origin = loopback(TASK_MANAGER_CONTROL_PORT);
+    const [health, root] = await Promise.all([
+      fetchImpl(`${origin}/health`, { signal: AbortSignal.timeout(PROBE_TIMEOUT_MS) }),
+      fetchImpl(`${origin}/`, { signal: AbortSignal.timeout(PROBE_TIMEOUT_MS) }),
+    ]);
+    return health.status === 404
+      && root.ok
+      && String(root.headers.get("content-type") || "").toLowerCase().startsWith("text/html");
+  } catch {
+    return false;
+  }
+}
+
+export async function verifyEmbeddedTaskManager({
+  classifyOwner = classifyTaskManagerPortOwner,
+  readPageContract = embeddedTaskManagerPageContract,
   timeoutMs = MANAGER_HEALTH_TIMEOUT_MS,
 } = {}) {
   const deadline = Date.now() + timeoutMs;
   let last = "unknown";
   do {
-    last = await inspect();
-    if (last === "embedded") return { ok: true, mode: "embedded" };
+    last = await classifyOwner();
+    if (last === "embedded" && await readPageContract()) {
+      return { ok: true, mode: "embedded" };
+    }
     const remaining = deadline - Date.now();
     if (remaining <= 0) break;
     await sleep(Math.min(POLL_MS, remaining));
@@ -220,40 +322,124 @@ async function waitForEmbeddedTaskManager({
   throw new Error(`The embedded Task Manager did not reclaim port ${TASK_MANAGER_CONTROL_PORT} (${last}).`);
 }
 
-async function waitForExpectedRouterHealth() {
-  const health = await pollRouterHealth({ timeoutMs: HEALTH_TIMEOUT_MS });
-  if (!health?.ok) throw new Error(health?.error || "The Router did not become healthy.");
-  const expectedMode = taskManagerStandaloneEnabled() ? "standalone" : "embedded";
-  if (health.payload?.taskManagerMode !== expectedMode) {
-    throw new Error(
-      `Router health reported Task Manager mode ${health.payload?.taskManagerMode || "unknown"}; expected ${expectedMode}.`,
-    );
-  }
-  return health;
+async function waitForExpectedRouterHealth({
+  readHealth = readProtectedTaskManagerRouterHealth,
+  expectedMode = taskManagerStandaloneEnabled() ? "standalone" : "embedded",
+  timeoutMs = HEALTH_TIMEOUT_MS,
+} = {}) {
+  const deadline = Date.now() + timeoutMs;
+  let health;
+  do {
+    health = await readHealth();
+    if (
+      health?.ok === true
+      && health.service === "codex-router"
+      && health.taskManagerMode === expectedMode
+    ) return health;
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
+    await sleep(Math.min(POLL_MS, remaining));
+  } while (Date.now() <= deadline);
+  throw new Error(
+    `The protected Router health did not report Task Manager mode ${expectedMode} (${health?.taskManagerMode || "unknown"}).`,
+  );
 }
 
-function defaultStatus() {
-  const platform = process.env.CODEX_ROUTER_SERVICE_PLATFORM || process.platform;
+function pathPresence(target) {
+  try {
+    const stats = lstatSync(target);
+    return stats.isFile() && !stats.isSymbolicLink()
+      ? { known: true, present: true }
+      : { known: false, present: null };
+  } catch (error) {
+    return error?.code === "ENOENT"
+      ? { known: true, present: false }
+      : { known: false, present: null };
+  }
+}
+
+export async function taskManagerInstallStatus({
+  platform = process.env.CODEX_ROUTER_SERVICE_PLATFORM || process.platform,
+  readManagerStatus = taskManagerServiceStatus,
+  readServiceComponents = taskManagerServiceComponentsStatus,
+  readMarkerState = taskManagerStandaloneState,
+  resolveShortcutPath = taskManagerShortcutPath,
+  readPath = pathPresence,
+} = {}) {
   if (platform !== "win32") {
     return {
       supported: false,
       standalone: false,
       manager: { installed: false, loaded: false, state: "unsupported" },
       shortcut: { installed: false },
+      components: Object.fromEntries(
+        CREATED_COMPONENT_KEYS.map((key) => [key, { known: false, present: null }]),
+      ),
     };
   }
-  const shortcutPath = taskManagerShortcutPath();
-  return Promise.resolve(taskManagerServiceStatus()).then((manager) => ({
+  const shortcutPath = resolveShortcutPath();
+  const [manager, serviceComponents] = await Promise.all([
+    readManagerStatus(),
+    readServiceComponents(),
+  ]);
+  const marker = readMarkerState();
+  const shortcut = readPath(shortcutPath);
+  return {
     supported: true,
-    standalone: taskManagerStandaloneEnabled(),
+    standalone: marker.enabled,
     manager,
-    shortcut: { installed: existsSync(shortcutPath), path: shortcutPath },
-  }));
+    shortcut: { installed: shortcut.present, path: shortcutPath },
+    components: {
+      ...serviceComponents,
+      shortcut,
+      marker: { known: marker.known, present: marker.exists },
+    },
+  };
+}
+
+export async function assertManagerTaskReplaceable({
+  queryTask = queryScheduledTask,
+  stateDir = STATE_DIR,
+} = {}) {
+  const task = await queryTask();
+  if (task?.known !== true) {
+    throw new Error(
+      `Task Scheduler could not identify "${TASK_MANAGER_TASK_NAME}"; refusing to stop Router.`,
+    );
+  }
+  if (task.exists && !taskActionIsCanonical(task, { stateDir })) {
+    throw new Error(
+      `Refusing to replace the noncanonical Scheduled Task "${TASK_MANAGER_TASK_NAME}" before stopping Router.`,
+    );
+  }
+  return task;
+}
+
+export function parseCreatedTaskManagerComponents(value) {
+  if (!value) return undefined;
+  let parsed;
+  try {
+    parsed = typeof value === "string" ? JSON.parse(value) : value;
+  } catch (error) {
+    throw new Error("Created Task Manager component state is malformed.", { cause: error });
+  }
+  if (
+    parsed?.version !== 1
+    || Object.keys(parsed).length !== CREATED_COMPONENT_KEYS.length + 1
+    || CREATED_COMPONENT_KEYS.some((key) => typeof parsed[key] !== "boolean")
+  ) {
+    throw new Error("Created Task Manager component state must be version 1 with exact boolean fields.");
+  }
+  return Object.freeze({
+    version: 1,
+    ...Object.fromEntries(CREATED_COMPONENT_KEYS.map((key) => [key, parsed[key]])),
+  });
 }
 
 function defaultDependencies() {
   return {
-    checkPortOwner: inspectPortOwner,
+    checkPortOwner: classifyTaskManagerPortOwner,
+    preflightManagerTask: assertManagerTaskReplaceable,
     standaloneEnabled: taskManagerStandaloneEnabled,
     setStandaloneEnabled: setTaskManagerStandaloneEnabled,
     snapshotRouterTaskAndLaunchers: () => snapshotWindowsTask({
@@ -266,30 +452,46 @@ function defaultDependencies() {
     }),
     stopRouterService: () => runNodeCommand("service.mjs", "stop"),
     installManagerService: () => runNodeCommand("task-manager-service.mjs", "install"),
+    startManagerService: () => runNodeCommand("task-manager-service.mjs", "start"),
     uninstallManagerService: () => runNodeCommand("task-manager-service.mjs", "uninstall"),
+    purgeManagerServiceComponents: purgeTaskManagerCreatedServiceComponents,
     waitForManagerHealth,
     installShortcut: () => installTaskManagerShortcut(),
     uninstallShortcut: () => uninstallTaskManagerShortcut(),
     installRouterService: () => runNodeCommand("service.mjs", "install"),
     waitForRouterHealth: waitForExpectedRouterHealth,
-    waitForEmbeddedTaskManager,
+    waitForEmbeddedTaskManager: verifyEmbeddedTaskManager,
     discardSnapshot: discardWindowsTaskSnapshot,
     restoreManagerTaskLaunchersAndShortcut: async (snapshot) => {
-      // Task Scheduler can report an ended task while its node descendant still
-      // owns port 4111. Reuse the exact process-state stop before replacing the
-      // launchers; the snapshot module then restores the byte-exact task.
-      runNodeCommand("task-manager-service.mjs", "stop");
-      return restoreWindowsTask(snapshot);
+      // Trusted rollback cannot depend on the low-level install gate: that gate
+      // rejects a noncanonical current task before the exact snapshot can put
+      // the previous definition back. Stop only the exact recorded process;
+      // restoreWindowsTask derives every task target from its trusted handle.
+      const errors = [];
+      try { stopOwnedManagerProcess(); } catch (error) { errors.push(asError(error)); }
+      try { await restoreWindowsTask(snapshot); } catch (error) { errors.push(asError(error)); }
+      if (errors.length) {
+        throw new AggregateError(errors, "Manager stop/restore could not be completed fully.");
+      }
+      return snapshot;
     },
     restoreRouterTaskAndLaunchers: async (snapshot) => {
       // The Router low-level stop also drains its verified process tree, which
       // prevents a running wscript/cmd launcher from locking the files being
       // restored and prevents the old listener racing the restored task.
-      runNodeCommand("service.mjs", "stop");
-      return restoreWindowsTask(snapshot);
+      const errors = [];
+      try { runNodeCommand("service.mjs", "stop"); } catch (error) { errors.push(asError(error)); }
+      try { await restoreWindowsTask(snapshot); } catch (error) { errors.push(asError(error)); }
+      if (errors.length) {
+        throw new AggregateError(errors, "Router stop/restore could not be completed fully.");
+      }
+      return snapshot;
     },
     startRestoredRouterTask: () => runNodeCommand("service.mjs", "start"),
-    readStatus: defaultStatus,
+    readStatus: taskManagerInstallStatus,
+    createdComponents: () => parseCreatedTaskManagerComponents(
+      process.env.CODEX_ROUTER_TASK_MANAGER_CREATED_COMPONENTS,
+    ),
   };
 }
 
@@ -297,12 +499,21 @@ function asError(value) {
   return value instanceof Error ? value : new Error(String(value));
 }
 
-function rollbackFailure(operationError, rollbackError) {
+function rollbackFailure(operationError, rollbackErrors) {
   return new AggregateError(
-    [asError(operationError), asError(rollbackError)],
+    [asError(operationError), ...rollbackErrors.map(asError)],
     "Task Manager installation failed and its previous Router state could not be fully restored.",
     { cause: asError(operationError) },
   );
+}
+
+function recoveryError(label, error) {
+  return new Error(`${label}: ${asError(error).message}`, { cause: asError(error) });
+}
+
+function recoveryErrors(label, error) {
+  const errors = error instanceof AggregateError ? error.errors : [error];
+  return errors.map((item) => recoveryError(label, item));
 }
 
 async function assertRecognizedPortOwner(deps) {
@@ -315,24 +526,70 @@ async function assertRecognizedPortOwner(deps) {
   return owner;
 }
 
-async function rollbackInstall(deps, previousStandalone, routerSnapshot, managerSnapshot) {
-  deps.setStandaloneEnabled(previousStandalone);
-  await deps.restoreManagerTaskLaunchersAndShortcut(managerSnapshot);
-  await deps.restoreRouterTaskAndLaunchers(routerSnapshot);
-  await deps.startRestoredRouterTask();
-  await deps.waitForRouterHealth();
+async function discardSnapshots(deps, routerSnapshot, managerSnapshot) {
+  const errors = [];
+  // Manager first keeps the Router snapshot -- the artifact needed to recover
+  // availability -- until the final cleanup attempt. Each attempt is
+  // independent, so a failed manager discard cannot leak both snapshots.
+  for (const [label, snapshot] of [
+    ["manager snapshot cleanup failed", managerSnapshot],
+    ["Router snapshot cleanup failed", routerSnapshot],
+  ]) {
+    if (!snapshot) continue;
+    try {
+      await deps.discardSnapshot(snapshot);
+    } catch (error) {
+      errors.push(recoveryError(label, error));
+    }
+  }
+  return errors;
 }
 
-async function commitSnapshots(deps, routerSnapshot, managerSnapshot) {
-  await deps.discardSnapshot(routerSnapshot);
-  await deps.discardSnapshot(managerSnapshot);
+async function captureSnapshots(deps) {
+  const routerSnapshot = await deps.snapshotRouterTaskAndLaunchers();
+  try {
+    const managerSnapshot = await deps.snapshotManagerTaskLaunchersAndShortcut();
+    return { routerSnapshot, managerSnapshot };
+  } catch (operationError) {
+    let cleanupError;
+    try {
+      await deps.discardSnapshot(routerSnapshot);
+    } catch (error) {
+      cleanupError = recoveryError("partial Router snapshot cleanup failed", error);
+    }
+    if (cleanupError) throw rollbackFailure(operationError, [cleanupError]);
+    throw operationError;
+  }
+}
+
+async function rollbackInstall(deps, previousStandalone, routerSnapshot, managerSnapshot) {
+  const errors = [];
+  const attempt = async (label, operation) => {
+    try {
+      await operation();
+    } catch (error) {
+      errors.push(...recoveryErrors(label, error));
+    }
+  };
+  await attempt("standalone marker restore failed", () =>
+    deps.setStandaloneEnabled(previousStandalone));
+  await attempt("manager task/launcher/shortcut restore failed", () =>
+    deps.restoreManagerTaskLaunchersAndShortcut(managerSnapshot));
+  // These three are deliberately unconditional. Router recovery is the
+  // non-skippable outcome even when marker or manager restoration failed.
+  await attempt("Router task/launcher restore failed", () =>
+    deps.restoreRouterTaskAndLaunchers(routerSnapshot));
+  await attempt("restored Router start failed", () => deps.startRestoredRouterTask());
+  await attempt("restored Router health failed", () => deps.waitForRouterHealth());
+  if (errors.length) return errors;
+  return discardSnapshots(deps, routerSnapshot, managerSnapshot);
 }
 
 async function install(deps) {
   await assertRecognizedPortOwner(deps);
+  await deps.preflightManagerTask();
   const previousStandalone = deps.standaloneEnabled();
-  const routerSnapshot = await deps.snapshotRouterTaskAndLaunchers();
-  const managerSnapshot = await deps.snapshotManagerTaskLaunchersAndShortcut();
+  const { routerSnapshot, managerSnapshot } = await captureSnapshots(deps);
   try {
     await deps.stopRouterService();
     await deps.installManagerService();
@@ -341,23 +598,29 @@ async function install(deps) {
     deps.setStandaloneEnabled(true);
     await deps.installRouterService();
     await deps.waitForRouterHealth();
-    await commitSnapshots(deps, routerSnapshot, managerSnapshot);
-    return { command: "install", standalone: true };
   } catch (operationError) {
-    try {
-      await rollbackInstall(deps, previousStandalone, routerSnapshot, managerSnapshot);
-    } catch (rollbackError) {
-      throw rollbackFailure(operationError, rollbackError);
-    }
+    const rollbackErrors = await rollbackInstall(
+      deps, previousStandalone, routerSnapshot, managerSnapshot,
+    );
+    if (rollbackErrors.length) throw rollbackFailure(operationError, rollbackErrors);
     throw operationError;
   }
+  // Health is the commit point. Cleanup failure is reported but can never
+  // consume a partially discarded snapshot by rolling back a healthy live
+  // generation.
+  const cleanupErrors = await discardSnapshots(deps, routerSnapshot, managerSnapshot);
+  return {
+    command: "install",
+    standalone: true,
+    cleanupErrors: cleanupErrors.map(({ message }) => message),
+  };
 }
 
 async function uninstall(deps) {
   await assertRecognizedPortOwner(deps);
+  await deps.preflightManagerTask();
   const previousStandalone = deps.standaloneEnabled();
-  const routerSnapshot = await deps.snapshotRouterTaskAndLaunchers();
-  const managerSnapshot = await deps.snapshotManagerTaskLaunchersAndShortcut();
+  const { routerSnapshot, managerSnapshot } = await captureSnapshots(deps);
   try {
     await deps.uninstallManagerService();
     await deps.uninstallShortcut();
@@ -365,20 +628,48 @@ async function uninstall(deps) {
     await deps.installRouterService();
     await deps.waitForEmbeddedTaskManager();
     await deps.waitForRouterHealth();
-    await commitSnapshots(deps, routerSnapshot, managerSnapshot);
-    return { command: "uninstall", standalone: false };
   } catch (operationError) {
-    try {
-      await rollbackInstall(deps, previousStandalone, routerSnapshot, managerSnapshot);
-    } catch (rollbackError) {
-      throw rollbackFailure(operationError, rollbackError);
-    }
+    const rollbackErrors = await rollbackInstall(
+      deps, previousStandalone, routerSnapshot, managerSnapshot,
+    );
+    if (rollbackErrors.length) throw rollbackFailure(operationError, rollbackErrors);
     throw operationError;
   }
+  const cleanupErrors = await discardSnapshots(deps, routerSnapshot, managerSnapshot);
+  return {
+    command: "uninstall",
+    standalone: false,
+    cleanupErrors: cleanupErrors.map(({ message }) => message),
+  };
 }
 
-async function purge(deps) {
+async function purge(deps, { createdOnly = false } = {}) {
   await assertRecognizedPortOwner(deps);
+  if (createdOnly) {
+    const created = typeof deps.createdComponents === "function"
+      ? deps.createdComponents()
+      : deps.createdComponents;
+    if (!created) {
+      throw new Error("purge-created requires the fixed created-component environment contract.");
+    }
+    const components = parseCreatedTaskManagerComponents(created);
+    await deps.purgeManagerServiceComponents({
+      task: components.task,
+      wrapper: components.wrapper,
+      launcher: components.launcher,
+    });
+    if (components.shortcut) await deps.uninstallShortcut();
+    if (components.marker) deps.setStandaloneEnabled(false);
+    if (
+      !components.marker
+      && !components.task
+      && !components.wrapper
+      && !components.launcher
+    ) {
+      await deps.startManagerService();
+    }
+    return { command: "purge", standalone: deps.standaloneEnabled?.() === true };
+  }
   await deps.uninstallManagerService();
   await deps.uninstallShortcut();
   deps.setStandaloneEnabled(false);
@@ -393,7 +684,7 @@ export async function runTaskManagerInstall(command, dependencies) {
   if (command === "status") return deps.readStatus();
   if (command === "install") return install(deps);
   if (command === "uninstall") return uninstall(deps);
-  return purge(deps);
+  return purge(deps, { createdOnly: command === "purge-created" });
 }
 
 function isMain() {
@@ -419,6 +710,17 @@ async function main() {
     : await withServiceOperationLock(run, {
         lockName: "task-manager-install-transaction",
       });
+  if (
+    command === "status"
+    && process.env.CODEX_ROUTER_TASK_MANAGER_REQUIRE_EMBEDDED === "1"
+  ) {
+    await verifyEmbeddedTaskManager();
+    await waitForExpectedRouterHealth({ expectedMode: "embedded" });
+    result.embeddedVerified = true;
+  }
+  for (const warning of result?.cleanupErrors || []) {
+    process.stderr.write(`Warning: ${warning}\n`);
+  }
   process.stdout.write(`${JSON.stringify(result)}\n`);
   return 0;
 }

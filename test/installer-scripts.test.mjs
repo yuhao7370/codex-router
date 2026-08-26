@@ -646,7 +646,7 @@ test("installer rollback undoes only what the run created", () => {
   );
   assert.match(windows, /\$ConfigWasEnabled\s*=/);
   assert.match(windows, /\$ServiceWasInstalled\s*=/);
-  assert.match(windows, /\$TaskManagerWasInstalled\s*=/);
+  assert.match(windows, /\$TaskManagerBaseline\s*=/);
 
   // ...and both teardowns must be gated on it.
   assert.match(
@@ -655,7 +655,7 @@ test("installer rollback undoes only what the run created", () => {
   );
   assert.match(posix, /\[ "\$config_was_enabled" != true \]/);
   assert.match(windows, /\$ServiceInstalled -and -not \$ServiceWasInstalled/);
-  assert.match(windows, /\$TaskManagerInstalled -and -not \$TaskManagerWasInstalled/);
+  assert.match(windows, /\$TaskManagerCreatedComponents\s*=/);
   assert.match(windows, /-not \$ConfigWasEnabled/);
 });
 
@@ -673,16 +673,39 @@ test("the Windows Codex installer commits the Task Manager transaction and resto
   );
 
   const rollbackStart = windows.indexOf("# Undo only what this run created");
-  const rollbackEnd = windows.indexOf("} finally {", rollbackStart);
+  const rollbackEnd = windows.lastIndexOf("} finally {");
   const rollback = windows.slice(rollbackStart, rollbackEnd);
   const purge = rollback.indexOf("src/task-manager-install.mjs purge");
   const embeddedInstall = rollback.indexOf("src/service.mjs install", purge);
-  const embeddedHealth = rollback.indexOf("src/wait-health.mjs", embeddedInstall);
-  assert.match(rollback, /\$TaskManagerInstalled -and -not \$TaskManagerWasInstalled/);
+  const embeddedHealth = rollback.indexOf("CODEX_ROUTER_TASK_MANAGER_REQUIRE_EMBEDDED", embeddedInstall);
+  assert.match(rollback, /\$TaskManagerInstalled/);
+  assert.match(rollback, /CODEX_ROUTER_TASK_MANAGER_CREATED_COMPONENTS/);
+  assert.match(rollback, /ConvertTo-Json -Compress/);
+  assert.match(rollback, /task-manager-install\.mjs purge-created/);
   assert.ok(purge >= 0, "rollback must purge only a manager created by this run");
   assert.ok(embeddedInstall > purge, "purge must be followed by an embedded Router reinstall");
-  assert.ok(embeddedHealth > embeddedInstall, "rollback must prove the restored embedded Router healthy");
+  assert.ok(embeddedHealth > embeddedInstall, "rollback must request strict embedded verification");
+  assert.match(rollback.slice(embeddedHealth), /task-manager-install\.mjs status/);
   assert.match(rollback, /Installation failed[\s\S]*rollback failed/);
+});
+
+test("Windows installer baselines fail closed and preserve partial Task Manager components", () => {
+  const windows = readScript("install.ps1");
+  const stateReader = windows.slice(
+    windows.indexOf("function Get-InstallerStateField"),
+    windows.indexOf("try {", windows.indexOf("function Get-InstallerStateField")),
+  );
+  assert.match(stateReader, /\$LASTEXITCODE/);
+  assert.match(stateReader, /throw/);
+  assert.doesNotMatch(stateReader, /return \$null/);
+
+  for (const component of ["task", "wrapper", "launcher", "shortcut", "marker"]) {
+    assert.match(windows, new RegExp(`TaskManagerBaseline\\.${component}`));
+    assert.match(windows, new RegExp(`${component}\\s*=\\s*-not \\$TaskManagerBaseline\\.${component}`));
+  }
+  assert.match(windows, /\.known -ne \$true[\s\S]*throw/);
+  assert.match(windows, /CODEX_ROUTER_TASK_MANAGER_CREATED_COMPONENTS/);
+  assert.match(windows, /CODEX_ROUTER_TASK_MANAGER_REQUIRE_EMBEDDED/);
 });
 
 // The manifest names the checkout that owns the generated state, and the

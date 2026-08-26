@@ -566,6 +566,7 @@ test("task-manager preserves bridge status and exposes capability-safe nested co
 test("task-manager service rejects unsupported actions and surplus arguments", () => {
   for (const childArgs of [
     ["task-manager", "service", "purge"],
+    ["task-manager", "service", "purge-created"],
     ["task-manager", "service", "render"],
     ["task-manager", "service", "remove"],
     ["task-manager", "service", "install", "unexpected"],

@@ -246,7 +246,8 @@ $AdoptionPending = $false
 $ConfigWasEnabled = $false
 $ServiceWasInstalled = $false
 $TaskManagerInstalled = $false
-$TaskManagerWasInstalled = $false
+$TaskManagerBaseline = $null
+$TaskManagerCreatedComponents = $null
 $TrayWasInstalled = $false
 Push-Location $ScriptDirectory
 
@@ -255,13 +256,24 @@ Push-Location $ScriptDirectory
 # resolved relative to the checkout.
 function Get-InstallerStateField {
   param([string[]]$CommandArguments, [string]$Field)
-  try {
-    $raw = (& node @CommandArguments 2>$null | Out-String)
-    if (-not $raw.Trim()) { return $null }
-    return (ConvertFrom-Json $raw).$Field
-  } catch {
-    return $null
+  $Raw = (& node @CommandArguments 2>$null | Out-String)
+  $StatusExitCode = $LASTEXITCODE
+  if ($StatusExitCode -ne 0) {
+    throw "Unable to read installer baseline from: node $($CommandArguments -join ' ')"
   }
+  if (-not $Raw.Trim()) {
+    throw "Installer baseline was empty for: node $($CommandArguments -join ' ')"
+  }
+  try {
+    $Document = ConvertFrom-Json $Raw
+  } catch {
+    throw "Installer baseline was malformed for: node $($CommandArguments -join ' ')"
+  }
+  $Property = $Document.PSObject.Properties[$Field]
+  if ($null -eq $Property -or $null -eq $Property.Value) {
+    throw "Installer baseline field '$Field' is unknown for: node $($CommandArguments -join ' ')"
+  }
+  return $Property.Value
 }
 
 try {
@@ -275,8 +287,26 @@ try {
   }
   $ServiceWasInstalled = (Get-InstallerStateField @("src\service.mjs", "status") "installed") -eq $true
   if ($Target -eq "codex") {
-    $TaskManagerStatus = Get-InstallerStateField @("src\task-manager-install.mjs", "status") "manager"
-    $TaskManagerWasInstalled = $null -ne $TaskManagerStatus -and $TaskManagerStatus.installed -eq $true
+    $TaskManagerStatus = Get-InstallerStateField @("src\task-manager-install.mjs", "status") "components"
+    $TaskManagerBaseline = [ordered]@{}
+    foreach ($ComponentName in @("task", "wrapper", "launcher", "shortcut", "marker")) {
+      $Component = $TaskManagerStatus.$ComponentName
+      if ($null -eq $Component -or
+          $Component.known -isnot [bool] -or
+          $Component.known -ne $true -or
+          $Component.present -isnot [bool]) {
+        throw "Task Manager baseline component '$ComponentName' is unknown; refusing installation."
+      }
+      $TaskManagerBaseline[$ComponentName] = [bool]$Component.present
+    }
+    $TaskManagerCreatedComponents = [ordered]@{
+      version = 1
+      task = -not $TaskManagerBaseline.task
+      wrapper = -not $TaskManagerBaseline.wrapper
+      launcher = -not $TaskManagerBaseline.launcher
+      shortcut = -not $TaskManagerBaseline.shortcut
+      marker = -not $TaskManagerBaseline.marker
+    }
   }
   $TrayWasInstalled = (Get-InstallerStateField @("src\tray-service.mjs", "status") "installed") -eq $true
   if ($Target -eq "codex") {
@@ -539,20 +569,54 @@ try {
   # cold-starting gateway with a large model set -- retryable, not broken -- and
   # tearing out a service and disabling a client config that were both working
   # before the run turns that into an unrouted machine.
-  if ($TaskManagerInstalled -and -not $TaskManagerWasInstalled) {
-    & node src/task-manager-install.mjs purge 2>$null | Out-Null
-    if ($LASTEXITCODE -ne 0) {
+  if ($TaskManagerInstalled -and $null -ne $TaskManagerCreatedComponents) {
+    $AnyTaskManagerComponentCreated = $TaskManagerCreatedComponents.task -or
+      $TaskManagerCreatedComponents.wrapper -or
+      $TaskManagerCreatedComponents.launcher -or
+      $TaskManagerCreatedComponents.shortcut -or
+      $TaskManagerCreatedComponents.marker
+    $PurgeExitCode = 0
+    if ($AnyTaskManagerComponentCreated) {
+      $HadCreatedComponents = Test-Path Env:CODEX_ROUTER_TASK_MANAGER_CREATED_COMPONENTS
+      $PreviousCreatedComponents = $env:CODEX_ROUTER_TASK_MANAGER_CREATED_COMPONENTS
+      try {
+        $env:CODEX_ROUTER_TASK_MANAGER_CREATED_COMPONENTS =
+          ($TaskManagerCreatedComponents | ConvertTo-Json -Compress)
+        & node src/task-manager-install.mjs purge-created 2>$null | Out-Null
+        $PurgeExitCode = $LASTEXITCODE
+      } finally {
+        if ($HadCreatedComponents) {
+          $env:CODEX_ROUTER_TASK_MANAGER_CREATED_COMPONENTS = $PreviousCreatedComponents
+        } else {
+          Remove-Item Env:CODEX_ROUTER_TASK_MANAGER_CREATED_COMPONENTS -ErrorAction SilentlyContinue
+        }
+      }
+    }
+    if ($PurgeExitCode -ne 0) {
       $RollbackErrors += "the Task Manager artifacts created by this run could not be purged"
-    } else {
+    } elseif ($AnyTaskManagerComponentCreated) {
       # Purge deliberately never restarts Router. Re-render without the marker
       # and prove the embedded port plus Router health before any fresh Router
       # service is removed below.
       & node src/service.mjs install 2>$null | Out-Null
-      if ($LASTEXITCODE -ne 0) {
+      $EmbeddedInstallExitCode = $LASTEXITCODE
+      if ($EmbeddedInstallExitCode -ne 0) {
         $RollbackErrors += "the embedded Router service could not be restored"
-      } else {
-        & node src/wait-health.mjs 2>$null | Out-Null
-        if ($LASTEXITCODE -ne 0) {
+      } elseif ($TaskManagerCreatedComponents.marker) {
+        $HadRequireEmbedded = Test-Path Env:CODEX_ROUTER_TASK_MANAGER_REQUIRE_EMBEDDED
+        $PreviousRequireEmbedded = $env:CODEX_ROUTER_TASK_MANAGER_REQUIRE_EMBEDDED
+        try {
+          $env:CODEX_ROUTER_TASK_MANAGER_REQUIRE_EMBEDDED = "1"
+          & node src/task-manager-install.mjs status 2>$null | Out-Null
+          $EmbeddedVerifyExitCode = $LASTEXITCODE
+        } finally {
+          if ($HadRequireEmbedded) {
+            $env:CODEX_ROUTER_TASK_MANAGER_REQUIRE_EMBEDDED = $PreviousRequireEmbedded
+          } else {
+            Remove-Item Env:CODEX_ROUTER_TASK_MANAGER_REQUIRE_EMBEDDED -ErrorAction SilentlyContinue
+          }
+        }
+        if ($EmbeddedVerifyExitCode -ne 0) {
           $RollbackErrors += "the restored embedded Router did not become healthy"
         }
       }

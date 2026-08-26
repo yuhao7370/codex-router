@@ -11,28 +11,26 @@ import {
 } from "node:fs";
 import path from "node:path";
 
-import { writePrivateFile, writePrivateJson } from "./file-security.mjs";
+import { writePrivateFile } from "./file-security.mjs";
 import { STATE_DIR } from "./paths.mjs";
 import { skipServiceManagerCall } from "./service-write-guard.mjs";
 
 const VERSION = 1;
 const COMMAND_TIMEOUT_MS = 15_000;
-const MAX_COMMAND_BYTES = 4 * 1024 * 1024;
-const MAX_MANIFEST_BYTES = 1024 * 1024;
+export const MAX_WINDOWS_TASK_SNAPSHOT_BYTES = 4 * 1024 * 1024;
 const SNAPSHOT_DIRECTORY = "windows-task-snapshots";
 const handles = new WeakMap();
 
-function runSchtasks(args, options = {}) {
+export function runSchtasksCommand(args, options = {}) {
   if (
     options.mutating
     && skipServiceManagerCall({ hostManaged: process.platform === "win32" })
   ) {
-    return "";
+    return Buffer.alloc(0);
   }
-  return execFileSync("schtasks.exe", args, {
-    encoding: "utf8",
+  return execFileSync(options.executable || "schtasks.exe", args, {
     timeout: COMMAND_TIMEOUT_MS,
-    maxBuffer: MAX_COMMAND_BYTES,
+    maxBuffer: MAX_WINDOWS_TASK_SNAPSHOT_BYTES,
     windowsHide: true,
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -52,7 +50,7 @@ function runPowerShell(script, options = {}) {
     {
       encoding: "utf8",
       timeout: COMMAND_TIMEOUT_MS,
-      maxBuffer: MAX_COMMAND_BYTES,
+      maxBuffer: MAX_WINDOWS_TASK_SNAPSHOT_BYTES,
       windowsHide: true,
       stdio: ["ignore", "pipe", "pipe"],
       env: environment,
@@ -76,7 +74,9 @@ function taskMetadataScript() {
     "$service = New-Object -ComObject 'Schedule.Service'",
     "$service.Connect()",
     "$folder = $service.GetFolder('\\')",
-    "$tasks = $folder.GetTasks(0)",
+    // TASK_ENUM_HIDDEN = 1. A hidden same-name task is existing state, never
+    // evidence that the name is free to delete or replace.
+    "$tasks = $folder.GetTasks(1)",
     "$matches = @()",
     "for ($index = 1; $index -le $tasks.Count; $index += 1) { $candidate = $tasks.Item($index); if ($candidate.Name -eq [string]$env:CODEX_ROUTER_TASK) { $matches += $candidate } }",
     "if ($matches.Count -eq 0) { [Console]::Out.Write('{\"exists\":false}'); exit 0 }",
@@ -224,17 +224,15 @@ function restoreFileAcl(target, acl, dependencies) {
   });
 }
 
-function xmlBytes(xml) {
-  if (/encoding\s*=\s*["']utf-16["']/i.test(xml)) {
-    return Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(xml, "utf16le")]);
-  }
-  return Buffer.from(xml, "utf8");
-}
-
 function readManifest(handle) {
   const manifestPath = path.join(handle.directory, "snapshot.json");
   const stats = lstatSync(manifestPath);
-  if (stats.isSymbolicLink() || !stats.isFile() || stats.size < 2 || stats.size > MAX_MANIFEST_BYTES) {
+  if (
+    stats.isSymbolicLink()
+    || !stats.isFile()
+    || stats.size < 2
+    || stats.size > MAX_WINDOWS_TASK_SNAPSHOT_BYTES
+  ) {
     throw new Error("Windows task snapshot manifest is not a bounded regular file.");
   }
   const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
@@ -254,24 +252,46 @@ function readManifest(handle) {
       recorded?.path !== trusted.path
       || recorded.existed !== trusted.existed
       || recorded.backupName !== trusted.backupName
+      || recorded.bytes !== trusted.bytes
     ) {
       throw new Error("Windows task snapshot file list does not match its trusted paths.");
     }
   }
   if (manifest.exists) {
     if (
-      typeof manifest.xml !== "string"
-      || !manifest.xml
+      manifest.xmlName !== "task.xml"
+      || !Number.isSafeInteger(manifest.xmlBytes)
+      || manifest.xmlBytes < 1
+      || manifest.xmlBytes > MAX_WINDOWS_TASK_SNAPSHOT_BYTES
       || typeof manifest.sddl !== "string"
       || !manifest.sddl
       || typeof manifest.running !== "boolean"
     ) {
       throw new Error("Windows task snapshot task definition is incomplete.");
     }
-  } else if (manifest.xml !== null || manifest.sddl !== null || manifest.running !== false) {
+  } else if (
+    manifest.xmlName !== null
+    || manifest.xmlBytes !== 0
+    || manifest.sddl !== null
+    || manifest.running !== false
+  ) {
     throw new Error("A missing Windows task snapshot has contradictory task state.");
   }
   return manifest;
+}
+
+function readSnapshotCopy(target, expectedBytes, label, { allowEmpty = false } = {}) {
+  const stats = lstatSync(target);
+  if (
+    stats.isSymbolicLink()
+    || !stats.isFile()
+    || stats.size !== expectedBytes
+    || (!allowEmpty && stats.size < 1)
+    || stats.size > MAX_WINDOWS_TASK_SNAPSHOT_BYTES
+  ) {
+    throw new Error(`Windows task snapshot ${label} is not one bounded exact copy.`);
+  }
+  return readFileSync(target);
 }
 
 function removeFile(target) {
@@ -295,7 +315,7 @@ export async function snapshotWindowsTask({
   files,
   stateDir = STATE_DIR,
   platform = process.platform,
-  runSchtasks: invokeSchtasks = runSchtasks,
+  runSchtasks: invokeSchtasks = runSchtasksCommand,
   runPowerShell: invokePowerShell = runPowerShell,
   randomId = randomUUID,
 } = {}) {
@@ -317,11 +337,20 @@ export async function snapshotWindowsTask({
       env: { ...process.env, CODEX_ROUTER_TASK: taskName },
     }));
     const xml = metadata.exists
-      ? String(invokeSchtasks(["/Query", "/TN", taskName, "/XML"], {
+      ? invokeSchtasks(["/Query", "/TN", taskName, "/XML"], {
           timeout: COMMAND_TIMEOUT_MS,
-        }))
+        })
       : null;
-    if (metadata.exists && !xml) throw new Error("Task Scheduler returned an empty XML definition.");
+    if (metadata.exists && !Buffer.isBuffer(xml)) {
+      throw new Error("Task Scheduler XML must be captured as raw bytes.");
+    }
+    if (
+      metadata.exists
+      && (xml.length < 1 || xml.length > MAX_WINDOWS_TASK_SNAPSHOT_BYTES)
+    ) {
+      throw new Error("Task Scheduler XML exceeds the snapshot maximum.");
+    }
+    if (metadata.exists) writePrivateFile(path.join(directory, "task.xml"), xml);
 
     const records = [];
     for (let index = 0; index < trustedFiles.length; index += 1) {
@@ -331,32 +360,43 @@ export async function snapshotWindowsTask({
         throw new Error(`Refusing to snapshot a non-regular launcher file: ${target}`);
       }
       const existed = Boolean(stats);
+      if (existed && stats.size > MAX_WINDOWS_TASK_SNAPSHOT_BYTES) {
+        throw new Error(`Launcher snapshot exceeds the snapshot maximum: ${target}`);
+      }
       const backupName = existed ? `file-${index}.bin` : null;
       const acl = existed ? readFileAcl(target, dependencies) : null;
       if (existed) writePrivateFile(path.join(directory, backupName), readFileSync(target));
-      records.push({ path: target, existed, backupName, acl });
+      records.push({ path: target, existed, backupName, bytes: existed ? stats.size : 0, acl });
     }
 
     const manifest = {
       version: VERSION,
       taskName,
       exists: metadata.exists,
-      xml,
+      xmlName: metadata.exists ? "task.xml" : null,
+      xmlBytes: metadata.exists ? xml.length : 0,
       sddl: metadata.exists ? metadata.sddl : null,
       running: metadata.exists ? metadata.running : false,
       files: records,
     };
-    writePrivateJson(path.join(directory, "snapshot.json"), manifest, { directoryMode: 0o700 });
-    const snapshot = { directory, ...manifest };
+    const manifestContents = `${JSON.stringify(manifest, null, 2)}\n`;
+    if (Buffer.byteLength(manifestContents) > MAX_WINDOWS_TASK_SNAPSHOT_BYTES) {
+      throw new Error("Windows task snapshot manifest exceeds the snapshot maximum.");
+    }
+    writePrivateFile(path.join(directory, "snapshot.json"), manifestContents, {
+      directoryMode: 0o700,
+    });
+    const snapshot = { directory, ...manifest, xml: metadata.exists ? Buffer.from(xml) : null };
     handles.set(snapshot, {
       root,
       directory,
       taskName,
       exists: manifest.exists,
-      files: records.map(({ path: target, existed, backupName }) => ({
+      files: records.map(({ path: target, existed, backupName, bytes }) => ({
         path: target,
         existed,
         backupName,
+        bytes,
       })),
       dependencies,
     });
@@ -383,37 +423,39 @@ export async function restoreWindowsTask(snapshot) {
     env: { ...process.env, CODEX_ROUTER_TASK: handle.taskName },
   }));
 
+  if (current.exists) {
+    invokeIgnoringFailure(() => dependencies.runSchtasks(
+      ["/End", "/TN", handle.taskName],
+      { mutating: true },
+    ));
+    dependencies.runSchtasks(
+      ["/Delete", "/TN", handle.taskName, "/F"],
+      { mutating: true },
+    );
+  }
+
   for (const record of manifest.files) {
     if (!record.existed) {
       removeFile(record.path);
       continue;
     }
     const backupPath = path.join(handle.directory, record.backupName);
-    const backupStats = lstatSync(backupPath);
-    if (backupStats.isSymbolicLink() || !backupStats.isFile()) {
-      throw new Error(`Windows task snapshot copy is not a regular file: ${record.backupName}`);
-    }
-    writePrivateFile(record.path, readFileSync(backupPath));
+    writePrivateFile(
+      record.path,
+      readSnapshotCopy(
+        backupPath,
+        record.bytes,
+        `copy ${record.backupName}`,
+        { allowEmpty: true },
+      ),
+    );
     restoreFileAcl(record.path, record.acl, dependencies);
   }
 
-  if (current.exists) {
-    invokeIgnoringFailure(() => dependencies.runSchtasks(
-      ["/End", "/TN", handle.taskName],
-      { mutating: true },
-    ));
-    // Absence was established by the bounded COM query above. Any deletion
-    // failure here is therefore access/host failure, not "already missing",
-    // and must make rollback fail loudly instead of being downgraded to success.
-    dependencies.runSchtasks(
-      ["/Delete", "/TN", handle.taskName, "/F"],
-      { mutating: true },
-    );
-  }
   if (!manifest.exists) return snapshot;
 
-  const xmlPath = path.join(handle.directory, "restore-task.xml");
-  writePrivateFile(xmlPath, xmlBytes(manifest.xml));
+  const xmlPath = path.join(handle.directory, manifest.xmlName);
+  readSnapshotCopy(xmlPath, manifest.xmlBytes, "task XML");
   dependencies.runSchtasks(
     ["/Create", "/TN", handle.taskName, "/XML", xmlPath, "/F"],
     { mutating: true },
