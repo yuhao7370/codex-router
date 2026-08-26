@@ -22,6 +22,17 @@ test("both dispatchers accept the stop command", () => {
   assert.match(windows, /"stop"\s*\{\s*Invoke-RouterNode "src\\service\.mjs" @\("stop"\)/);
 });
 
+test("both dispatchers expose the Task Manager command", () => {
+  const posix = readFileSync(path.join(root, "bin", "model-router"), "utf8");
+  assert.match(posix, /\|task-manager\|/);
+  const wrapper = readFileSync(path.join(root, "bin", "task-manager"), "utf8");
+  assert.match(wrapper, /src\/control\.mjs.+task-manager/);
+
+  const windows = readFileSync(path.join(root, "codex-router.ps1"), "utf8");
+  assert.match(windows, /"task-manager"/);
+  assert.match(windows, /src\\control\.mjs.+task-manager/);
+});
+
 for (const args of [["--version"], ["codex", "--version"]]) {
   test(
     `model-router ${args.join(" ")} reports the package version`,

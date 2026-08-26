@@ -16,7 +16,7 @@ $Commands = @(
   "setup", "install", "doctor", "status", "providers", "provider-key", "enable",
   "disable", "chatgpt-session", "uninstall", "update", "rollback", "support-bundle",
   "smoke-test", "start", "stop", "test-model", "discover-models", "local-mlx",
-  "signed-routing", "refresh-catalog", "media", "tray", "panel", "companion"
+  "signed-routing", "refresh-catalog", "media", "tray", "panel", "task-manager", "companion"
 )
 if ($Command -notin $Commands) {
   throw "Unknown command '$Command'. Choose: $($Commands -join ', ')."
@@ -902,6 +902,7 @@ switch ($Command) {
   # The companion with nothing to build and nothing to download. The router is
   # already serving it; this is the one thing that knows the address.
   "panel" { Invoke-RouterNode "src\panel.mjs" $Arguments }
+  "task-manager" { Invoke-RouterNode "src\control.mjs" (@("task-manager") + $Arguments) }
   # The Windows counterpart of ./bin/model-router-tray. Before this, macOS and
   # Linux had one command that built and supervised the companion and Windows
   # had none -- bin/model-router-tray only told you to go read a build script.

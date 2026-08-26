@@ -12,6 +12,7 @@ import {
   redactCallerUrl,
 } from "../src/caller-auth.mjs";
 import { isPanelRoute } from "../src/desktop-panel.mjs";
+import { openInBrowser } from "../src/open-browser.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const CALLER_KEY = "test-caller-auth-capability-with-sufficient-length";
@@ -84,3 +85,21 @@ test("both entry points expose the command", () => {
   assert.match(windows, /"panel"/, "codex-router.ps1 must list panel");
   assert.match(windows, /src\\panel\.mjs/);
 });
+
+for (const [platform, command, commandArgs] of [
+  ["win32", "cmd.exe", ["/c", "start", "", "https://example.test/"]],
+  ["darwin", "open", ["https://example.test/"]],
+  ["linux", "xdg-open", ["https://example.test/"]],
+]) {
+  test(`the shared browser launcher uses the ${platform} native command`, async () => {
+    const calls = [];
+    await openInBrowser("https://example.test/", {
+      platform,
+      execFileImpl: (...args) => {
+        calls.push(args.slice(0, 3));
+        args[3](null);
+      },
+    });
+    assert.deepEqual(calls, [[command, commandArgs, { windowsHide: true }]]);
+  });
+}

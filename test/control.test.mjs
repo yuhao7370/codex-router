@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -542,6 +542,39 @@ test("picker all accepts the documented show/hide flag position", () => {
     ]),
     ["set", "deepseek/deepseek-v4-flash", "hide"],
   );
+});
+
+test("task-manager preserves bridge status and exposes capability-safe nested commands", () => {
+  const source = readFileSync(path.join(root, "src", "control.mjs"), "utf8");
+  const handler = source.match(
+    /async function handleTaskManager[\s\S]*?\r?\n}\r?\n\r?\nasync function handleChatGptSession/,
+  )?.[0];
+  assert.ok(handler, "task-manager handler should be readable");
+  assert.match(handler, /readTaskManagerConfig/);
+  assert.match(handler, /if \(!action \|\| action === "status"\)/);
+  assert.match(handler, /action === "service"[\s\S]*?runTaskManagerService/);
+  assert.match(handler, /action === "open"[\s\S]*?runTaskManagerOpen/);
+  assert.match(source, /task-manager-service\.mjs/);
+  assert.match(source, /handleTaskManager\(args\[1\], args\[2\], args\.slice\(3\)\)/);
+});
+
+test("task-manager service rejects unsupported actions and surplus arguments", () => {
+  for (const childArgs of [
+    ["task-manager", "service", "install"],
+    ["task-manager", "service", "status", "unexpected"],
+  ]) {
+    const result = spawnSync(process.execPath, [path.join(root, "src", "control.mjs"), ...childArgs], {
+      cwd: root,
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        CODEX_ROUTER_SERVICE_PLATFORM: "linux",
+        MODEL_ROUTER_SKIP_SERVICE_MANAGER: "1",
+      },
+    });
+    assert.notEqual(result.status, 0, childArgs.join(" "));
+    assert.match(result.stderr, /task-manager service status\|start\|stop\|restart/);
+  }
 });
 
 function probeSet(target, providers, provider, desired) {

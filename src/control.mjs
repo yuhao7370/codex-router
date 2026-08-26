@@ -2725,7 +2725,42 @@ async function handlePresence(action, value) {
   process.stdout.write(`${JSON.stringify(setPresenceMode(value))}\n`);
 }
 
-async function handleTaskManager(action, value) {
+function runTaskManagerChild(script, childArgs) {
+  const result = spawnSync(
+    process.execPath,
+    [path.join(REPO_ROOT, "src", script), ...childArgs],
+    { stdio: "inherit", env: process.env },
+  );
+  if (result.error) throw result.error;
+  if (result.status !== 0) {
+    throw new Error(`Task Manager command failed with exit code ${result.status}.`);
+  }
+}
+
+function runTaskManagerService(action) {
+  const serviceAction = action || "status";
+  if (!SERVICE_COMMANDS.includes(serviceAction)) {
+    throw new Error(`Usage: control task-manager service ${SERVICE_COMMANDS.join("|")}`);
+  }
+  runTaskManagerChild("task-manager-service.mjs", [serviceAction]);
+}
+
+function runTaskManagerOpen(openArgs) {
+  runTaskManagerChild("task-manager-open.mjs", openArgs);
+}
+
+async function handleTaskManager(action, value, rest = []) {
+  if (action === "service") {
+    if (rest.length) {
+      throw new Error(`Usage: control task-manager service ${SERVICE_COMMANDS.join("|")}`);
+    }
+    runTaskManagerService(value || "status");
+    return;
+  }
+  if (action === "open") {
+    runTaskManagerOpen([value, ...rest].filter((item) => item !== undefined));
+    return;
+  }
   const bridge = await import("./task-manager-bridge.mjs");
   const snapshot = () => {
     const config = bridge.readTaskManagerConfig();
@@ -2772,7 +2807,7 @@ async function handleTaskManager(action, value) {
     return;
   }
   throw new Error(
-    "Usage: control task-manager status|enable|disable|port <1-65535>|token <value|clear>|test|accounts|select <id>",
+    "Usage: control task-manager status|enable|disable|port <1-65535>|token <value|clear>|test|accounts|select <id>|service status|start|stop|restart|open [--print]",
   );
 }
 
@@ -2870,7 +2905,7 @@ if (args.includes("--probe")) {
 } else if (args[0] === "presence") {
   await handlePresence(args[1], args[2]);
 } else if (args[0] === "task-manager") {
-  await handleTaskManager(args[1], args[2]);
+  await handleTaskManager(args[1], args[2], args.slice(3));
 } else if (args[0] === "chatgpt-session") {
   if (args.length > 2) throw new Error("Usage: control chatgpt-session status|enable|disable");
   await handleChatGptSession(args[1]);

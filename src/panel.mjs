@@ -8,10 +8,10 @@
 // survives in scrollback, screen shares, and pasted bug reports. `--print` is
 // the deliberate exception for someone who has to move it to another browser,
 // and it says what it is handing over.
-import { execFile } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 
 import { assertCallerSecret, panelUrl, redactCallerUrl } from "./caller-auth.mjs";
+import { openInBrowser } from "./open-browser.mjs";
 import { CALLER_SECRET_PATH, PORTS } from "./paths.mjs";
 
 const args = process.argv.slice(2);
@@ -56,23 +56,6 @@ async function routerIsRunning() {
   } catch {
     return false;
   }
-}
-
-function openInBrowser(url) {
-  const [command, commandArgs] =
-    process.platform === "win32"
-      ? // The empty string is `start`'s title argument. Without it a quoted URL
-        // becomes the window title and nothing opens.
-        ["cmd.exe", ["/c", "start", "", url]]
-      : process.platform === "darwin"
-        ? ["open", [url]]
-        : ["xdg-open", [url]];
-  return new Promise((resolve, reject) => {
-    execFile(command, commandArgs, { windowsHide: true }, (error) => {
-      if (error) reject(error);
-      else resolve();
-    });
-  });
 }
 
 async function main() {
