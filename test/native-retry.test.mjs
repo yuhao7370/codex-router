@@ -74,7 +74,6 @@ function run(env) {
       KIMI_INTERNAL_KEY: INTERNAL_KEY,
       CODEX_ROUTER_SHOW_ALL_MODELS: "1",
       CODEX_ROUTER_QUIET: "1",
-      CODEX_ROUTER_TASK_MANAGER_STANDALONE: "1",
       ...env,
     },
     stdio: ["ignore", "ignore", "pipe"],
@@ -153,6 +152,7 @@ function startRouter({ nativePort, routerPort, stateDir, controlPort, backoffMs 
     CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${nativePort}/v1`,
     MODEL_ROUTER_STATE_DIR: stateDir,
     CODEX_ROUTER_NATIVE_RETRY_BACKOFF_MS: String(backoffMs),
+    CODEX_ROUTER_TASK_MANAGER_STANDALONE: controlPort === undefined ? "1" : "0",
     ...(controlPort === undefined ? {} : { CODEX_ROUTER_CONTROL_PORT: String(controlPort) }),
     ...(retries === undefined ? {} : { CODEX_ROUTER_NATIVE_RETRIES: String(retries) }),
   });
