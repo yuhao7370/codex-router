@@ -187,6 +187,15 @@ function port(name, fallback) {
   return value;
 }
 
+export const TASK_MANAGER_TASK_NAME = "Codex Router Task Manager";
+export const TASK_MANAGER_LOG_PATH = path.join(STATE_DIR, "task-manager.log");
+export const TASK_MANAGER_PROCESS_STATE_PATH = path.join(STATE_DIR, "task-manager-process.json");
+export const TASK_MANAGER_STANDALONE_PATH = path.join(STATE_DIR, "task-manager-standalone.json");
+export const TASK_MANAGER_CONTROL_PORT = port(
+  "MODEL_ROUTER_CONTROL_PORT",
+  process.env.CODEX_ROUTER_CONTROL_PORT || 4111,
+);
+
 // Keep the defaults in an unassigned IANA range. 4101-4104 are the registered
 // BrlAPI ports on Linux; binding an HTTP service there makes xbrlapi wait for a
 // protocol response during GNOME login. gateway/oauth/router/api are the

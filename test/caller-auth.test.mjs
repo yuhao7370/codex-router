@@ -18,6 +18,8 @@ import {
   isManagedCallerBaseUrl,
   isManagedGeminiBaseUrl,
   redactCallerUrl,
+  taskManagerPath,
+  taskManagerUrl,
 } from "../src/caller-auth.mjs";
 import { privateFileIsProtected } from "../src/file-security.mjs";
 
@@ -79,6 +81,16 @@ test("the gemini leaf sits behind the same capability and is redacted with it", 
   assert.equal(isManagedGeminiBaseUrl(baseUrl, 4102), false);
   assert.equal(isManagedGeminiBaseUrl(callerBaseUrl(46192, CALLER_KEY), 46192), false);
   assert.equal(isManagedGeminiBaseUrl(`${baseUrl}?key=x`, 46192), false);
+});
+
+test("the task manager leaf reuses and redacts the caller capability", () => {
+  const url = taskManagerUrl(4111, CALLER_KEY);
+  assert.equal(url, `http://127.0.0.1:4111/_codex-router/${CALLER_KEY}/task-manager/`);
+  assert.equal(authenticatedRoute(new URL(url).pathname, CALLER_KEY), "/task-manager/");
+  assert.equal(
+    redactCallerUrl(`${url}api/router/status`),
+    "http://127.0.0.1:4111/_codex-router/[REDACTED]/task-manager/api/router/status",
+  );
 });
 
 test("secret setup creates stable, separate, current-user-only keys", () => {

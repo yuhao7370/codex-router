@@ -63,6 +63,14 @@ export function panelUrl(port, secret) {
   return `http://127.0.0.1:${port}${panelPath(secret)}`;
 }
 
+export function taskManagerPath(secret) {
+  return `${CALLER_PATH_PREFIX}/${assertCallerSecret(secret)}/task-manager/`;
+}
+
+export function taskManagerUrl(port, secret) {
+  return `http://127.0.0.1:${port}${taskManagerPath(secret)}`;
+}
+
 export function authenticatedRoute(pathname, expectedSecret) {
   if (typeof pathname !== "string") return undefined;
   const prefix = `${CALLER_PATH_PREFIX}/`;
@@ -122,7 +130,7 @@ export function isManagedGeminiBaseUrl(value, port) {
 export function redactCallerUrl(value) {
   if (typeof value !== "string") return value;
   return value.replace(
-    new RegExp(`(${CALLER_PATH_PREFIX}/)[A-Za-z0-9_-]+(?=/(?:v1|panel|gemini)(?:/|$))`, "g"),
+    new RegExp(`(${CALLER_PATH_PREFIX}/)[A-Za-z0-9_-]+(?=/(?:v1|panel|gemini|task-manager)(?:/|$))`, "g"),
     "$1[REDACTED]",
   );
 }
