@@ -21,6 +21,7 @@ const dispatcherScript = path.join(root, "src", "task-manager-service.mjs");
 
 function canonicalTask(action, overrides = {}) {
   const currentUser = "EXAMPLE\\operator";
+  const currentSid = "S-1-5-21-100-200-300-1001";
   return {
     known: true,
     exists: true,
@@ -28,7 +29,9 @@ function canonicalTask(action, overrides = {}) {
     actionCount: 1,
     action,
     currentUser,
-    computerName: "EXAMPLE",
+    currentSid,
+    principalSid: currentSid,
+    triggerSid: currentSid,
     principal: { userId: currentUser, logonType: "interactive", runLevel: "limited" },
     triggerCount: 1,
     trigger: { type: "MSFT_TaskLogonTrigger", userId: currentUser, enabled: true },
@@ -168,7 +171,8 @@ test("scheduler query uses a bounded UTF-8 PowerShell boundary", async () => {
     invocation.script,
     /\[Console\]::OutputEncoding = \[Text\.Encoding\]::UTF8/,
   );
-  assert.match(invocation.script, /\[Environment\]::MachineName/);
+  assert.match(invocation.script, /WindowsIdentity\]::GetCurrent\(\)\.User\.Value/);
+  assert.match(invocation.script, /NTAccount[\s\S]*Translate[\s\S]*SecurityIdentifier/);
 });
 
 test("scheduler query timeout stays unknown", async () => {
@@ -182,12 +186,14 @@ test("scheduler query timeout stays unknown", async () => {
   );
 });
 
-test("scheduler query preserves the local computer identity proof", async () => {
+test("scheduler query preserves resolved task identity SIDs", async () => {
   const task = canonicalTask(taskAction({ stateDir: "C:/state" }));
   const result = await queryScheduledTask({
     runPowerShell: () => JSON.stringify(task),
   });
-  assert.equal(result.computerName, "EXAMPLE");
+  assert.equal(result.currentSid, "S-1-5-21-100-200-300-1001");
+  assert.equal(result.principalSid, "S-1-5-21-100-200-300-1001");
+  assert.equal(result.triggerSid, "S-1-5-21-100-200-300-1001");
 });
 
 test("status keeps a scheduler query failure unknown", async () => {
@@ -260,11 +266,11 @@ test("task canonicality covers principal, login trigger, recovery, power, and in
   assert.equal(taskActionIsCanonical(task, { stateDir: "C:/state" }), true);
 
   const drifts = [
-    { principal: { ...task.principal, userId: "EXAMPLE\\other" } },
+    { principalSid: "S-1-5-21-100-200-300-1002" },
     { principal: { ...task.principal, logonType: "password" } },
     { principal: { ...task.principal, runLevel: "highest" } },
     { trigger: { ...task.trigger, type: "time" } },
-    { trigger: { ...task.trigger, userId: "EXAMPLE\\other" } },
+    { triggerSid: "S-1-5-21-100-200-300-1002" },
     { settings: { ...task.settings, restartCount: 3 } },
     { settings: { ...task.settings, restartInterval: "PT5M" } },
     { settings: { ...task.settings, executionTimeLimit: "PT72H" } },
@@ -277,39 +283,32 @@ test("task canonicality covers principal, login trigger, recovery, power, and in
   }
 });
 
-test("task canonicality accepts bare identities only for the current local account", () => {
+test("task canonicality proves task identities by exact resolved SID", () => {
   const stateDir = "C:/state";
   const action = taskAction({ stateDir });
-  const localTask = canonicalTask(action, {
+  const task = canonicalTask(action, {
     currentUser: "GAME\\yuhaofeng",
-    computerName: "GAME",
     principal: { userId: "yuhaofeng", logonType: "interactive", runLevel: "limited" },
     trigger: { type: "MSFT_TaskLogonTrigger", userId: "GAME\\yuhaofeng", enabled: true },
   });
-  assert.equal(taskActionIsCanonical(localTask, { stateDir }), true);
+  assert.equal(taskActionIsCanonical(task, { stateDir }), true);
   assert.equal(taskActionIsCanonical({
-    ...localTask,
-    principal: { ...localTask.principal, userId: "GAME\\yuhaofeng" },
-    trigger: { ...localTask.trigger, userId: "yuhaofeng" },
+    ...task,
+    principal: { ...task.principal, userId: "OTHER\\alias" },
+    trigger: { ...task.trigger, userId: "alias" },
   }, { stateDir }), true);
 
   const rejected = [
-    { principal: { ...localTask.principal, userId: "other" } },
-    { principal: { ...localTask.principal, userId: "OTHER\\yuhaofeng" } },
-    {
-      currentUser: "CORP\\yuhaofeng",
-      principal: { ...localTask.principal, userId: "yuhaofeng" },
-      trigger: { ...localTask.trigger, userId: "CORP\\yuhaofeng" },
-    },
-    { principal: { ...localTask.principal, userId: "" } },
-    { principal: { ...localTask.principal, userId: "GAME\\yuhaofeng\\extra" } },
-    { principal: { ...localTask.principal, userId: "\\yuhaofeng" } },
-    { trigger: { ...localTask.trigger, userId: "GAME\\" } },
-    { currentUser: "yuhaofeng" },
-    { computerName: "" },
+    { principalSid: "S-1-5-21-100-200-300-1002" },
+    { triggerSid: "S-1-5-21-100-200-300-1002" },
+    { currentSid: "" },
+    { principalSid: "" },
+    { triggerSid: "" },
+    { principalSid: undefined },
+    { triggerSid: undefined },
   ];
   for (const overrides of rejected) {
-    assert.equal(taskActionIsCanonical({ ...localTask, ...overrides }, { stateDir }), false);
+    assert.equal(taskActionIsCanonical({ ...task, ...overrides }, { stateDir }), false);
   }
 });
 

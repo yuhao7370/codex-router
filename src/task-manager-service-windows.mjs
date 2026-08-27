@@ -82,22 +82,6 @@ function normalized(value) {
   return String(value || "").trim().replaceAll("\\", "/").toLowerCase();
 }
 
-function taskIdentityMatchesCurrentUser(value, currentUser, computerName) {
-  if (typeof value !== "string" || typeof currentUser !== "string") return false;
-  const candidate = normalized(value);
-  const current = normalized(currentUser);
-  const currentParts = /^([^/]+)\/([^/]+)$/.exec(current);
-  if (!currentParts || !candidate) return false;
-  if (candidate === current) return true;
-  if (typeof computerName !== "string") return false;
-  const computer = normalized(computerName);
-  return !candidate.includes("/")
-    && computer.length > 0
-    && !computer.includes("/")
-    && currentParts[1] === computer
-    && currentParts[2] === candidate;
-}
-
 function guardLauncherWrite(env = process.env) {
   if (env.CODEX_ROUTER_TEST_SKIP_SERVICE_WRITES === "1") {
     throw new Error("Refusing to write Task Manager service artifacts while the test write guard is enabled.");
@@ -252,7 +236,11 @@ function taskQueryScript(taskName = TASK_MANAGER_TASK_NAME) {
     "$trigger = if ($triggers.Count -gt 0) { $triggers[0] } else { $null }",
     "$principal = $task[0].Principal",
     "$settings = $task[0].Settings",
-    "$payload = [ordered]@{ exists = $true; state = $task[0].State.ToString(); currentUser = [Security.Principal.WindowsIdentity]::GetCurrent().Name; computerName = [Environment]::MachineName; actionCount = $actions.Count; action = [ordered]@{ execute = [string]$action.Execute; argument = [string]$action.Arguments }; principal = [ordered]@{ userId = [string]$principal.UserId; logonType = $principal.LogonType.ToString(); runLevel = $principal.RunLevel.ToString() }; triggerCount = $triggers.Count; trigger = [ordered]@{ type = [string]$trigger.CimClass.CimClassName; userId = [string]$trigger.UserId; enabled = [bool]$trigger.Enabled }; settings = [ordered]@{ restartCount = [int]$settings.RestartCount; restartInterval = [string]$settings.RestartInterval; executionTimeLimit = [string]$settings.ExecutionTimeLimit; disallowStartIfOnBatteries = [bool]$settings.DisallowStartIfOnBatteries; stopIfGoingOnBatteries = [bool]$settings.StopIfGoingOnBatteries; multipleInstances = $settings.MultipleInstances.ToString() } }",
+    "function Resolve-TaskUserSid([string]$userId) { if ([string]::IsNullOrWhiteSpace($userId)) { return '' }; try { return ([Security.Principal.NTAccount]::new($userId)).Translate([Security.Principal.SecurityIdentifier]).Value } catch { return '' } }",
+    "$currentSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value",
+    "$principalSid = Resolve-TaskUserSid ([string]$principal.UserId)",
+    "$triggerSid = Resolve-TaskUserSid ([string]$trigger.UserId)",
+    "$payload = [ordered]@{ exists = $true; state = $task[0].State.ToString(); currentUser = [Security.Principal.WindowsIdentity]::GetCurrent().Name; currentSid = $currentSid; principalSid = $principalSid; triggerSid = $triggerSid; actionCount = $actions.Count; action = [ordered]@{ execute = [string]$action.Execute; argument = [string]$action.Arguments }; principal = [ordered]@{ userId = [string]$principal.UserId; logonType = $principal.LogonType.ToString(); runLevel = $principal.RunLevel.ToString() }; triggerCount = $triggers.Count; trigger = [ordered]@{ type = [string]$trigger.CimClass.CimClassName; userId = [string]$trigger.UserId; enabled = [bool]$trigger.Enabled }; settings = [ordered]@{ restartCount = [int]$settings.RestartCount; restartInterval = [string]$settings.RestartInterval; executionTimeLimit = [string]$settings.ExecutionTimeLimit; disallowStartIfOnBatteries = [bool]$settings.DisallowStartIfOnBatteries; stopIfGoingOnBatteries = [bool]$settings.StopIfGoingOnBatteries; multipleInstances = $settings.MultipleInstances.ToString() } }",
     "[Console]::Out.Write(($payload | ConvertTo-Json -Compress -Depth 5))",
   ].join("; ");
 }
@@ -275,6 +263,9 @@ export async function queryScheduledTask({
       || typeof task.action.argument !== "string"
       || !Number.isSafeInteger(task.actionCount)
       || typeof task.currentUser !== "string"
+      || typeof task.currentSid !== "string"
+      || typeof task.principalSid !== "string"
+      || typeof task.triggerSid !== "string"
       || !task.principal
       || !task.trigger
       || !task.settings
@@ -289,7 +280,9 @@ export async function queryScheduledTask({
       actionCount: task.actionCount,
       action: task.action,
       currentUser: task.currentUser,
-      computerName: task.computerName,
+      currentSid: task.currentSid,
+      principalSid: task.principalSid,
+      triggerSid: task.triggerSid,
       principal: task.principal,
       triggerCount: task.triggerCount,
       trigger: task.trigger,
@@ -302,25 +295,17 @@ export async function queryScheduledTask({
 
 export function scheduledTaskDefinitionIsCanonical(task, expectedAction) {
   if (!task?.exists || !task.action) return false;
-  const currentUser = normalized(task.currentUser);
   return task.actionCount === 1
     && normalized(task.action.execute) === normalized(expectedAction?.execute)
     && normalized(task.action.argument) === normalized(expectedAction?.argument)
-    && currentUser.length > 0
-    && taskIdentityMatchesCurrentUser(
-      task.principal?.userId,
-      task.currentUser,
-      task.computerName,
-    )
+    && typeof task.currentSid === "string"
+    && task.currentSid.length > 0
+    && task.principalSid === task.currentSid
     && normalized(task.principal?.logonType) === "interactive"
     && normalized(task.principal?.runLevel) === "limited"
     && task.triggerCount === 1
     && normalized(task.trigger?.type) === "msft_tasklogontrigger"
-    && taskIdentityMatchesCurrentUser(
-      task.trigger?.userId,
-      task.currentUser,
-      task.computerName,
-    )
+    && task.triggerSid === task.currentSid
     && task.trigger?.enabled === true
     && task.settings?.restartCount === 999
     && normalized(task.settings?.restartInterval) === "pt1m"
