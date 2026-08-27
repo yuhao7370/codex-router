@@ -310,12 +310,13 @@ export function startTaskManagerUi({
         const range = url.searchParams.get("range") || "90d";
         const snapshot = panelUsageSnapshot({ range });
         const accountMeta = new Map();
-        const validIds = new Set();
+        let currentAccounts = [];
         let ctmReachable = false;
         try {
           const accounts = await listTaskManagerAccounts();
           ctmReachable = true;
-          for (const account of Array.isArray(accounts?.accounts) ? accounts.accounts : []) {
+          currentAccounts = Array.isArray(accounts?.accounts) ? accounts.accounts : [];
+          for (const account of currentAccounts) {
             const meta = {
               email: typeof account.email === "string" ? account.email : "",
               plan:
@@ -326,7 +327,6 @@ export function startTaskManagerUi({
             const id = account.id || account.account_id;
             if (id) {
               accountMeta.set(String(id), meta);
-              validIds.add(String(id));
             }
           }
         } catch {
@@ -338,7 +338,7 @@ export function startTaskManagerUi({
           : [];
         const accounts = !ctmReachable
           ? snapshotAccounts.map((account) => ({ ...account, email: "", plan: "" }))
-          : mergeDeletedAccounts(snapshotAccounts, validIds).map((account) => {
+          : mergeDeletedAccounts(snapshotAccounts, currentAccounts).map((account) => {
               const meta = accountMeta.get(account.accountId);
               return {
                 ...account,

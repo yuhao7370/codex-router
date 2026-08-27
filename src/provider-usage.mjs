@@ -513,23 +513,46 @@ export function attachAccountCosts(accounts, index = loadPricingIndex()) {
   });
 }
 
-// Deleted CTM accounts leave the account list, but their token usage is still
-// real spend. Fold every account that is no longer present in the CTM account
-// list into one synthetic "已删除" bucket so the total stays whole instead of
-// silently dropping those rows.
-export function mergeDeletedAccounts(accounts, validIds) {
-  const kept = [];
+// CTM exposes both its own record id and ChatGPT's account id. Usage can carry
+// either one, so canonicalize both before deciding that an account was deleted.
+export function mergeDeletedAccounts(accounts, currentAccounts = []) {
+  const aliases = new Map();
+  for (const account of currentAccounts) {
+    const canonicalId = String(account?.id || account?.account_id || "");
+    if (!canonicalId) continue;
+    aliases.set(canonicalId, canonicalId);
+    if (account.id) aliases.set(String(account.id), canonicalId);
+    if (account.account_id) aliases.set(String(account.account_id), canonicalId);
+  }
+
+  const kept = new Map();
   const deleted = [];
   for (const account of accounts) {
-    if (validIds.has(account.accountId)) kept.push(account);
-    else deleted.push(account);
+    const canonicalId = aliases.get(String(account.accountId || ""));
+    if (!canonicalId) {
+      deleted.push(account);
+      continue;
+    }
+    const normalized = canonicalId === account.accountId
+      ? account
+      : { ...account, accountId: canonicalId };
+    const existing = kept.get(canonicalId);
+    kept.set(
+      canonicalId,
+      existing
+        ? foldAccounts([existing, normalized], { accountId: canonicalId, email: "", plan: "" })
+        : normalized,
+    );
   }
-  if (deleted.length === 0) return kept;
-  kept.push(foldDeletedAccounts(deleted));
-  return kept;
+  const merged = [...kept.values()];
+  if (deleted.length > 0) merged.push(foldAccounts(deleted));
+  return merged;
 }
 
-function foldDeletedAccounts(accounts) {
+function foldAccounts(
+  accounts,
+  { accountId = "__deleted__", email = "已删除", plan = "" } = {},
+) {
   const models = new Map();
   let requests = 0;
   let successfulRequests = 0;
@@ -588,9 +611,9 @@ function foldDeletedAccounts(accounts) {
   );
 
   return {
-    accountId: "__deleted__",
-    email: "已删除",
-    plan: "",
+    accountId,
+    email,
+    plan,
     requests,
     successfulRequests,
     meteredRequests,

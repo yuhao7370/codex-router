@@ -682,7 +682,7 @@ test("deleted accounts fold into one kept 已删除 bucket", () => {
     },
   ];
 
-  const merged = mergeDeletedAccounts(accounts, new Set(["acct-a"]));
+  const merged = mergeDeletedAccounts(accounts, [{ id: "acct-a" }]);
 
   assert.equal(merged.length, 2);
   assert.equal(merged[0].accountId, "acct-a");
@@ -698,8 +698,35 @@ test("deleted accounts fold into one kept 已删除 bucket", () => {
 
 test("mergeDeletedAccounts keeps everything when every account is still valid", () => {
   const accounts = [{ accountId: "acct-a", totalTokens: 10, models: [] }];
-  const merged = mergeDeletedAccounts(accounts, new Set(["acct-a"]));
+  const merged = mergeDeletedAccounts(accounts, [{ id: "acct-a" }]);
   assert.deepEqual(merged, accounts);
+});
+
+test("CTM record and ChatGPT account ids merge into one current account", () => {
+  const usage = (accountId, requests, totalTokens) => ({
+    accountId,
+    requests,
+    successfulRequests: requests,
+    meteredRequests: requests,
+    inputTokens: totalTokens,
+    outputTokens: 0,
+    cachedInputTokens: 0,
+    totalTokens,
+    totalCost: totalTokens / 1000,
+    models: [],
+  });
+  const merged = mergeDeletedAccounts(
+    [usage("record-id", 2, 100), usage("chatgpt-id", 3, 200), usage("gone-id", 1, 50)],
+    [{ id: "record-id", account_id: "chatgpt-id" }],
+  );
+
+  assert.equal(merged.length, 2);
+  assert.deepEqual(
+    { accountId: merged[0].accountId, requests: merged[0].requests, totalTokens: merged[0].totalTokens },
+    { accountId: "record-id", requests: 5, totalTokens: 300 },
+  );
+  assert.equal(merged[1].accountId, "__deleted__");
+  assert.equal(merged[1].totalTokens, 50);
 });
 
 // Output tokens per second is the rate after the first token, with the wait
