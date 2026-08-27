@@ -11,20 +11,32 @@ export function taskManagerDoctorRows({
   health,
   components,
   privateState,
+  configExists,
   routerMode,
 } = {}) {
   if (platform !== "win32") return [];
   const componentStates = ["task", "wrapper", "launcher", "shortcut", "process"]
     .map((name) => components?.[name]);
-  const noComponents = service?.installed === false
+  const markerAbsent = markerState?.known === true
+    && markerState.enabled === false
+    && (
+      (markerState.exists === false && markerState.state === "missing")
+      || (markerState.exists === true && markerState.state === "disabled")
+    );
+  const noInstallation = markerAbsent
+    && service?.installed === false
     && service?.loaded === false
-    && !Number.isSafeInteger(service?.pid)
+    && service.state === "stopped"
+    && service.canonical === false
+    && service.healthy === false
+    && service.pid === null
+    && service.listener === "absent"
+    && health === undefined
+    && (routerMode === undefined || routerMode === "embedded")
+    && configExists === false
     && componentStates.every((component) =>
       component?.known === true && component.present === false);
-  if (
-    noComponents
-    && (markerState?.state === "missing" || markerState?.state === "disabled")
-  ) return [];
+  if (noInstallation) return [];
 
   const enabled = markerState?.known === true
     && markerState.exists === true

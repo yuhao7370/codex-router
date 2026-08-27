@@ -37,9 +37,38 @@ function healthyFixture(overrides = {}) {
       process: present,
     },
     privateState: { caller: true, marker: true, process: true, config: true },
+    configExists: true,
     routerMode: "standalone",
     ...overrides,
   };
+}
+
+function absentFixture(overrides = {}) {
+  const absent = { known: true, present: false };
+  return healthyFixture({
+    markerState: { known: true, exists: false, enabled: false, state: "missing" },
+    service: {
+      installed: false,
+      loaded: false,
+      state: "stopped",
+      canonical: false,
+      healthy: false,
+      pid: null,
+      listener: "absent",
+    },
+    health: undefined,
+    components: {
+      task: absent,
+      wrapper: absent,
+      launcher: absent,
+      shortcut: absent,
+      process: absent,
+    },
+    privateState: { caller: true, marker: true, process: true, config: true },
+    configExists: false,
+    routerMode: undefined,
+    ...overrides,
+  });
 }
 
 function assertRow(rows, label, status) {
@@ -65,27 +94,55 @@ test("standalone Task Manager reports four healthy doctor rows", () => {
 });
 
 test("non-Windows and a missing marker with proven-absent components add no rows", () => {
-  const absent = { known: true, present: false };
   assert.deepEqual(taskManagerDoctorRows(healthyFixture({ platform: "linux" })), []);
-  assert.deepEqual(taskManagerDoctorRows(healthyFixture({
-    markerState: { known: true, exists: false, enabled: false, state: "missing" },
-    service: {
-      installed: false,
-      loaded: false,
-      state: "stopped",
-      canonical: false,
-      healthy: false,
-      pid: null,
-      listener: "absent",
-    },
-    components: {
-      task: absent,
-      wrapper: absent,
-      launcher: absent,
-      shortcut: absent,
-      process: absent,
-    },
+  assert.deepEqual(taskManagerDoctorRows(absentFixture()), []);
+  assert.deepEqual(taskManagerDoctorRows(absentFixture({
+    markerState: { known: true, exists: true, enabled: false, state: "disabled" },
+    routerMode: "embedded",
   })), []);
+});
+
+test("missing or disabled markers still diagnose every independent installation signal", () => {
+  const signals = [
+    ["standalone Router", { routerMode: "standalone" }],
+    ["manager health", {
+      health: { ok: true, service: "codex-router-task-manager", mode: "standalone", pid: 4111 },
+    }],
+    ["listener", { service: { ...absentFixture().service, listener: "foreign" } }],
+    ["protected config", { configExists: true }],
+    ["unprotected config", {
+      configExists: true,
+      privateState: { ...absentFixture().privateState, config: false, callerKey },
+    }],
+  ];
+  for (const markerState of [
+    { known: true, exists: false, enabled: false, state: "missing" },
+    { known: true, exists: true, enabled: false, state: "disabled" },
+  ]) {
+    for (const [name, signal] of signals) {
+      const rows = taskManagerDoctorRows(absentFixture({ markerState, ...signal }));
+      assert.equal(rows.length, 4, `${markerState.state}/${name}`);
+      assertRow(rows, "Task Manager service", "fail");
+      assertRow(rows, "Task Manager health", "fail");
+      assertRow(rows, "Task Manager privacy", "fail");
+      assertRow(rows, "Task Manager topology", "fail");
+      assert.doesNotMatch(JSON.stringify(rows), /4111|C:\\\\|_codex-router|sentinel|TEST_DOCTOR/i);
+    }
+  }
+});
+
+test("N/A requires complete, well-formed absence evidence", () => {
+  for (const malformed of [
+    { service: { ...absentFixture().service, listener: undefined } },
+    { service: { ...absentFixture().service, state: "running" } },
+    { service: { ...absentFixture().service, healthy: true } },
+    { health: {} },
+    { routerMode: "malformed" },
+    { components: { ...absentFixture().components, task: undefined } },
+    { configExists: undefined },
+  ]) {
+    assert.equal(taskManagerDoctorRows(absentFixture(malformed)).length, 4);
+  }
 });
 
 test("missing, malformed, and disabled markers fail closed for every manager component", () => {
@@ -99,11 +156,11 @@ test("missing, malformed, and disabled markers fail closed for every manager com
     process: absent,
   };
   const evidence = [
-    ["installed", { service: { ...healthyFixture().service, installed: true, loaded: false, state: "ready", healthy: false, pid: null } }],
-    ["running", { service: { ...healthyFixture().service, installed: true, loaded: true, state: "running" } }],
+    ["installed", { service: { ...absentFixture().service, installed: true, state: "ready" } }],
+    ["running", { service: { ...absentFixture().service, installed: true, loaded: true, state: "running" } }],
     ...["task", "wrapper", "launcher", "shortcut", "process"].map((name) => [
       name,
-      { service: { installed: false, loaded: false, state: "stopped", canonical: false, healthy: false, pid: null, listener: "absent" }, components: { ...emptyComponents, [name]: present } },
+      { components: { ...emptyComponents, [name]: present } },
     ]),
   ];
   for (const state of ["missing", "malformed", "disabled"]) {
@@ -113,7 +170,7 @@ test("missing, malformed, and disabled markers fail closed for every manager com
         ? { known: true, exists: true, enabled: false, state }
         : { known: false, exists: true, enabled: false, state };
     for (const [name, overrides] of evidence) {
-      const rows = taskManagerDoctorRows(healthyFixture({
+      const rows = taskManagerDoctorRows(absentFixture({
         markerState,
         components: emptyComponents,
         ...overrides,
@@ -200,5 +257,6 @@ test("doctor reads standalone topology only through protected control health", (
   assert.match(source, /import \{ readControlHealth \} from "\.\/control-health\.mjs"/);
   assert.match(source, /await readControlHealth\(\)/);
   assert.match(source, /routerMode:\s*protectedHealth\.taskManagerMode/);
+  assert.match(source, /configExists:\s*existsSync\(TASK_MANAGER_CONFIG_PATH\)/);
   assert.doesNotMatch(source, /routerMode:\s*health\.payload\?\.taskManagerMode/);
 });

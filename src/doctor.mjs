@@ -1185,6 +1185,7 @@ if (process.platform === "win32") {
     service: managerInstall?.manager,
     health: await taskManagerHealth(),
     components: managerInstall?.components,
+    configExists: existsSync(TASK_MANAGER_CONFIG_PATH),
     privateState: {
       caller: privateFileIsProtected(CALLER_SECRET_PATH),
       marker: privateFileIsProtected(TASK_MANAGER_STANDALONE_PATH),
