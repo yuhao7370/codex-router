@@ -53,3 +53,12 @@ test("usage panel persists only a valid selected range", () => {
   assert.match(source, /localStorage\.setItem\(RANGE_STORAGE_KEY,\s*next\)/);
   assert.match(source, /setRange\(range\)/);
 });
+
+test("usage panel queues the latest range selected during an active load", () => {
+  const source = readFileSync(path.join(root, "src", "usage-panel.js"), "utf8");
+  assert.match(source, /let reloadPending\s*=\s*false/);
+  assert.match(source, /const requestedRange\s*=\s*range/);
+  assert.match(source, /if \(requestedRange === range\) render\(data\)/);
+  assert.match(source, /if \(reloadPending\) \{[\s\S]*reloadPending = false;[\s\S]*return load\(\)/);
+  assert.match(source, /if \(loading\) reloadPending = true;[\s\S]*load\(\)/);
+});

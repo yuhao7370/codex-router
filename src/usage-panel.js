@@ -258,15 +258,22 @@
     }
 
     let loading = false;
+    let reloadPending = false;
     async function load() {
       if (loading) return;
       loading = true;
+      const requestedRange = range;
       try {
-        render(await api("api/usage?range=" + encodeURIComponent(range)));
+        const data = await api("api/usage?range=" + encodeURIComponent(requestedRange));
+        if (requestedRange === range) render(data);
       } catch (error) {
         // Keep the last snapshot on transient failures.
       }
       loading = false;
+      if (reloadPending) {
+        reloadPending = false;
+        return load();
+      }
     }
 
     function setRange(next) {
@@ -281,6 +288,7 @@
       const label = RANGE_NAMES[next];
       q('[data-role="tokens-label"]').textContent = "总 Token（" + label + "）";
       q('[data-role="cost-label"]').textContent = "等效成本（" + label + "）";
+      if (loading) reloadPending = true;
       load();
     }
 
