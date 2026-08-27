@@ -227,10 +227,23 @@ export function startTaskManagerUi({
     return runtimeRefresh ? { ...status, runtimeRefresh } : status;
   };
   let accountRead = null;
+  const readAccountsWithRetry = async () => {
+    let lastError;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        return await listAccounts();
+      } catch (error) {
+        lastError = error;
+        if (Number.isInteger(error?.status) && error.status < 500) throw error;
+        if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+    }
+    throw lastError;
+  };
   const readAccounts = () => {
     if (accountRead) return accountRead;
     accountRead = Promise.resolve()
-      .then(() => listAccounts())
+      .then(readAccountsWithRetry)
       .finally(() => { accountRead = null; });
     return accountRead;
   };

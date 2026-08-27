@@ -186,6 +186,43 @@ test("concurrent account and usage reads share one CTM account request", async (
   }
 });
 
+test("account reads retry transient CTM failures but not client errors", async () => {
+  let transientReads = 0;
+  const transient = await start({
+    mode: "standalone",
+    callerSecret: CALLER_KEY,
+    listAccounts: async () => {
+      transientReads += 1;
+      if (transientReads < 3) throw new Error("ECONNRESET");
+      return { accounts: [] };
+    },
+    ...dependencies(),
+  });
+  try {
+    assert.equal((await fetch(`${transient.origin}/api/accounts`)).status, 200);
+    assert.equal(transientReads, 3);
+  } finally {
+    await close(transient.server);
+  }
+
+  let clientReads = 0;
+  const clientError = await start({
+    mode: "standalone",
+    callerSecret: CALLER_KEY,
+    listAccounts: async () => {
+      clientReads += 1;
+      throw Object.assign(new Error("unauthorized"), { status: 401 });
+    },
+    ...dependencies(),
+  });
+  try {
+    assert.equal((await fetch(`${clientError.origin}/api/accounts`)).status, 500);
+    assert.equal(clientReads, 1);
+  } finally {
+    await close(clientError.server);
+  }
+});
+
 test("standalone POST routes require same-origin JSON before service control", async () => {
   const deps = dependencies();
   const { server, origin } = await start({
