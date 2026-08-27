@@ -4,7 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { MIMEType } from "node:util";
 
-import { authenticatedRoute } from "./caller-auth.mjs";
+import { CALLER_PATH_PREFIX, authenticatedRoute } from "./caller-auth.mjs";
 import {
   activeAccount,
   clearBlockedAccount,
@@ -262,7 +262,9 @@ export function startTaskManagerUi({
       const route = standalone
         ? authenticated?.startsWith("/task-manager")
           ? authenticated.slice("/task-manager".length) || "/"
-          : undefined
+          : url.pathname.startsWith(`${CALLER_PATH_PREFIX}/`)
+            ? undefined
+            : url.pathname
         : authenticated;
       if (route === undefined) {
         return sendJson(response, 401, { error: "caller capability required" });

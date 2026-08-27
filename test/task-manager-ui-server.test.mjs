@@ -93,7 +93,7 @@ async function close(server) {
   await new Promise((resolve) => server.close(resolve));
 }
 
-test("standalone routes require the caller capability and send hardened responses", async () => {
+test("standalone serves the full bare panel and keeps capability URLs compatible", async () => {
   const deps = dependencies();
   const { server, origin } = await start({
     mode: "standalone",
@@ -116,7 +116,16 @@ test("standalone routes require the caller capability and send hardened response
     assert.equal(health.headers.get("x-content-type-options"), "nosniff");
     assert.equal(health.headers.get("access-control-allow-origin"), null);
 
-    assert.equal((await fetch(`${origin}/`)).status, 401);
+    const barePage = await fetch(`${origin}/`);
+    assert.equal(barePage.status, 200);
+    assert.equal(barePage.headers.get("cache-control"), "no-store");
+    const bareHtml = await barePage.text();
+    for (const match of bareHtml.matchAll(/(?:href|src)=["']([^"']+)["']/g)) {
+      const asset = new URL(match[1], `${origin}/`);
+      assert.equal((await fetch(asset)).status, 200, asset.pathname);
+    }
+    assert.equal((await fetch(`${origin}/api/status`)).status, 200);
+
     const capabilityUrl = `${origin}${taskManagerPath(CALLER_KEY)}`;
     const page = await fetch(capabilityUrl);
     assert.equal(page.status, 200);
@@ -147,7 +156,7 @@ test("standalone POST routes require same-origin JSON before service control", a
     callerSecret: CALLER_KEY,
     ...deps,
   });
-  const restartUrl = `${origin}${taskManagerPath(CALLER_KEY)}api/router/restart`;
+  const restartUrl = `${origin}/api/router/restart`;
 
   try {
     const refused = [
