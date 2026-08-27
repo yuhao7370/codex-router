@@ -662,10 +662,34 @@ test("installer rollback undoes only what the run created", () => {
 test("the Windows Codex installer commits the Task Manager transaction and restores embedded health on rollback", () => {
   const windows = readScript("install.ps1");
   const transaction = windows.indexOf("src/task-manager-install.mjs install");
+  const transactionGuard = windows.indexOf(
+    'if ($LASTEXITCODE -ne 0) { throw "Background-service installation failed." }',
+    transaction,
+  );
+  const serviceCommit = windows.indexOf("$ServiceInstalled = $true", transaction);
+  const taskManagerCommit = windows.indexOf("$TaskManagerInstalled = $true", transaction);
+  const codexBranchEnd = windows.indexOf("} else {", transaction);
   const legacyServiceInstall = windows.indexOf("src/service.mjs install", transaction);
+  const legacyGuard = windows.indexOf(
+    'if ($LASTEXITCODE -ne 0) { throw "Background-service installation failed." }',
+    legacyServiceInstall,
+  );
+  const legacyCommit = windows.indexOf("$ServiceInstalled = $true", legacyServiceInstall);
   const success = windows.indexOf("Installed the selected external model routes.");
   assert.ok(transaction >= 0, "the Windows Codex path must call the manager transaction");
+  assert.ok(transactionGuard > transaction, "transaction failure must be checked before state is committed");
+  assert.ok(serviceCommit > transactionGuard, "Router service state must commit only after transaction success");
+  assert.ok(taskManagerCommit > transactionGuard, "Task Manager state must commit only after transaction success");
+  assert.ok(serviceCommit < codexBranchEnd, "Router service state must commit in the successful Codex arm");
+  assert.ok(taskManagerCommit < codexBranchEnd, "Task Manager state must commit in the successful Codex arm");
   assert.ok(legacyServiceInstall > transaction, "other targets must retain the low-level Router install arm");
+  assert.ok(legacyGuard > legacyServiceInstall, "legacy service failure must be checked before state is committed");
+  assert.ok(legacyCommit > legacyGuard, "legacy Router state must commit only after service-install success");
+  assert.equal(
+    windows.indexOf("$ServiceInstalled = $true"),
+    serviceCommit,
+    "a failed Codex preflight must leave the Router uninstall guard false",
+  );
   assert.ok(success > transaction, "success output must follow the committed manager transaction");
   assert.match(
     windows,

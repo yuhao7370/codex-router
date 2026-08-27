@@ -488,14 +488,16 @@ try {
   & node @ConfigArguments
   if ($LASTEXITCODE -ne 0) { throw "$Target configuration update failed." }
   $AdoptionPending = $false
-  $ServiceInstalled = $true
   if ($Target -eq "codex") {
     & node src/task-manager-install.mjs install
-    if ($LASTEXITCODE -eq 0) { $TaskManagerInstalled = $true }
+    if ($LASTEXITCODE -ne 0) { throw "Background-service installation failed." }
+    $ServiceInstalled = $true
+    $TaskManagerInstalled = $true
   } else {
     & node src/service.mjs install
+    if ($LASTEXITCODE -ne 0) { throw "Background-service installation failed." }
+    $ServiceInstalled = $true
   }
-  if ($LASTEXITCODE -ne 0) { throw "Background-service installation failed." }
   # Record before the health wait, not after. The manifest is provenance for
   # the install that just happened -- which checkout owns the state, and the
   # proxy environment a later repair must restore -- and the service is already
