@@ -145,25 +145,43 @@ test("manager health transition waits between a fast failure and one successful 
   assert.deepEqual(delays, [250]);
 });
 
-test("manager health transition bounds two worst-case probes to 90 seconds with no third call", async () => {
-  let now = 0;
-  let reads = 0;
-  const delays = [];
-  await assert.rejects(waitForManagerHealth({
-    readStatus: async () => {
-      reads += 1;
-      now += 45_000;
-      return { installed: true, canonical: true, healthy: false, state: "starting" };
-    },
-    now: () => now,
-    delay: async (milliseconds) => {
-      delays.push(milliseconds);
-      now += milliseconds;
-    },
-  }), /starting/i);
-  assert.equal(reads, 2);
-  assert.deepEqual(delays, []);
-  assert.ok(now <= 90_000);
+test("manager health transition reserves a full status budget and never starts a third probe", async () => {
+  {
+    let now = 0;
+    let reads = 0;
+    await assert.rejects(waitForManagerHealth({
+      readStatus: async () => {
+        reads += 1;
+        now += 44_000;
+        return { installed: true, canonical: true, healthy: false, state: "starting" };
+      },
+      now: () => now,
+      delay: async () => assert.fail("insufficient retry budget must not wait"),
+    }), /starting/i);
+    assert.equal(reads, 1);
+    assert.equal(now, 44_000);
+  }
+
+  {
+    let now = 0;
+    let reads = 0;
+    const delays = [];
+    await assert.rejects(waitForManagerHealth({
+      readStatus: async () => {
+        reads += 1;
+        if (reads === 2) now += 60_000;
+        return { installed: true, canonical: true, healthy: false, state: "starting" };
+      },
+      now: () => now,
+      delay: async (milliseconds) => {
+        delays.push(milliseconds);
+        now += milliseconds;
+      },
+    }), /starting/i);
+    assert.equal(reads, 2);
+    assert.deepEqual(delays, [250]);
+    assert.ok(now <= 90_000);
+  }
 });
 
 test("install commits in the fixed manager-before-Router order", async () => {

@@ -52,8 +52,8 @@ const ROUTER_TASK_NAME = "Codex Router";
 const PROBE_TIMEOUT_MS = 3_000;
 const HEALTH_TIMEOUT_MS = 300_000;
 const MANAGER_HEALTH_TIMEOUT_MS = 90_000;
-// One status call can spend 15s querying the task, then 2x15s probing PowerShell hosts.
-const MANAGER_STATUS_TIMEOUT_MS = 45_000;
+// One status call can spend 15s each on task and process identity, then 2x15s on listener hosts.
+const MANAGER_STATUS_TIMEOUT_MS = 60_000;
 const POLL_MS = 250;
 const MAX_HTTP_BODY_BYTES = 64 * 1024;
 const CREATED_COMPONENT_KEYS = Object.freeze([
