@@ -257,23 +257,24 @@
       }
     }
 
-    let loading = false;
-    let reloadPending = false;
+    let loadController = null;
+    let loadRequestId = 0;
     async function load() {
-      if (loading) return;
-      loading = true;
+      const requestId = ++loadRequestId;
+      loadController?.abort();
+      const controller = new AbortController();
+      loadController = controller;
       const requestedRange = range;
       try {
-        const data = await api("api/usage?range=" + encodeURIComponent(requestedRange));
-        if (requestedRange === range) render(data);
+        const data = await api(
+          "api/usage?range=" + encodeURIComponent(requestedRange),
+          { signal: controller.signal },
+        );
+        if (requestId === loadRequestId && requestedRange === range) render(data);
       } catch (error) {
-        // Keep the last snapshot on transient failures.
+        // Keep the last snapshot on cancellation or transient failure.
       }
-      loading = false;
-      if (reloadPending) {
-        reloadPending = false;
-        return load();
-      }
+      if (requestId === loadRequestId) loadController = null;
     }
 
     function setRange(next) {
@@ -288,7 +289,6 @@
       const label = RANGE_NAMES[next];
       q('[data-role="tokens-label"]').textContent = "总 Token（" + label + "）";
       q('[data-role="cost-label"]').textContent = "等效成本（" + label + "）";
-      if (loading) reloadPending = true;
       load();
     }
 
@@ -362,6 +362,7 @@
       setRange: setRange,
       destroy: function () {
         clearTimeout(timer);
+        loadController?.abort();
       },
     };
   }

@@ -42,3 +42,14 @@ test("overview keeps Router service first and combines account with failover", (
   assert.ok(router < proxy && proxy < account && account < quota);
   assert.match(stats.slice(account, quota), /id=["']active-account["'][\s\S]*id=["']failover-badge["'][\s\S]*id=["']failover-last["']/);
 });
+
+test("initial load reuses status, loads independent data in parallel, and delays polling", () => {
+  const html = readFileSync(path.join(root, "src", "task-manager-ui.html"), "utf8");
+  assert.match(html, /async function loadStatus\(status\)[\s\S]*status \|\|= await api\(["']api\/status["']\)/);
+  assert.match(html, /await loadStatus\(status\)/);
+  assert.match(html, /await Promise\.all\(\[[\s\S]*loadAccounts\(\)[\s\S]*loadRouterService\(\)/);
+  assert.match(html, /function schedulePolls\(\)[\s\S]*setTimeout\(pollLog, logIntervalMs\)[\s\S]*setTimeout\(pollAccounts, accountsIntervalMs\)/);
+  const boot = html.match(/async function boot\(\) \{[\s\S]*?\n  \}/)?.[0] || "";
+  assert.match(boot, /schedulePolls\(\)/);
+  assert.doesNotMatch(boot, /\bpollLog\(\);[\s\S]*\bpollAccounts\(\);/);
+});

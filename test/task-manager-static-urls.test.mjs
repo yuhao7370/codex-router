@@ -54,11 +54,14 @@ test("usage panel persists only a valid selected range", () => {
   assert.match(source, /setRange\(range\)/);
 });
 
-test("usage panel queues the latest range selected during an active load", () => {
+test("usage panel cancels stale loads and renders only the latest selected range", () => {
   const source = readFileSync(path.join(root, "src", "usage-panel.js"), "utf8");
-  assert.match(source, /let reloadPending\s*=\s*false/);
+  assert.match(source, /let loadController\s*=\s*null/);
+  assert.match(source, /let loadRequestId\s*=\s*0/);
+  assert.match(source, /loadController\?\.abort\(\)/);
+  assert.match(source, /const requestId\s*=\s*\+\+loadRequestId/);
   assert.match(source, /const requestedRange\s*=\s*range/);
-  assert.match(source, /if \(requestedRange === range\) render\(data\)/);
-  assert.match(source, /if \(reloadPending\) \{[\s\S]*reloadPending = false;[\s\S]*return load\(\)/);
-  assert.match(source, /if \(loading\) reloadPending = true;[\s\S]*load\(\)/);
+  assert.match(source, /signal:\s*controller\.signal/);
+  assert.match(source, /if \(requestId === loadRequestId && requestedRange === range\) render\(data\)/);
+  assert.doesNotMatch(source, /reloadPending/);
 });

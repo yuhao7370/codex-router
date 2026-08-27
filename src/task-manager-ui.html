@@ -552,8 +552,8 @@
     throw new Error('无法识别格式（需要 auth.json 或 sub2api 导出）');
   }
 
-  async function loadStatus() {
-    const status = await api('api/status');
+  async function loadStatus(status) {
+    status ||= await api('api/status');
     el('enabled-badge').textContent = status.enabled ? '已启用' : '未启用';
     el('enabled-badge').className = 'badge ' + (status.enabled ? 'on' : 'off');
     const headerStatus = el('header-status');
@@ -892,6 +892,15 @@
     accountsTimer = setTimeout(pollAccounts, accountsIntervalMs);
   }
 
+  function schedulePolls() {
+    clearTimeout(logTimer);
+    clearTimeout(accountsTimer);
+    logNextAt = Date.now() + logIntervalMs;
+    accountsNextAt = Date.now() + accountsIntervalMs;
+    logTimer = setTimeout(pollLog, logIntervalMs);
+    accountsTimer = setTimeout(pollAccounts, accountsIntervalMs);
+  }
+
   function tickCountdown() {
     const now = Date.now();
     el('log-countdown').textContent = Math.max(0, Math.ceil((logNextAt - now) / 1000)) + 's';
@@ -914,10 +923,7 @@
       el('log-interval-input').value = String(Math.round(logIntervalMs / 1000));
       el('accounts-interval-input').value = String(Math.round(accountsIntervalMs / 1000));
       el('usage-interval-input').value = String(Math.round(usageIntervalMs / 1000));
-      clearTimeout(logTimer);
-      clearTimeout(accountsTimer);
-      pollLog();
-      pollAccounts();
+      schedulePolls();
     } catch (error) {
       setResult('test-result', false, '保存轮询间隔失败：' + error.message);
     }
@@ -991,8 +997,9 @@
   });
 
   async function boot() {
+    let status;
     try {
-      const status = await api('api/status');
+      status = await api('api/status');
       currentPool = new Set(
         status.pool && Array.isArray(status.pool.ids) ? status.pool.ids : [],
       );
@@ -1008,12 +1015,14 @@
       applyUsagePanelVisible(showUsagePanel);
       el('capacity-toggle').checked = status.capacityRetry !== false;
       el('capacity-attempts-input').value = String(status.capacityRetryAttempts || 5);
+      await loadStatus(status);
     } catch (error) {}
-    await loadAccounts();
-    await loadStatus();
-    await loadRouterService();
-    pollLog();
-    pollAccounts();
+    await Promise.all([
+      loadAccounts(),
+      loadRouterService(),
+      status ? Promise.resolve() : loadStatus(),
+    ]);
+    schedulePolls();
   }
   boot().catch(function (error) { setResult('test-result', false, '加载失败：' + error.message); });
   setInterval(tickCountdown, 1000);
