@@ -86,7 +86,7 @@ function childError(script, command, result) {
   );
 }
 
-function runNodeCommand(script, command) {
+function runNodeCommand(script, command, { timeoutMs } = {}) {
   const result = spawnSync(
     process.execPath,
     [path.join(SOURCE_ROOT, "src", script), command],
@@ -96,6 +96,7 @@ function runNodeCommand(script, command) {
       env: process.env,
       windowsHide: true,
       stdio: ["ignore", "pipe", "pipe"],
+      ...(timeoutMs === undefined ? {} : { timeout: timeoutMs }),
     },
   );
   if (result.error) throw result.error;
@@ -251,7 +252,9 @@ export async function classifyTaskManagerPortOwner({
 }
 
 export async function waitForManagerHealth({
-  readStatus = taskManagerServiceStatus,
+  readStatus = (timeoutMs) => runNodeCommand(
+    "task-manager-service.mjs", "status", { timeoutMs },
+  ),
   timeoutMs = MANAGER_HEALTH_TIMEOUT_MS,
   now = Date.now,
   delay = sleep,
@@ -259,9 +262,12 @@ export async function waitForManagerHealth({
   const deadline = now() + timeoutMs;
   let last;
   for (let attempt = 0; attempt < 2; attempt += 1) {
-    last = await readStatus();
+    const remaining = deadline - now();
+    if (remaining <= 0 || (attempt > 0 && remaining < MANAGER_STATUS_TIMEOUT_MS)) break;
+    last = await readStatus(Math.min(MANAGER_STATUS_TIMEOUT_MS, remaining));
     if (
-      last?.installed === true
+      now() <= deadline
+      && last?.installed === true
       && last.canonical === true
       && last.healthy === true
     ) {

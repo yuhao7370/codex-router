@@ -149,9 +149,11 @@ test("manager health transition reserves a full status budget and never starts a
   {
     let now = 0;
     let reads = 0;
+    const probeTimeouts = [];
     await assert.rejects(waitForManagerHealth({
-      readStatus: async () => {
+      readStatus: async (timeoutMs) => {
         reads += 1;
+        probeTimeouts.push(timeoutMs);
         now += 25_000;
         return { installed: true, canonical: true, healthy: false, state: "starting" };
       },
@@ -160,15 +162,18 @@ test("manager health transition reserves a full status budget and never starts a
     }), /starting/i);
     assert.equal(reads, 1);
     assert.equal(now, 25_000);
+    assert.deepEqual(probeTimeouts, [65_000]);
   }
 
   {
     let now = 0;
     let reads = 0;
     const delays = [];
+    const probeTimeouts = [];
     await assert.rejects(waitForManagerHealth({
-      readStatus: async () => {
+      readStatus: async (timeoutMs) => {
         reads += 1;
+        probeTimeouts.push(timeoutMs);
         if (reads === 2) now += 65_000;
         return { installed: true, canonical: true, healthy: false, state: "starting" };
       },
@@ -180,8 +185,38 @@ test("manager health transition reserves a full status budget and never starts a
     }), /starting/i);
     assert.equal(reads, 2);
     assert.deepEqual(delays, [250]);
+    assert.deepEqual(probeTimeouts, [65_000, 65_000]);
     assert.equal(now, 65_250);
   }
+});
+
+test("manager health transition rechecks its deadline after a late poll timer", async () => {
+  let now = 0;
+  let reads = 0;
+  await assert.rejects(waitForManagerHealth({
+    readStatus: async () => {
+      reads += 1;
+      return { installed: true, canonical: true, healthy: false, state: "starting" };
+    },
+    now: () => now,
+    delay: async () => { now += 30_000; },
+  }), /starting/i);
+  assert.equal(reads, 1);
+});
+
+test("manager health transition rejects a healthy result returned after its deadline", async () => {
+  let now = 0;
+  const probeTimeouts = [];
+  await assert.rejects(waitForManagerHealth({
+    readStatus: async (timeoutMs) => {
+      probeTimeouts.push(timeoutMs);
+      now += 90_001;
+      return { installed: true, canonical: true, healthy: true, state: "running" };
+    },
+    now: () => now,
+    delay: async () => assert.fail("an expired transition must not wait"),
+  }), /running/i);
+  assert.deepEqual(probeTimeouts, [65_000]);
 });
 
 test("install commits in the fixed manager-before-Router order", async () => {
