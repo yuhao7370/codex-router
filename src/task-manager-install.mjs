@@ -51,7 +51,7 @@ const RECOGNIZED_PORT_OWNERS = new Set(["absent", "embedded", "standalone"]);
 const ROUTER_TASK_NAME = "Codex Router";
 const PROBE_TIMEOUT_MS = 3_000;
 const HEALTH_TIMEOUT_MS = 300_000;
-const MANAGER_HEALTH_TIMEOUT_MS = 30_000;
+const MANAGER_HEALTH_TIMEOUT_MS = 90_000;
 const POLL_MS = 250;
 const MAX_HTTP_BODY_BYTES = 64 * 1024;
 const CREATED_COMPONENT_KEYS = Object.freeze([
@@ -248,11 +248,13 @@ export async function classifyTaskManagerPortOwner({
   return "unknown";
 }
 
-async function waitForManagerHealth({
+export async function waitForManagerHealth({
   readStatus = taskManagerServiceStatus,
   timeoutMs = MANAGER_HEALTH_TIMEOUT_MS,
+  now = Date.now,
+  delay = sleep,
 } = {}) {
-  const deadline = Date.now() + timeoutMs;
+  const deadline = now() + timeoutMs;
   let last;
   do {
     last = await readStatus();
@@ -263,10 +265,10 @@ async function waitForManagerHealth({
     ) {
       return last;
     }
-    const remaining = deadline - Date.now();
+    const remaining = deadline - now();
     if (remaining <= 0) break;
-    await sleep(Math.min(POLL_MS, remaining));
-  } while (Date.now() <= deadline);
+    await delay(Math.min(POLL_MS, remaining));
+  } while (now() <= deadline);
   throw new Error(`The standalone Task Manager did not become healthy (${last?.state || "unknown"}).`);
 }
 

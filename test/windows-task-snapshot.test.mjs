@@ -25,6 +25,7 @@ const XML_BYTES = Buffer.concat([
   Buffer.from([0xff, 0xfe]),
   Buffer.from(XML, "utf16le"),
 ]);
+const LIVE_PIPE_XML = '<?xml version="1.0" encoding="UTF-16"?><Task><Command>C:\\Launcher.vbs</Command></Task>\r\n';
 const SDDL = "D:P(A;;FA;;;SY)(A;;FA;;;OW)";
 const FILE_SDDL = "D:P(A;;FA;;;OW)";
 
@@ -248,6 +249,69 @@ test("the real schtasks runner boundary returns UTF-16 XML bytes without decodin
   assert.equal(output.subarray(0, 2).toString("hex"), "fffe");
 });
 
+test("snapshot normalizes the live BOM-less UTF-8 pipe shape to declared UTF-16LE", async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "codex-router-live-task-xml-"));
+  const runners = windowsRunners({ taskXml: Buffer.from(LIVE_PIPE_XML, "utf8") });
+  try {
+    const snapshot = await snapshotWindowsTask({
+      taskName: TASK_NAME,
+      files: [],
+      stateDir: path.join(root, "state"),
+      platform: "win32",
+      ...runners,
+    });
+    assert.equal(snapshot.xml.subarray(0, 2).toString("hex"), "fffe");
+    assert.equal(snapshot.xml.subarray(2).toString("utf16le"), LIVE_PIPE_XML);
+
+    await restoreWindowsTask(snapshot);
+    const restored = runners.calls.find(({ kind }) => kind === "created-xml")?.bytes;
+    assert.equal(restored.subarray(0, 2).toString("hex"), "fffe");
+    assert.equal(restored.subarray(2).toString("utf16le"), LIVE_PIPE_XML);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("snapshot preserves already BOM-marked UTF-16 task XML byte-for-byte", async () => {
+  const utf16be = Buffer.from([0xfe, 0xff, 0x00, 0x3c, 0x00, 0x54, 0x00, 0x61, 0x00, 0x73, 0x00, 0x6b, 0x00, 0x2f, 0x00, 0x3e]);
+  for (const taskXml of [XML_BYTES, utf16be]) {
+    const root = mkdtempSync(path.join(os.tmpdir(), "codex-router-bom-task-xml-"));
+    try {
+      const snapshot = await snapshotWindowsTask({
+        taskName: TASK_NAME,
+        files: [],
+        stateDir: path.join(root, "state"),
+        platform: "win32",
+        ...windowsRunners({ taskXml }),
+      });
+      assert.deepEqual(snapshot.xml, taskXml);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("snapshot refuses malformed or differently declared BOM-less task XML", async () => {
+  for (const taskXml of [
+    Buffer.from('<?xml version="1.0" encoding="UTF-8"?><Task/>', "utf8"),
+    Buffer.from('<?xml version="1.0"?><Task/>', "utf8"),
+    Buffer.from([0x3c, 0x3f, 0x78, 0x6d, 0x6c, 0xff]),
+  ]) {
+    const root = mkdtempSync(path.join(os.tmpdir(), "codex-router-invalid-task-xml-"));
+    try {
+      await assert.rejects(snapshotWindowsTask({
+        taskName: TASK_NAME,
+        files: [],
+        stateDir: path.join(root, "state"),
+        platform: "win32",
+        ...windowsRunners({ taskXml }),
+      }), /encoding|UTF-16|XML/i);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+});
+
 test("snapshot creation and restoration share one maximum byte boundary", async () => {
   const root = mkdtempSync(path.join(os.tmpdir(), "codex-router-large-task-snapshot-"));
   try {
@@ -413,7 +477,10 @@ test("native XML and SDDL validation fails before every mutation", async () => {
   for (const fixture of [
     {
       name: "xml",
-      taskXml: Buffer.from("<Task><broken></Task>", "utf8"),
+      taskXml: Buffer.concat([
+        Buffer.from([0xff, 0xfe]),
+        Buffer.from("<Task><broken></Task>", "utf16le"),
+      ]),
       taskSddl: SDDL,
       error: new Error("XML syntax invalid"),
     },

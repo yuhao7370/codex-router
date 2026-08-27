@@ -11,6 +11,7 @@ import {
   runTaskManagerInstall,
   taskManagerInstallStatus,
   verifyEmbeddedTaskManager,
+  waitForManagerHealth,
   windowsTaskManagerPortOwner,
 } from "../src/task-manager-install.mjs";
 
@@ -119,6 +120,27 @@ function transactionDeps({
     },
   };
 }
+
+test("manager health transition allows a bounded 90-second status budget", async () => {
+  let now = 1_000;
+  const delays = [];
+  let reads = 0;
+  await assert.rejects(waitForManagerHealth({
+    readStatus: async () => {
+      reads += 1;
+      now += 30_100;
+      return { installed: true, canonical: true, healthy: false, state: "starting" };
+    },
+    now: () => now,
+    delay: async (milliseconds) => {
+      delays.push(milliseconds);
+      now += milliseconds;
+    },
+  }), /starting/i);
+  assert.equal(reads, 3);
+  assert.deepEqual(delays, [250, 250]);
+  assert.equal(now, 91_800);
+});
 
 test("install commits in the fixed manager-before-Router order", async () => {
   const fixture = transactionDeps();

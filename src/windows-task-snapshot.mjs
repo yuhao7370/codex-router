@@ -32,6 +32,25 @@ function validSha256(value) {
   return typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
 }
 
+function normalizeTaskXml(xml) {
+  if (
+    (xml[0] === 0xff && xml[1] === 0xfe)
+    || (xml[0] === 0xfe && xml[1] === 0xff)
+  ) return xml;
+
+  let text;
+  try {
+    text = new TextDecoder("utf-8", { fatal: true }).decode(xml);
+  } catch (error) {
+    throw new Error("Task Scheduler XML has no UTF-16 BOM and is not valid UTF-8.", { cause: error });
+  }
+  const declaration = text.match(/^<\?xml\s+[^?]*\?>/)?.[0];
+  if (!declaration || !/^<\?xml\s+version\s*=\s*(?:"1\.[01]"|'1\.[01]')\s+encoding\s*=\s*(?:"UTF-16"|'UTF-16')(?:\s+standalone\s*=\s*(?:"(?:yes|no)"|'(?:yes|no)'))?\s*\?>$/i.test(declaration)) {
+    throw new Error("Task Scheduler XML without a UTF-16 BOM must have a valid UTF-16 XML declaration.");
+  }
+  return Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(text, "utf16le")]);
+}
+
 export function runSchtasksCommand(args, options = {}) {
   if (
     options.mutating
@@ -440,19 +459,23 @@ export async function snapshotWindowsTask({
     const metadata = parseTaskMetadata(invokePowerShell(taskMetadataScript(), {
       env: { ...process.env, CODEX_ROUTER_TASK: taskName },
     }));
-    const xml = metadata.exists
+    const rawXml = metadata.exists
       ? invokeSchtasks(["/Query", "/TN", taskName, "/XML"], {
           timeout: COMMAND_TIMEOUT_MS,
         })
       : null;
-    if (metadata.exists && !Buffer.isBuffer(xml)) {
+    if (metadata.exists && !Buffer.isBuffer(rawXml)) {
       throw new Error("Task Scheduler XML must be captured as raw bytes.");
     }
     if (
       metadata.exists
-      && (xml.length < 1 || xml.length > MAX_WINDOWS_TASK_SNAPSHOT_BYTES)
+      && (rawXml.length < 1 || rawXml.length > MAX_WINDOWS_TASK_SNAPSHOT_BYTES)
     ) {
       throw new Error("Task Scheduler XML exceeds the snapshot maximum.");
+    }
+    const xml = metadata.exists ? normalizeTaskXml(rawXml) : null;
+    if (metadata.exists && xml.length > MAX_WINDOWS_TASK_SNAPSHOT_BYTES) {
+      throw new Error("Normalized Task Scheduler XML exceeds the snapshot maximum.");
     }
     if (metadata.exists) writePrivateFile(path.join(directory, "task.xml"), xml);
     const xmlSha256 = metadata.exists ? sha256(xml) : null;
