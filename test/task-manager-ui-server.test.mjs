@@ -149,6 +149,43 @@ test("standalone serves the full bare panel and keeps capability URLs compatible
   }
 });
 
+test("concurrent account and usage reads share one CTM account request", async () => {
+  let release;
+  let started;
+  let reads = 0;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const firstRead = new Promise((resolve) => { started = resolve; });
+  const deps = dependencies();
+  const { server, origin } = await start({
+    mode: "standalone",
+    callerSecret: CALLER_KEY,
+    listAccounts: async () => {
+      reads += 1;
+      started();
+      await gate;
+      return { accounts: [] };
+    },
+    ...deps,
+  });
+
+  try {
+    const accounts = fetch(`${origin}/api/accounts`);
+    await Promise.race([
+      firstRead,
+      new Promise((_, reject) => setTimeout(() => reject(new Error("injected account read did not start")), 500)),
+    ]);
+    const usage = fetch(`${origin}/api/usage?range=today`);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(reads, 1);
+    release();
+    assert.deepEqual((await Promise.all([accounts, usage])).map((response) => response.status), [200, 200]);
+    assert.equal(reads, 1);
+  } finally {
+    release();
+    await close(server);
+  }
+});
+
 test("standalone POST routes require same-origin JSON before service control", async () => {
   const deps = dependencies();
   const { server, origin } = await start({

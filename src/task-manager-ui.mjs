@@ -197,6 +197,7 @@ export function startTaskManagerUi({
   callerSecret,
   runtimeClient,
   serviceController,
+  listAccounts = listTaskManagerAccounts,
   restartRouter,
   quiet = false,
   syncPricing = syncModelsDevPricing,
@@ -224,6 +225,14 @@ export function startTaskManagerUi({
     const runtimeRefresh = await refreshRuntime();
     const status = await readStatus();
     return runtimeRefresh ? { ...status, runtimeRefresh } : status;
+  };
+  let accountRead = null;
+  const readAccounts = () => {
+    if (accountRead) return accountRead;
+    accountRead = Promise.resolve()
+      .then(() => listAccounts())
+      .finally(() => { accountRead = null; });
+    return accountRead;
   };
   const scheduleRouterRestart = () => {
     const timer = setTimeout(() => {
@@ -313,7 +322,7 @@ export function startTaskManagerUi({
         let currentAccounts = [];
         let ctmReachable = false;
         try {
-          const accounts = await listTaskManagerAccounts();
+          const accounts = await readAccounts();
           ctmReachable = true;
           currentAccounts = Array.isArray(accounts?.accounts) ? accounts.accounts : [];
           for (const account of currentAccounts) {
@@ -447,7 +456,7 @@ export function startTaskManagerUi({
         return sendJson(response, 200, await testTaskManagerConnection());
       }
       if (request.method === "GET" && route === "/api/accounts") {
-        return sendJson(response, 200, await listTaskManagerAccounts());
+        return sendJson(response, 200, await readAccounts());
       }
       if (request.method === "POST" && route === "/api/select") {
         const body = await readJsonBody(request);
