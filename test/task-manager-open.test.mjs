@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
+import path from "node:path";
 import test from "node:test";
 
+import { SOURCE_ROOT } from "../src/paths.mjs";
 import { openTaskManager } from "../src/task-manager-open.mjs";
 
 const CALLER_KEY = "test-task-manager-caller-capability-with-sufficient-length";
@@ -13,6 +15,121 @@ function response(status, body) {
     headers: body === undefined ? undefined : { "content-type": "application/json" },
   });
 }
+
+function htmlResponse(status = 200) {
+  return new Response("<!doctype html><title>Task Manager</title>", {
+    status,
+    headers: { "content-type": "text/html; charset=utf-8" },
+  });
+}
+
+test("POSIX embedded opens the responding HTML root without Windows ownership or caller capability", async () => {
+  const calls = [];
+  const result = await openTaskManager({
+    platform: "linux",
+    controlPort: CONTROL_PORT,
+    classifyOwner: async () => {
+      calls.push("windows-owner");
+      throw new Error("POSIX must not classify Windows ownership");
+    },
+    readCallerSecret: () => {
+      calls.push("caller-secret");
+      throw new Error("embedded mode must not need the caller capability");
+    },
+    fetchImpl: async (url) => String(url).endsWith("/health")
+      ? response(404, { error: "not found" })
+      : htmlResponse(),
+    openBrowser: async (url) => calls.push(["browser", url]),
+    writeOutput: () => {},
+  });
+
+  assert.deepEqual(result, { url: `${ORIGIN}/`, mode: "embedded" });
+  assert.deepEqual(calls, [["browser", `${ORIGIN}/`]]);
+});
+
+test("POSIX standalone-shaped public health refuses before caller capability or browser", async () => {
+  const calls = [];
+  await assert.rejects(openTaskManager({
+    platform: "darwin",
+    controlPort: CONTROL_PORT,
+    classifyOwner: async () => {
+      calls.push("windows-owner");
+      return "standalone";
+    },
+    readCallerSecret: () => {
+      calls.push("caller-secret");
+      return CALLER_KEY;
+    },
+    fetchImpl: async () => response(200, {
+      ok: true,
+      service: "codex-router-task-manager",
+      mode: "standalone",
+      pid: 123,
+    }),
+    openBrowser: async () => calls.push("browser"),
+    writeOutput: () => {},
+  }), /Windows|standalone|refus/i);
+  assert.deepEqual(calls, []);
+});
+
+test("Windows development embedded accepts the exact current-checkout listener without a task", async () => {
+  const calls = [];
+  const result = await openTaskManager({
+    platform: "win32",
+    controlPort: CONTROL_PORT,
+    ownerOptions: {
+      sourceRoot: SOURCE_ROOT,
+      stateDir: "C:/unused-router-state",
+      readPortOwner: async () => ({ known: true, pid: 4123 }),
+      readManagerHealth: async () => undefined,
+      readManagerTask: async () => ({ known: true, exists: false }),
+      readRouterTask: async () => ({ known: true, exists: false }),
+      readProcessCommandLine: () => `node.exe "${path.join(SOURCE_ROOT, "src", "router.mjs")}"`,
+      readManagerProcessState: () => undefined,
+    },
+    readCallerSecret: () => {
+      calls.push("caller-secret");
+      throw new Error("embedded mode must not need the caller capability");
+    },
+    fetchImpl: async () => htmlResponse(),
+    openBrowser: async (url) => calls.push(["browser", url]),
+    writeOutput: () => {},
+  });
+
+  assert.deepEqual(result, { url: `${ORIGIN}/`, mode: "embedded" });
+  assert.deepEqual(calls, [["browser", `${ORIGIN}/`]]);
+});
+
+test("default Windows ownership refuses spoofed standalone health before caller capability or browser", async () => {
+  const calls = [];
+  await assert.rejects(openTaskManager({
+    platform: "win32",
+    controlPort: CONTROL_PORT,
+    ownerOptions: {
+      sourceRoot: SOURCE_ROOT,
+      stateDir: "C:/unused-router-state",
+      readPortOwner: async () => ({ known: true, pid: 9001 }),
+      readManagerHealth: async () => ({
+        ok: true,
+        service: "codex-router-task-manager",
+        mode: "standalone",
+        pid: 9001,
+      }),
+      readManagerTask: async () => ({ known: true, exists: false }),
+      readRouterTask: async () => ({ known: true, exists: false }),
+      readProcessCommandLine: () => "node.exe C:/foreign/router.mjs",
+      readManagerProcessState: () => undefined,
+    },
+    readCallerSecret: () => {
+      calls.push("caller-secret");
+      return CALLER_KEY;
+    },
+    fetchImpl: async () => htmlResponse(),
+    openBrowser: async () => calls.push("browser"),
+    writeOutput: () => {},
+  }), /owned|recognized Router installation/i);
+  assert.deepEqual(calls, []);
+});
 
 test("standalone health opens the capability URL without printing the capability", async () => {
   const opened = [];
@@ -53,7 +170,7 @@ test("an embedded root is opened when health is absent", async () => {
     },
     fetchImpl: async (url) => {
       requested.push(String(url));
-      return String(url).endsWith("/health") ? response(404) : response(200);
+      return String(url).endsWith("/health") ? response(404) : htmlResponse();
     },
     openBrowser: async (url) => opened.push(url),
     writeOutput: () => {},
@@ -72,7 +189,7 @@ test("non-manager health falls back to a responding embedded root", async () => 
     readCallerSecret: () => CALLER_KEY,
     fetchImpl: async (url) => String(url).endsWith("/health")
       ? response(200, { ok: true, service: "codex-router", mode: "router" })
-      : response(200),
+      : htmlResponse(),
     openBrowser: async (url) => opened.push(url),
     writeOutput: () => {},
   });

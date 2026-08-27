@@ -186,6 +186,7 @@ export async function classifyTaskManagerPortOwner({
   sourceRoot = SOURCE_ROOT,
   stateDir = STATE_DIR,
   controlPort = TASK_MANAGER_CONTROL_PORT,
+  allowDevelopmentEmbedded = false,
 } = {}) {
   const owner = await readPortOwner({ port: controlPort, platform: "win32" });
   if (owner?.known !== true) return "unknown";
@@ -215,13 +216,28 @@ export async function classifyTaskManagerPortOwner({
     }
     return "unknown";
   }
+  const routerEntrypointMatches = commandLineHasExactEntrypoint(
+    readProcessCommandLine(owner.pid),
+    path.join(sourceRoot, "src", "router.mjs"),
+  );
   if (
     routerTask?.known === true
     && scheduledTaskDefinitionIsCanonical(routerTask, routerTaskAction({ stateDir }))
-    && commandLineHasExactEntrypoint(
-      readProcessCommandLine(owner.pid),
-      path.join(sourceRoot, "src", "router.mjs"),
+    && routerEntrypointMatches
+  ) {
+    return "embedded";
+  }
+  if (
+    allowDevelopmentEmbedded
+    && managerTask?.known === true
+    && managerTask.exists === false
+    && routerTask?.known === true
+    && routerTask.exists === false
+    && !(
+      managerHealth?.service === "codex-router-task-manager"
+      && managerHealth.mode === "standalone"
     )
+    && routerEntrypointMatches
   ) {
     return "embedded";
   }

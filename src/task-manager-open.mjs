@@ -46,7 +46,11 @@ async function standaloneHealth(fetchImpl, origin) {
 
 async function embeddedRootResponds(fetchImpl, origin) {
   try {
-    return (await fetchWithin(fetchImpl, `${origin}/`)).ok;
+    const response = await fetchWithin(fetchImpl, `${origin}/`);
+    return response.ok
+      && String(response.headers.get("content-type") || "")
+        .toLowerCase()
+        .startsWith("text/html");
   } catch {
     return false;
   }
@@ -58,12 +62,26 @@ export async function openTaskManager({
   printOnly = false,
   readCallerSecret = callerSecret,
   classifyOwner = classifyTaskManagerPortOwner,
+  ownerOptions = {},
+  platform = process.platform,
   controlPort = TASK_MANAGER_CONTROL_PORT,
   writeOutput = (value) => process.stdout.write(value),
   writeWarning = (value) => process.stderr.write(value),
 } = {}) {
   const origin = `http://127.0.0.1:${controlPort}`;
-  const mode = await classifyOwner({ controlPort });
+  let mode;
+  if (platform !== "win32") {
+    if (await standaloneHealth(fetchImpl, origin)) {
+      throw new Error("The standalone Task Manager is supported only on Windows; refusing to open it.");
+    }
+    mode = "embedded";
+  } else {
+    mode = await classifyOwner({
+      ...ownerOptions,
+      controlPort,
+      allowDevelopmentEmbedded: true,
+    });
+  }
   if (mode !== "standalone" && mode !== "embedded") {
     throw new Error(
       `Task Manager port ${controlPort} is not owned by a recognized Router installation; refusing to open it.`,
