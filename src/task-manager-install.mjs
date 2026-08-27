@@ -174,10 +174,9 @@ function commandLineHasExactEntrypoint(commandLine, entrypoint) {
     return value;
   });
   const executable = normalized(unquoted[0]).split("/").at(-1);
-  const entrypointIndex = unquoted.findIndex((token) => normalized(token) === expected);
   return (executable === "node" || executable === "node.exe")
-    && entrypointIndex > 0
-    && unquoted.slice(1, entrypointIndex).every((token) => token.startsWith("-"));
+    && unquoted.length === 2
+    && normalized(unquoted[1]) === expected;
 }
 
 export async function classifyTaskManagerPortOwner({

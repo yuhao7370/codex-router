@@ -23,6 +23,19 @@ function htmlResponse(status = 200) {
   });
 }
 
+function developmentOwnerOptions(commandLine) {
+  return {
+    sourceRoot: SOURCE_ROOT,
+    stateDir: "C:/unused-router-state",
+    readPortOwner: async () => ({ known: true, pid: 4123 }),
+    readManagerHealth: async () => undefined,
+    readManagerTask: async () => ({ known: true, exists: false }),
+    readRouterTask: async () => ({ known: true, exists: false }),
+    readProcessCommandLine: () => commandLine,
+    readManagerProcessState: () => undefined,
+  };
+}
+
 test("POSIX embedded opens the responding HTML root without Windows ownership or caller capability", async () => {
   const calls = [];
   const result = await openTaskManager({
@@ -95,32 +108,31 @@ test("POSIX refuses non-2xx standalone-shaped health before HTML-root fallback",
   assert.deepEqual(calls, []);
 });
 
-test("Windows development embedded accepts the exact current-checkout listener without a task", async () => {
+test("Windows development embedded accepts quoted and unquoted direct node entrypoints", async () => {
   const calls = [];
-  const result = await openTaskManager({
-    platform: "win32",
-    controlPort: CONTROL_PORT,
-    ownerOptions: {
-      sourceRoot: SOURCE_ROOT,
-      stateDir: "C:/unused-router-state",
-      readPortOwner: async () => ({ known: true, pid: 4123 }),
-      readManagerHealth: async () => undefined,
-      readManagerTask: async () => ({ known: true, exists: false }),
-      readRouterTask: async () => ({ known: true, exists: false }),
-      readProcessCommandLine: () => `node.exe "${path.join(SOURCE_ROOT, "src", "router.mjs")}"`,
-      readManagerProcessState: () => undefined,
-    },
-    readCallerSecret: () => {
-      calls.push("caller-secret");
-      throw new Error("embedded mode must not need the caller capability");
-    },
-    fetchImpl: async () => htmlResponse(),
-    openBrowser: async (url) => calls.push(["browser", url]),
-    writeOutput: () => {},
-  });
-
-  assert.deepEqual(result, { url: `${ORIGIN}/`, mode: "embedded" });
-  assert.deepEqual(calls, [["browser", `${ORIGIN}/`]]);
+  const router = path.join(SOURCE_ROOT, "src", "router.mjs");
+  for (const commandLine of [
+    `node.exe ${router}`,
+    `"C:/Program Files/nodejs/node.exe" "${router}"`,
+  ]) {
+    const result = await openTaskManager({
+      platform: "win32",
+      controlPort: CONTROL_PORT,
+      ownerOptions: developmentOwnerOptions(commandLine),
+      readCallerSecret: () => {
+        calls.push("caller-secret");
+        throw new Error("embedded mode must not need the caller capability");
+      },
+      fetchImpl: async () => htmlResponse(),
+      openBrowser: async (url) => calls.push(["browser", url]),
+      writeOutput: () => {},
+    });
+    assert.deepEqual(result, { url: `${ORIGIN}/`, mode: "embedded" });
+  }
+  assert.deepEqual(calls, [
+    ["browser", `${ORIGIN}/`],
+    ["browser", `${ORIGIN}/`],
+  ]);
 });
 
 test("Windows development embedded refuses an expected entrypoint passed to a foreign script", async () => {
@@ -128,17 +140,9 @@ test("Windows development embedded refuses an expected entrypoint passed to a fo
   await assert.rejects(openTaskManager({
     platform: "win32",
     controlPort: CONTROL_PORT,
-    ownerOptions: {
-      sourceRoot: SOURCE_ROOT,
-      stateDir: "C:/unused-router-state",
-      readPortOwner: async () => ({ known: true, pid: 4123 }),
-      readManagerHealth: async () => undefined,
-      readManagerTask: async () => ({ known: true, exists: false }),
-      readRouterTask: async () => ({ known: true, exists: false }),
-      readProcessCommandLine: () =>
-        `node.exe C:/foreign/evil.mjs "${path.join(SOURCE_ROOT, "src", "router.mjs")}"`,
-      readManagerProcessState: () => undefined,
-    },
+    ownerOptions: developmentOwnerOptions(
+      `node.exe C:/foreign/evil.mjs "${path.join(SOURCE_ROOT, "src", "router.mjs")}"`,
+    ),
     readCallerSecret: () => {
       calls.push("caller-secret");
       return CALLER_KEY;
@@ -149,6 +153,30 @@ test("Windows development embedded refuses an expected entrypoint passed to a fo
   }), /owned|recognized Router installation/i);
   assert.deepEqual(calls, []);
 });
+
+for (const [label, commandLine] of [
+  ["--import option-value bypass", `node.exe --import "${path.join(SOURCE_ROOT, "src", "router.mjs")}" C:/foreign/evil.mjs`],
+  ["--require option-value bypass", `node.exe --require "${path.join(SOURCE_ROOT, "src", "router.mjs")}" C:/foreign/evil.mjs`],
+  ["a generic Node flag", `node.exe --trace-warnings "${path.join(SOURCE_ROOT, "src", "router.mjs")}"`],
+  ["trailing foreign arguments", `node.exe "${path.join(SOURCE_ROOT, "src", "router.mjs")}" C:/foreign/evil.mjs`],
+]) {
+  test(`Windows development embedded refuses ${label}`, async () => {
+    const calls = [];
+    await assert.rejects(openTaskManager({
+      platform: "win32",
+      controlPort: CONTROL_PORT,
+      ownerOptions: developmentOwnerOptions(commandLine),
+      readCallerSecret: () => {
+        calls.push("caller-secret");
+        return CALLER_KEY;
+      },
+      fetchImpl: async () => htmlResponse(),
+      openBrowser: async () => calls.push("browser"),
+      writeOutput: () => {},
+    }), /owned|recognized Router installation/i);
+    assert.deepEqual(calls, []);
+  });
+}
 
 test("default Windows ownership refuses spoofed standalone health before caller capability or browser", async () => {
   const calls = [];
