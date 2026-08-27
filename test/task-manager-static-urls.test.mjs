@@ -43,3 +43,13 @@ test("task manager assets emit only capability-relative browser URLs", () => {
     assert.match(source, /request\.body === undefined/, file);
   }
 });
+
+test("usage panel persists only a valid selected range", () => {
+  const source = readFileSync(path.join(root, "src", "usage-panel.js"), "utf8");
+  assert.match(source, /RANGE_STORAGE_KEY\s*=\s*["']usage-range["']/);
+  assert.match(source, /Object\.hasOwn\(RANGE_NAMES,\s*value\)/);
+  assert.match(source, /localStorage\.getItem\(RANGE_STORAGE_KEY\)/);
+  assert.match(source, /validRange\(savedRange\)/);
+  assert.match(source, /localStorage\.setItem\(RANGE_STORAGE_KEY,\s*next\)/);
+  assert.match(source, /setRange\(range\)/);
+});

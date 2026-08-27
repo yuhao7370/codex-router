@@ -54,6 +54,8 @@
     "30d": "30 天",
     "90d": "90 天",
   };
+  const RANGE_STORAGE_KEY = "usage-range";
+  const validRange = (value) => Object.hasOwn(RANGE_NAMES, value);
 
   const STYLES = `
 .usage-app { font: 14px/1.6 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; color: #161d2b; }
@@ -154,8 +156,12 @@
         : function () {
             return options.pollIntervalMs || 5000;
           };
-    const defaultRange = options.defaultRange || "90d";
+    const defaultRange = validRange(options.defaultRange) ? options.defaultRange : "90d";
     let range = defaultRange;
+    try {
+      const savedRange = localStorage.getItem(RANGE_STORAGE_KEY);
+      if (validRange(savedRange)) range = savedRange;
+    } catch (error) {}
 
     injectStyles();
     root.classList.add("usage-app");
@@ -264,8 +270,11 @@
     }
 
     function setRange(next) {
-      if (!RANGE_NAMES[next]) return;
+      if (!validRange(next)) return;
       range = next;
+      try {
+        localStorage.setItem(RANGE_STORAGE_KEY, next);
+      } catch (error) {}
       root.querySelectorAll(".up-seg").forEach(function (seg) {
         seg.classList.toggle("active", seg.getAttribute("data-range") === next);
       });
@@ -297,7 +306,7 @@
       }
     });
 
-    setRange(defaultRange);
+    setRange(range);
 
     const detailToggle = q('[data-role="detail-toggle"]');
     const detailColumn = q('[data-role="detail"]');
