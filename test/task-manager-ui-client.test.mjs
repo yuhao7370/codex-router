@@ -28,3 +28,17 @@ test("task manager UI exposes guarded Router lifecycle controls", () => {
   assert.match(html, /routerOperationPending/);
   assert.match(html, /\[['"]starting['"], ['"]stopping['"], ['"]restarting['"]\]/);
 });
+
+test("overview keeps Router service first and combines account with failover", () => {
+  const html = readFileSync(path.join(root, "src", "task-manager-ui.html"), "utf8");
+  const start = html.indexOf('<section class="stats">');
+  const stats = html.slice(start, html.indexOf("</section>", start));
+
+  assert.equal((stats.match(/class=["']card stat["']/g) || []).length, 4);
+  const router = stats.indexOf("Router 服务");
+  const proxy = stats.indexOf("代理状态");
+  const account = stats.indexOf("当前使用账号");
+  const quota = stats.indexOf("订阅 / 剩余额度");
+  assert.ok(router < proxy && proxy < account && account < quota);
+  assert.match(stats.slice(account, quota), /id=["']active-account["'][\s\S]*id=["']failover-badge["'][\s\S]*id=["']failover-last["']/);
+});

@@ -274,6 +274,16 @@
   </header>
 
   <section class="stats">
+    <div class="card stat" id="router-service-card" hidden>
+      <div class="stat-label">Router 服务</div>
+      <div class="stat-value"><span id="router-service-state" class="badge">状态异常</span></div>
+      <div class="stat-actions">
+        <button id="router-start-btn">启动</button>
+        <button class="ghost" id="router-stop-btn">停止</button>
+        <button class="ghost" id="router-restart-btn">重启</button>
+      </div>
+      <div id="router-operation-result" class="result" hidden></div>
+    </div>
     <div class="card stat">
       <div class="stat-label">代理状态</div>
       <div class="stat-value"><span id="enabled-badge" class="badge off">…</span></div>
@@ -288,28 +298,14 @@
     <div class="card stat">
       <div class="stat-label">当前使用账号</div>
       <div class="stat-value small" id="active-account">…</div>
-      <div class="stat-foot">未获取时自动回退原生登录</div>
+      <div class="stat-foot">故障自动切换：<span id="failover-badge" class="badge">…</span></div>
+      <div class="stat-foot">上次切换：<span id="failover-last">…</span> · 未获取账号时回退原生登录</div>
     </div>
     <div class="card stat">
       <div class="stat-label">订阅 / 剩余额度</div>
       <div class="stat-value" id="account-quota">…</div>
       <div class="quota-bar" id="quota-bar" hidden><div class="quota-fill" id="quota-fill" style="width:0%"></div></div>
       <div class="stat-foot">更新于 <span id="quota-updated">…</span></div>
-    </div>
-    <div class="card stat">
-      <div class="stat-label">故障自动切换</div>
-      <div class="stat-value"><span id="failover-badge" class="badge">…</span></div>
-      <div class="stat-foot">上次切换：<span id="failover-last">…</span></div>
-    </div>
-    <div class="card stat" id="router-service-card" hidden>
-      <div class="stat-label">Router 服务</div>
-      <div class="stat-value"><span id="router-service-state" class="badge">状态异常</span></div>
-      <div class="stat-actions">
-        <button id="router-start-btn">启动</button>
-        <button class="ghost" id="router-stop-btn">停止</button>
-        <button class="ghost" id="router-restart-btn">重启</button>
-      </div>
-      <div id="router-operation-result" class="result" hidden></div>
     </div>
   </section>
 
