@@ -295,6 +295,8 @@ test("snapshot refuses malformed or differently declared BOM-less task XML", asy
   for (const taskXml of [
     Buffer.from('<?xml version="1.0" encoding="UTF-8"?><Task/>', "utf8"),
     Buffer.from('<?xml version="1.0"?><Task/>', "utf8"),
+    Buffer.from('<?XML VERSION="1.0" encoding="UTF-16"?><Task/>', "utf8"),
+    Buffer.from('<?xml version="1.0" encoding="UTF-16" standalone="YES"?><Task/>', "utf8"),
     Buffer.from([0x3c, 0x3f, 0x78, 0x6d, 0x6c, 0xff]),
   ]) {
     const root = mkdtempSync(path.join(os.tmpdir(), "codex-router-invalid-task-xml-"));
@@ -309,6 +311,26 @@ test("snapshot refuses malformed or differently declared BOM-less task XML", asy
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
+  }
+});
+
+test("snapshot explicitly refuses UTF-8 BOM task XML", async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "codex-router-utf8-bom-task-xml-"));
+  try {
+    await assert.rejects(snapshotWindowsTask({
+      taskName: TASK_NAME,
+      files: [],
+      stateDir: path.join(root, "state"),
+      platform: "win32",
+      ...windowsRunners({
+        taskXml: Buffer.concat([
+          Buffer.from([0xef, 0xbb, 0xbf]),
+          Buffer.from(LIVE_PIPE_XML, "utf8"),
+        ]),
+      }),
+    }), /UTF-8 BOM/i);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
   }
 });
 

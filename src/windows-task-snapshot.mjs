@@ -37,6 +37,9 @@ function normalizeTaskXml(xml) {
     (xml[0] === 0xff && xml[1] === 0xfe)
     || (xml[0] === 0xfe && xml[1] === 0xff)
   ) return xml;
+  if (xml[0] === 0xef && xml[1] === 0xbb && xml[2] === 0xbf) {
+    throw new Error("Task Scheduler XML with a UTF-8 BOM is not the known BOM-less pipe shape.");
+  }
 
   let text;
   try {
@@ -45,7 +48,7 @@ function normalizeTaskXml(xml) {
     throw new Error("Task Scheduler XML has no UTF-16 BOM and is not valid UTF-8.", { cause: error });
   }
   const declaration = text.match(/^<\?xml\s+[^?]*\?>/)?.[0];
-  if (!declaration || !/^<\?xml\s+version\s*=\s*(?:"1\.[01]"|'1\.[01]')\s+encoding\s*=\s*(?:"UTF-16"|'UTF-16')(?:\s+standalone\s*=\s*(?:"(?:yes|no)"|'(?:yes|no)'))?\s*\?>$/i.test(declaration)) {
+  if (!declaration || !/^<\?xml\s+version\s*=\s*(?:"1\.[01]"|'1\.[01]')\s+encoding\s*=\s*(?:"UTF-16"|'UTF-16')(?:\s+standalone\s*=\s*(?:"(?:yes|no)"|'(?:yes|no)'))?\s*\?>$/.test(declaration)) {
     throw new Error("Task Scheduler XML without a UTF-16 BOM must have a valid UTF-16 XML declaration.");
   }
   return Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(text, "utf16le")]);

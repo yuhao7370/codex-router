@@ -121,14 +121,38 @@ function transactionDeps({
   };
 }
 
-test("manager health transition allows a bounded 90-second status budget", async () => {
-  let now = 1_000;
-  const delays = [];
+test("manager health transition returns immediately when the first probe is healthy", async () => {
   let reads = 0;
+  const healthy = { installed: true, canonical: true, healthy: true, state: "running" };
+  assert.equal(await waitForManagerHealth({
+    readStatus: async () => { reads += 1; return healthy; },
+    delay: async () => assert.fail("healthy status must not wait"),
+  }), healthy);
+  assert.equal(reads, 1);
+});
+
+test("manager health transition waits between a fast failure and one successful retry", async () => {
+  let reads = 0;
+  const delays = [];
+  const healthy = { installed: true, canonical: true, healthy: true, state: "running" };
+  assert.equal(await waitForManagerHealth({
+    readStatus: async () => (++reads === 1
+      ? { installed: true, canonical: true, healthy: false, state: "starting" }
+      : healthy),
+    delay: async (milliseconds) => delays.push(milliseconds),
+  }), healthy);
+  assert.equal(reads, 2);
+  assert.deepEqual(delays, [250]);
+});
+
+test("manager health transition bounds two worst-case probes to 90 seconds with no third call", async () => {
+  let now = 0;
+  let reads = 0;
+  const delays = [];
   await assert.rejects(waitForManagerHealth({
     readStatus: async () => {
       reads += 1;
-      now += 30_100;
+      now += 45_000;
       return { installed: true, canonical: true, healthy: false, state: "starting" };
     },
     now: () => now,
@@ -137,9 +161,9 @@ test("manager health transition allows a bounded 90-second status budget", async
       now += milliseconds;
     },
   }), /starting/i);
-  assert.equal(reads, 3);
-  assert.deepEqual(delays, [250, 250]);
-  assert.equal(now, 91_800);
+  assert.equal(reads, 2);
+  assert.deepEqual(delays, []);
+  assert.ok(now <= 90_000);
 });
 
 test("install commits in the fixed manager-before-Router order", async () => {
