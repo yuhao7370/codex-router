@@ -166,13 +166,18 @@ function normalized(value) {
 function commandLineHasExactEntrypoint(commandLine, entrypoint) {
   const expected = normalized(path.resolve(entrypoint));
   const tokens = String(commandLine || "").match(/"[^"]*"|'[^']*'|[^\s]+/g) || [];
-  return tokens.some((token) => {
-    const unquoted = token.length > 1 && (
+  const unquoted = tokens.map((token) => {
+    const value = token.length > 1 && (
       (token.startsWith('"') && token.endsWith('"'))
       || (token.startsWith("'") && token.endsWith("'"))
     ) ? token.slice(1, -1) : token;
-    return normalized(unquoted) === expected;
+    return value;
   });
+  const executable = normalized(unquoted[0]).split("/").at(-1);
+  const entrypointIndex = unquoted.findIndex((token) => normalized(token) === expected);
+  return (executable === "node" || executable === "node.exe")
+    && entrypointIndex > 0
+    && unquoted.slice(1, entrypointIndex).every((token) => token.startsWith("-"));
 }
 
 export async function classifyTaskManagerPortOwner({

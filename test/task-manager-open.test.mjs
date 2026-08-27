@@ -72,6 +72,29 @@ test("POSIX standalone-shaped public health refuses before caller capability or 
   assert.deepEqual(calls, []);
 });
 
+test("POSIX refuses non-2xx standalone-shaped health before HTML-root fallback", async () => {
+  const calls = [];
+  await assert.rejects(openTaskManager({
+    platform: "linux",
+    controlPort: CONTROL_PORT,
+    classifyOwner: async () => calls.push("windows-owner"),
+    readCallerSecret: () => {
+      calls.push("caller-secret");
+      return CALLER_KEY;
+    },
+    fetchImpl: async (url) => String(url).endsWith("/health")
+      ? response(503, {
+          ok: false,
+          service: "codex-router-task-manager",
+          mode: "standalone",
+        })
+      : htmlResponse(),
+    openBrowser: async () => calls.push("browser"),
+    writeOutput: () => {},
+  }), /Windows|standalone|refus/i);
+  assert.deepEqual(calls, []);
+});
+
 test("Windows development embedded accepts the exact current-checkout listener without a task", async () => {
   const calls = [];
   const result = await openTaskManager({
@@ -98,6 +121,33 @@ test("Windows development embedded accepts the exact current-checkout listener w
 
   assert.deepEqual(result, { url: `${ORIGIN}/`, mode: "embedded" });
   assert.deepEqual(calls, [["browser", `${ORIGIN}/`]]);
+});
+
+test("Windows development embedded refuses an expected entrypoint passed to a foreign script", async () => {
+  const calls = [];
+  await assert.rejects(openTaskManager({
+    platform: "win32",
+    controlPort: CONTROL_PORT,
+    ownerOptions: {
+      sourceRoot: SOURCE_ROOT,
+      stateDir: "C:/unused-router-state",
+      readPortOwner: async () => ({ known: true, pid: 4123 }),
+      readManagerHealth: async () => undefined,
+      readManagerTask: async () => ({ known: true, exists: false }),
+      readRouterTask: async () => ({ known: true, exists: false }),
+      readProcessCommandLine: () =>
+        `node.exe C:/foreign/evil.mjs "${path.join(SOURCE_ROOT, "src", "router.mjs")}"`,
+      readManagerProcessState: () => undefined,
+    },
+    readCallerSecret: () => {
+      calls.push("caller-secret");
+      return CALLER_KEY;
+    },
+    fetchImpl: async () => htmlResponse(),
+    openBrowser: async () => calls.push("browser"),
+    writeOutput: () => {},
+  }), /owned|recognized Router installation/i);
+  assert.deepEqual(calls, []);
 });
 
 test("default Windows ownership refuses spoofed standalone health before caller capability or browser", async () => {

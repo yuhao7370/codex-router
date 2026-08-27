@@ -31,14 +31,13 @@ async function fetchWithin(fetchImpl, url) {
   });
 }
 
-async function standaloneHealth(fetchImpl, origin) {
+async function standaloneHealth(fetchImpl, origin, { requireHealthy = true } = {}) {
   try {
     const response = await fetchWithin(fetchImpl, `${origin}/health`);
-    if (!response.ok) return false;
     const health = await response.json();
-    return health?.ok === true
-      && health.service === "codex-router-task-manager"
-      && health.mode === "standalone";
+    return health?.service === "codex-router-task-manager"
+      && health.mode === "standalone"
+      && (!requireHealthy || (response.ok && health.ok === true));
   } catch {
     return false;
   }
@@ -71,7 +70,7 @@ export async function openTaskManager({
   const origin = `http://127.0.0.1:${controlPort}`;
   let mode;
   if (platform !== "win32") {
-    if (await standaloneHealth(fetchImpl, origin)) {
+    if (await standaloneHealth(fetchImpl, origin, { requireHealthy: false })) {
       throw new Error("The standalone Task Manager is supported only on Windows; refusing to open it.");
     }
     mode = "embedded";
