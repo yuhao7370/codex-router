@@ -16,6 +16,7 @@ import {
 
 function canonicalTask(action, overrides = {}) {
   const currentUser = "EXAMPLE\\operator";
+  const currentSid = "S-1-5-21-1000-1000-1000-1001";
   return {
     known: true,
     exists: true,
@@ -23,6 +24,9 @@ function canonicalTask(action, overrides = {}) {
     actionCount: 1,
     action,
     currentUser,
+    currentSid,
+    principalSid: currentSid,
+    triggerSid: currentSid,
     principal: { userId: currentUser, logonType: "interactive", runLevel: "limited" },
     triggerCount: 1,
     trigger: { type: "MSFT_TaskLogonTrigger", userId: currentUser, enabled: true },
@@ -476,7 +480,7 @@ test("main Router preflight accepts missing or canonical tasks and refuses drift
   await assert.rejects(assertRouterTaskReplaceable({
     stateDir,
     queryTask: async () => canonicalTask(routerTask(stateDir).action, {
-      trigger: { ...routerTask(stateDir).trigger, userId: "EXAMPLE\\other" },
+      triggerSid: "S-1-5-21-1000-1000-1000-9999",
     }),
   }), /noncanonical.*Codex Router/i);
 });
@@ -512,7 +516,7 @@ test("Windows port-owner probe is bounded, UTF-8, and fail-closed", () => {
   });
   assert.deepEqual(result, { known: true, pid: 4242 });
   assert.equal(invocation.options.encoding, "utf8");
-  assert.ok(invocation.options.timeout > 0);
+  assert.equal(invocation.options.timeout, 15_000);
   assert.match(invocation.args.at(-1), /OutputEncoding.*UTF8/);
   assert.match(invocation.args.at(-1), /Get-NetTCPConnection/);
   assert.match(invocation.args.at(-1), /4111|CODEX_ROUTER_CONTROL_PORT/);

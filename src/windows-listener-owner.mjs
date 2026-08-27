@@ -2,7 +2,7 @@ import { spawnSync } from "node:child_process";
 
 import { TASK_MANAGER_CONTROL_PORT } from "./paths.mjs";
 
-const QUERY_TIMEOUT_MS = 5_000;
+const QUERY_TIMEOUT_MS = 15_000;
 const MAX_OUTPUT_BYTES = 64 * 1024;
 
 export function windowsLoopbackPortOwner({
