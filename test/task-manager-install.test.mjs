@@ -152,14 +152,14 @@ test("manager health transition reserves a full status budget and never starts a
     await assert.rejects(waitForManagerHealth({
       readStatus: async () => {
         reads += 1;
-        now += 44_000;
+        now += 25_000;
         return { installed: true, canonical: true, healthy: false, state: "starting" };
       },
       now: () => now,
       delay: async () => assert.fail("insufficient retry budget must not wait"),
     }), /starting/i);
     assert.equal(reads, 1);
-    assert.equal(now, 44_000);
+    assert.equal(now, 25_000);
   }
 
   {
@@ -169,7 +169,7 @@ test("manager health transition reserves a full status budget and never starts a
     await assert.rejects(waitForManagerHealth({
       readStatus: async () => {
         reads += 1;
-        if (reads === 2) now += 60_000;
+        if (reads === 2) now += 65_000;
         return { installed: true, canonical: true, healthy: false, state: "starting" };
       },
       now: () => now,
@@ -180,7 +180,7 @@ test("manager health transition reserves a full status budget and never starts a
     }), /starting/i);
     assert.equal(reads, 2);
     assert.deepEqual(delays, [250]);
-    assert.ok(now <= 90_000);
+    assert.equal(now, 65_250);
   }
 });
 

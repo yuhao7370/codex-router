@@ -507,10 +507,8 @@ export async function taskManagerServiceStatus({
     && processOwns(processState, { platform, sourceRoot, stateDir }),
   );
   const pid = owned ? processState.pid : null;
-  const [health, portOwner] = await Promise.all([
-    readHealth(),
-    readPortOwner({ port: controlPort, platform }),
-  ]);
+  const health = await readHealth();
+  const portOwner = await readPortOwner({ port: controlPort, platform });
   const listener = portOwner?.known !== true
     ? "unknown"
     : portOwner.pid === null

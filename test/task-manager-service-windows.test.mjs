@@ -260,6 +260,33 @@ test("status requires canonical task, owned process, and exact health identity",
   assert.equal(wrongIdentity.pid, 42);
 });
 
+test("status finishes the HTTP health probe before the blocking listener probe", async () => {
+  const calls = [];
+  const processState = { pid: 42 };
+  await taskManagerServiceStatus({
+    stateDir: "C:/state",
+    queryTask: async () => canonicalTask(taskAction({ stateDir: "C:/state" })),
+    readProcessState: () => processState,
+    processOwns: () => true,
+    readHealth: async () => {
+      calls.push("health-start");
+      await Promise.resolve();
+      calls.push("health-end");
+      return {
+        ok: true,
+        service: "codex-router-task-manager",
+        mode: "standalone",
+        pid: 42,
+      };
+    },
+    readPortOwner: () => {
+      calls.push("listener");
+      return { known: true, pid: 42 };
+    },
+  });
+  assert.deepEqual(calls, ["health-start", "health-end", "listener"]);
+});
+
 test("task canonicality covers principal, login trigger, recovery, power, and instance policy", () => {
   const action = taskAction({ stateDir: "C:/state" });
   const task = canonicalTask(action);

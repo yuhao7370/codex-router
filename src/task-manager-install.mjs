@@ -52,8 +52,8 @@ const ROUTER_TASK_NAME = "Codex Router";
 const PROBE_TIMEOUT_MS = 3_000;
 const HEALTH_TIMEOUT_MS = 300_000;
 const MANAGER_HEALTH_TIMEOUT_MS = 90_000;
-// One status call can spend 15s each on task and process identity, then 2x15s on listener hosts.
-const MANAGER_STATUS_TIMEOUT_MS = 60_000;
+// One status call can spend 15s each on task and process identity, 3s on health, then 2x15s on listener hosts.
+const MANAGER_STATUS_TIMEOUT_MS = 65_000;
 const POLL_MS = 250;
 const MAX_HTTP_BODY_BYTES = 64 * 1024;
 const CREATED_COMPONENT_KEYS = Object.freeze([
@@ -268,10 +268,8 @@ export async function waitForManagerHealth({
       return last;
     }
     if (attempt > 0) break;
-    const retrySlack = deadline - now() - MANAGER_STATUS_TIMEOUT_MS;
-    if (retrySlack < 0) break;
-    const waitMs = Math.min(POLL_MS, retrySlack);
-    if (waitMs > 0) await delay(waitMs);
+    if (deadline - now() < MANAGER_STATUS_TIMEOUT_MS + POLL_MS) break;
+    await delay(POLL_MS);
   }
   throw new Error(`The standalone Task Manager did not become healthy (${last?.state || "unknown"}).`);
 }
