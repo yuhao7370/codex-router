@@ -63,18 +63,42 @@ export function createRouterServiceController({
   let operation = null;
 
   const snapshot = async () => {
-    const [serviceResult, healthResult] = await Promise.allSettled([
-      readServiceStatus(),
-      readHealth(),
-    ]);
-    const service = serviceResult.status === "fulfilled" ? serviceResult.value : undefined;
-    const health = healthResult.status === "fulfilled" ? healthResult.value : { ok: false };
-    const serviceError = serviceResult.status === "rejected"
-      ? "Router service status unavailable."
-      : undefined;
-    const healthError = healthResult.status === "rejected"
-      ? "Router health unavailable."
-      : undefined;
+    if (operation) {
+      return {
+        state: routerServiceLifecycle({ operation }),
+        service: undefined,
+        health: undefined,
+        operation,
+        serviceError: undefined,
+        healthError: undefined,
+      };
+    }
+
+    let health = { ok: false };
+    let healthError;
+    try {
+      health = await readHealth() || health;
+    } catch {
+      healthError = "Router health unavailable.";
+    }
+    if (health.ok) {
+      return {
+        state: routerServiceLifecycle({ health, operation }),
+        service: undefined,
+        health,
+        operation,
+        serviceError: undefined,
+        healthError,
+      };
+    }
+
+    let service;
+    let serviceError;
+    try {
+      service = await readServiceStatus();
+    } catch {
+      serviceError = "Router service status unavailable.";
+    }
     const state = routerServiceLifecycle({ service, health, operation, serviceError, healthError });
     return { state, service, health, operation, serviceError, healthError };
   };

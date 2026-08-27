@@ -14,22 +14,43 @@ test("lifecycle distinguishes stopped, running, and unhealthy", () => {
   assert.equal(routerServiceLifecycle({ serviceError: "scheduler unavailable", health: { ok: false } }), "failed");
 });
 
+test("healthy Router status skips the slow service probe and unhealthy status falls back", async () => {
+  let healthy = true;
+  let serviceReads = 0;
+  const controller = createRouterServiceController({
+    readHealth: async () => ({ ok: healthy }),
+    readServiceStatus: async () => {
+      serviceReads += 1;
+      return { installed: true, loaded: true, state: "running" };
+    },
+  });
+
+  assert.equal((await controller.snapshot()).state, "running");
+  assert.equal(serviceReads, 0);
+  healthy = false;
+  assert.equal((await controller.snapshot()).state, "unhealthy");
+  assert.equal(serviceReads, 1);
+});
+
 test("service actions are allowlisted and overlap is rejected", async () => {
   let release;
+  let healthReads = 0;
   const running = new Promise((resolve) => { release = resolve; });
   const controller = createRouterServiceController({
     runServiceCommand: async () => running,
     readServiceStatus: async () => ({ installed: true, loaded: true, state: "running" }),
-    readHealth: async () => ({ ok: true }),
+    readHealth: async () => { healthReads += 1; return { ok: true }; },
   });
 
   const first = controller.perform("restart");
   assert.equal(controller.currentOperation()?.action, "restart");
   assert.equal((await controller.snapshot()).state, "restarting");
+  assert.equal(healthReads, 0);
   await assert.rejects(() => controller.perform("stop"), /already running/i);
   await assert.rejects(() => controller.perform("delete"), /unknown router service action/i);
   release();
   assert.equal((await first).state, "running");
+  assert.equal(healthReads, 1);
   assert.equal(controller.currentOperation(), null);
 });
 
