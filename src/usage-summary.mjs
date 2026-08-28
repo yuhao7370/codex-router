@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { closeSync, openSync, readFileSync, readSync, statSync } from "node:fs";
 
 import { USAGE_EVENTS_PATH } from "./paths.mjs";
 import { PROVIDERS } from "./model-registry.mjs";
@@ -73,16 +73,27 @@ function newEntry() {
 }
 
 let summary = null;
+let summaryOffset = 0;
+let summaryFileId;
+
+function fileId(stats) {
+  return `${stats.dev}:${stats.ino}`;
+}
 
 function buildSummary() {
   const target = { providers: new Map(), accounts: new Map() };
-  let raw = "";
+  let raw;
   try {
-    raw = readFileSync(USAGE_EVENTS_PATH, "utf8");
+    const stats = statSync(USAGE_EVENTS_PATH);
+    raw = readFileSync(USAGE_EVENTS_PATH);
+    summaryOffset = raw.length;
+    summaryFileId = fileId(stats);
   } catch {
+    summaryOffset = 0;
+    summaryFileId = undefined;
     return target;
   }
-  const tail = raw.split("\n").slice(-Math.max(1, REBUILD_LINE_LIMIT));
+  const tail = raw.toString("utf8").split("\n").slice(-Math.max(1, REBUILD_LINE_LIMIT));
   for (const line of tail) {
     if (!line) continue;
     let event;
@@ -99,6 +110,62 @@ function buildSummary() {
 function ensureSummary() {
   if (summary === null) summary = buildSummary();
   return summary;
+}
+
+function readAppendedBytes(start, length) {
+  const descriptor = openSync(USAGE_EVENTS_PATH, "r");
+  const buffer = Buffer.allocUnsafe(length);
+  let total = 0;
+  try {
+    while (total < length) {
+      const count = readSync(descriptor, buffer, total, length - total, start + total);
+      if (count === 0) break;
+      total += count;
+    }
+  } finally {
+    closeSync(descriptor);
+  }
+  return buffer.subarray(0, total);
+}
+
+function refreshSummaryFromDisk() {
+  let target = ensureSummary();
+  let stats;
+  try {
+    stats = statSync(USAGE_EVENTS_PATH);
+  } catch (error) {
+    if (error?.code === "ENOENT" && (summaryFileId !== undefined || summaryOffset !== 0)) {
+      summary = null;
+      target = ensureSummary();
+    }
+    return target;
+  }
+
+  if (fileId(stats) !== summaryFileId || stats.size < summaryOffset) {
+    summary = null;
+    return ensureSummary();
+  }
+  if (stats.size === summaryOffset) return target;
+
+  let appended;
+  try {
+    appended = readAppendedBytes(summaryOffset, stats.size - summaryOffset);
+  } catch {
+    return target;
+  }
+  const newline = appended.lastIndexOf(0x0a);
+  if (newline < 0) return target;
+  const complete = appended.subarray(0, newline + 1);
+  summaryOffset += complete.length;
+  for (const line of complete.toString("utf8").split(/\r?\n/)) {
+    if (!line) continue;
+    try {
+      mergeEvent(target, JSON.parse(line));
+    } catch {
+      // A malformed telemetry row is skipped exactly as it is during rebuild.
+    }
+  }
+  return target;
 }
 
 function mergeEvent(target, event) {
@@ -253,8 +320,14 @@ export function recordUsageSummaryEvent(event) {
   mergeEvent(ensureSummary(), event);
 }
 
+export function markUsageSummaryEventPersisted(byteLength) {
+  const bytes = Number(byteLength);
+  if (summary === null || !Number.isSafeInteger(bytes) || bytes <= 0) return;
+  summaryOffset += bytes;
+}
+
 export function usageSummarySnapshot({ range = "90d", now = Date.now() } = {}) {
-  const target = ensureSummary();
+  const target = refreshSummaryFromDisk();
   const { fromDay, toDay } = resolveRangeDays(range, now);
 
   const seed = new Map(

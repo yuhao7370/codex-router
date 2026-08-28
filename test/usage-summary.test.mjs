@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { appendFileSync, mkdtempSync, rmSync } from "node:fs";
+import { appendFileSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -134,6 +134,49 @@ test("summary rebuilds from the raw event log", async () => {
     snapshot.providers.find((provider) => provider.id === "openai").totalTokens,
     2708,
   );
+});
+
+test("summary ingests events appended after its initial snapshot", async () => {
+  resetRawLog();
+  const { summary } = await loadModules();
+  assert.equal(summary.usageSummarySnapshot({ range: "7d", now }).accounts.length, 0);
+
+  appendFileSync(eventsPath, `${JSON.stringify(events[0])}\n`, "utf8");
+  const account = summary
+    .usageSummarySnapshot({ range: "7d", now })
+    .accounts.find((entry) => entry.accountId === "acct-a");
+  assert.equal(account.totalTokens, 140);
+});
+
+test("a locally recorded persisted event is not counted again from disk", async () => {
+  resetRawLog();
+  const { summary } = await loadModules();
+  const line = `${JSON.stringify(events[0])}\n`;
+  summary.recordUsageSummaryEvent(events[0]);
+  appendFileSync(eventsPath, line, "utf8");
+  summary.markUsageSummaryEventPersisted(Buffer.byteLength(line));
+
+  const account = summary
+    .usageSummarySnapshot({ range: "7d", now })
+    .accounts.find((entry) => entry.accountId === "acct-a");
+  assert.equal(account.totalTokens, 140);
+});
+
+test("summary rebuilds when the usage log is replaced", async () => {
+  resetRawLog();
+  appendFileSync(eventsPath, `${JSON.stringify(events[0])}\n`, "utf8");
+  const { summary } = await loadModules();
+  assert.equal(
+    summary.usageSummarySnapshot({ range: "7d", now }).accounts[0].totalTokens,
+    140,
+  );
+
+  rmSync(eventsPath, { force: true });
+  writeFileSync(eventsPath, `${JSON.stringify(events[2])}\n`, "utf8");
+  const snapshot = summary.usageSummarySnapshot({ range: "7d", now });
+  assert.equal(snapshot.accounts.length, 1);
+  assert.equal(snapshot.accounts[0].accountId, "acct-b");
+  assert.equal(snapshot.accounts[0].totalTokens, 30);
 });
 
 test("summary drops days outside the requested window", async () => {

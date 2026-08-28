@@ -10,7 +10,10 @@ import path from "node:path";
 
 import { STATE_DIR, USAGE_EVENTS_PATH } from "./paths.mjs";
 import { canonicalProviderId } from "./provider-selection.mjs";
-import { recordUsageSummaryEvent } from "./usage-summary.mjs";
+import {
+  markUsageSummaryEventPersisted,
+  recordUsageSummaryEvent,
+} from "./usage-summary.mjs";
 import { acceptedInputTokens } from "./context-window-drift.mjs";
 
 export { USAGE_EVENTS_PATH };
@@ -238,6 +241,7 @@ export function recordUsageEvent({
       ? { toolResultBytesLargest: safeTokenCount(toolResultBytesLargest) }
       : {}),
   };
+  const serialized = `${JSON.stringify(event)}\n`;
   try {
     recordUsageSummaryEvent(event);
   } catch {
@@ -245,10 +249,11 @@ export function recordUsageEvent({
   }
   try {
     mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
-    appendFileSync(USAGE_EVENTS_PATH, `${JSON.stringify(event)}\n`, {
+    appendFileSync(USAGE_EVENTS_PATH, serialized, {
       encoding: "utf8",
       mode: 0o600,
     });
+    markUsageSummaryEventPersisted(Buffer.byteLength(serialized));
     chmodSync(USAGE_EVENTS_PATH, 0o600);
   } catch {
     // Usage telemetry must never interrupt or fail a model request.
