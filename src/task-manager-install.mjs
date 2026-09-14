@@ -200,11 +200,14 @@ export async function classifyTaskManagerPortOwner({
   if (owner.pid === null) return "absent";
   if (!Number.isSafeInteger(owner.pid) || owner.pid < 1) return "unknown";
 
-  const [managerHealth, managerTask, routerTask] = await Promise.all([
-    readManagerHealth(),
+  const [managerTask, routerTask] = await Promise.all([
     readManagerTask(),
     readRouterTask(),
   ]);
+  // Task Scheduler inspection uses synchronous PowerShell calls. Start the
+  // bounded HTTP probe afterwards so that work cannot exhaust its deadline
+  // while the event loop is unable to receive a healthy manager's response.
+  const managerHealth = await readManagerHealth();
   if (
     managerHealth?.ok === true
     && managerHealth.service === "codex-router-task-manager"

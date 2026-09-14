@@ -774,3 +774,37 @@ test("status exposes fail-closed component baselines instead of converting unkno
     process: { known: true, present: true },
   });
 });
+
+
+test("synchronous task inspection cannot consume the manager HTTP health deadline", async () => {
+  const http = await import("node:http");
+  const health = { ok: true, service: "codex-router-task-manager", mode: "standalone", pid: 52 };
+  const server = http.createServer((_request, response) => response.end(JSON.stringify(health)));
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const stateDir = "C:/Router State";
+  try {
+    const owner = await classifyTaskManagerPortOwner({
+      sourceRoot: "C:/Router", stateDir,
+      readPortOwner: async () => ({ known: true, pid: 52 }),
+      readManagerTask: async () => {
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 750);
+        return managerTask(stateDir);
+      },
+      readRouterTask: async () => routerTask(stateDir),
+      readManagerHealth: async () => {
+        try {
+          return await (await fetch("http://127.0.0.1:" + server.address().port + "/health", {
+            signal: AbortSignal.timeout(500),
+          })).json();
+        } catch { return undefined; }
+      },
+      readManagerProcessState: () => ({ pid: 52 }),
+      managerProcessOwns: () => true,
+      readProcessCommandLine: () => "unrelated",
+    });
+    assert.equal(owner, "standalone");
+  } finally {
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
