@@ -310,7 +310,7 @@ test("registry merges valid user models and skips collisions", async () => {
   // Historical user state keeps x-preview-f-free under its opaque id with curated suffix.
   assert.equal(
     registry.MODEL_BY_SLUG.get("opencode-free/x-preview-f-free").displayName,
-    "x-preview-f-free (curated)",
+    "x-preview-f-free",
   );
   assert.equal(registry.MODEL_SLUG_ALIASES.has("deepseek/deepseek-v4-pro"), false);
   assert.equal(registry.MODEL_BY_SLUG.get("deepseek/deepseek-v4-pro").provider, "deepseek");
@@ -421,4 +421,21 @@ test("a defaulted effort ladder is distinguishable from a chosen one", () => {
   );
   assert.equal(hasDefaultUserModelReasoning({}), false);
   assert.equal(hasDefaultUserModelReasoning(undefined), false);
+});
+
+
+test("new user models use the model name without a curation label", () => {
+  const entry = userModelEntry({ providerId: "local-router", upstreamId: "new-model", priority: 100 });
+  assert.equal(entry.displayName, "new-model");
+});
+
+
+test("legacy curation labels are cleaned without changing stored routing identities", () => {
+  const entry = userModelEntry({ providerId: "local-router", upstreamId: "legacy-model", priority: 100 });
+  writeUserModels([{ ...entry, displayName: "Legacy (curated)" }]);
+  const [model] = readUserModels();
+  assert.equal(model.displayName, "Legacy");
+  assert.equal(model.slug, entry.slug);
+  assert.equal(model.gatewayModel, entry.gatewayModel);
+  assert.equal(model.upstreamModel, entry.upstreamModel);
 });

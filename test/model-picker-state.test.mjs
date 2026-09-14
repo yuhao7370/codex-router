@@ -287,3 +287,23 @@ test("a migration still lands on a destination nobody has decided", () => {
   assert.equal(migrated.visible.includes(from), false);
   assert.equal(migrated.visible.includes(to), true);
 });
+
+
+test("new discoveries default visible once and respect explicit hides including legacy state", async () => {
+  const { seedModelsVisible } = await import("../src/model-picker-state.mjs");
+  const first = "local-router/new-auto-model";
+  const next = "local-router/later-auto-model";
+  seedModelsVisible([first]);
+  assert.ok(modelPickerSnapshot().visible.includes(first));
+  setModelVisible(first, false);
+  seedModelsVisible([first, next]);
+  assert.ok(readHiddenModels().has(first));
+  assert.ok(!modelPickerSnapshot().visible.includes(first));
+  assert.ok(modelPickerSnapshot().visible.includes(next));
+  const before = readFileSync(MODEL_PICKER_STATE_PATH, "utf8");
+  seedModelsVisible([first, next]);
+  assert.equal(readFileSync(MODEL_PICKER_STATE_PATH, "utf8"), before);
+  writeFileSync(MODEL_PICKER_STATE_PATH, JSON.stringify({ version: 1, hidden: ["local-router/hand-hidden"] }));
+  seedModelsVisible(["local-router/hand-hidden"]);
+  assert.ok(readHiddenModels().has("local-router/hand-hidden"));
+});

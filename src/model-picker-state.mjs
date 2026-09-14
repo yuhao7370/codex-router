@@ -333,3 +333,17 @@ export function seedModelsHidden(slugs) {
   }
   return writePickerState({ hidden, visible, seeded, hasExplicitVisibility });
 }
+
+// Auto-discovered local routes arrive on once. Any recorded choice, including
+// a legacy or hand-edited hide without a seeded entry, belongs to the user.
+export function seedModelsVisible(slugs) {
+  const { hidden, visible, seeded, hasExplicitVisibility } = readPickerState();
+  const fresh = [...new Set(slugs.map(String).filter(Boolean))]
+    .filter((slug) => !seeded.has(slug) && !hidden.has(slug) && !visible.has(slug));
+  if (fresh.length === 0) return modelPickerSnapshot();
+  for (const slug of fresh) {
+    visible.add(slug);
+    seeded.add(slug);
+  }
+  return writePickerState({ hidden, visible, seeded, hasExplicitVisibility });
+}

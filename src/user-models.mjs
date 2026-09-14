@@ -131,7 +131,7 @@ export function userModelEntry({ providerId, upstreamId, requestProfile, priorit
     upstreamModel: upstreamId,
     provider: providerId,
     listed: true,
-    displayName: officialModelDisplayName(providerId, upstreamId) || `${upstreamId} (curated)`,
+    displayName: officialModelDisplayName(providerId, upstreamId) || upstreamId,
     description: defaultUserModelDescription(providerId),
     priority,
     ...defaultUserModelReasoning(),
@@ -150,7 +150,11 @@ export function readUserModels() {
   if (!existsSync(USER_MODELS_PATH)) return [];
   try {
     const payload = JSON.parse(readFileSync(USER_MODELS_PATH, "utf8"));
-    return Array.isArray(payload?.models) ? payload.models : [];
+    return Array.isArray(payload?.models) ? payload.models.map((model) =>
+      typeof model?.displayName === "string"
+        ? { ...model, displayName: model.displayName.replace(/\s+\(curated\)$/, "") }
+        : model,
+    ) : [];
   } catch {
     return [];
   }

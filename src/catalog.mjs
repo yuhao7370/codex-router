@@ -46,6 +46,7 @@ import {
   modelPickerSnapshot,
   readHiddenModels,
   seedModelsHidden,
+  seedModelsVisible,
 } from "./model-picker-state.mjs";
 import { buildNativeAliasAssignments } from "./native-alias.mjs";
 import {
@@ -689,7 +690,7 @@ export function routedModel(template, model, behaviorTemplate = template) {
     base_instructions: behaviorInstructions,
     model_messages: behaviorModelMessages,
     slug: model.slug,
-    display_name: model.displayName,
+    display_name: model.displayName.replace(/\s+\(curated\)$/, ""),
     description: model.description,
     priority: model.priority,
     visibility: "list",
@@ -1004,6 +1005,12 @@ function behaviorTemplateFor(nativeModels, model, fallback) {
   return nativeModels.find((candidate) => candidate.slug === model.behaviorTemplate) || fallback;
 }
 
+function localRouterProtocolAlias(model, models) {
+  return model.provider === "local-router" && model.upstreamModel?.startsWith("anthropic/") &&
+    models.some((candidate) => candidate.provider === "local-router" &&
+      candidate.upstreamModel === model.upstreamModel.slice("anthropic/".length));
+}
+
 export function buildMergedCatalog(native, routedModelsList, { includeNative = true } = {}) {
   const template =
     native.models.find((model) => model.slug === "gpt-5.5") ||
@@ -1020,8 +1027,17 @@ export function buildMergedCatalog(native, routedModelsList, { includeNative = t
   const ordered = routedPickerPriorities(native.models, routedModelsList);
   const published = publishedPickerPriorities(native.models, ordered);
   for (const model of ordered) {
+    // Native identity and account metadata always own their original slug.
+    if (includeNative && native.models.some((entry) => entry.slug === model.slug)) continue;
     const behaviorTemplate = behaviorTemplateFor(native.models, model, template);
     const entry = routedModel(template, model, behaviorTemplate);
+    if (localRouterProtocolAlias(model, routedModelsList)) entry.visibility = "hide";
+    // Keep the external canonical route for existing tasks and forwarding,
+    // while the signed-in picker shows the authoritative native model once.
+    if (includeNative && model.provider === "local-router" &&
+        native.models.some((nativeModel) => nativeModel.slug === model.upstreamModel?.replace(/^anthropic\//, "") && nativeModel.visibility === "list")) {
+      entry.visibility = "hide";
+    }
     models.set(
       model.slug,
       published.has(model.slug) ? { ...entry, priority: published.get(model.slug) } : entry,
@@ -1068,7 +1084,8 @@ function publishedPickerPriorities(nativeModels, orderedRoutedModels) {
 export function buildLoginFreeCatalog(native, routedModelsList) {
   const configured = new Set(configuredProviderIds());
   const usableModels = routedModelsList.filter(
-    (model) => !model.provider || configured.has(model.provider),
+    (model) => (!model.provider || configured.has(model.provider)) &&
+      !localRouterProtocolAlias(model, routedModelsList),
   );
   const assignments = buildNativeAliasAssignments(native.models, usableModels);
   const aliasedSlugs = new Set(assignments.map(({ model }) => model.slug));
@@ -1135,6 +1152,7 @@ export function publishCatalog({ refreshNative = refresh, output = true } = {}) 
     [...MODEL_SLUG_ALIASES].map(([from, to]) => ({ from, to })),
   );
   migrateLegacyVisibleModels(routedSeedSlugs);
+  seedModelsVisible(selectedModels.filter((model) => model.provider === "local-router").map((model) => model.slug));
   seedModelsHidden([...NATIVE_CONTEXT_VARIANT_SLUGS, ...routedSeedSlugs]);
   const hiddenModels = readHiddenModels();
   const pickerState = modelPickerSnapshot();

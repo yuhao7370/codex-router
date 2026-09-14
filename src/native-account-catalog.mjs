@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 
-import { Agent, EnvHttpProxyAgent, fetch as undiciFetch } from "undici";
+import { Agent, EnvHttpProxyAgent, ProxyAgent, fetch as undiciFetch } from "undici";
 
 import { nativeAccountCatalogHeaders } from "./codex-native-session.mjs";
 import { codexVersion } from "./codex-binary.mjs";
@@ -12,6 +12,7 @@ import { writePrivateJsonAsync } from "./file-security.mjs";
 import { MODEL_BY_SLUG } from "./model-registry.mjs";
 import { MODELS_CACHE_PATH } from "./paths.mjs";
 import { environmentHttpProxyConfigured } from "./proxy-environment.mjs";
+import { parseNativeProxyUrl } from "./native-proxy.mjs";
 
 export const NATIVE_ACCOUNT_CATALOG_TTL_MS = 5 * 60_000;
 const MAX_ACCOUNT_CATALOG_BYTES = 32 * 1024 * 1024;
@@ -130,21 +131,29 @@ async function boundedJson(response, maxBytes = MAX_ACCOUNT_CATALOG_BYTES) {
   }
 }
 
-function accountCatalogDispatcher({
+export function accountCatalogDispatcher({
   environment = process.env,
   execArgv = process.execArgv,
   AgentClass = Agent,
   EnvHttpProxyAgentClass = EnvHttpProxyAgent,
+  ProxyAgentClass = ProxyAgent,
 } = {}) {
-  const DispatcherClass = environmentHttpProxyConfigured(environment, execArgv)
-    ? EnvHttpProxyAgentClass
-    : AgentClass;
-  return new DispatcherClass({
+  // Native refresh follows the same explicit proxy as native turns, without
+  // changing the process-wide dispatcher or any external provider's traffic.
+  const nativeProxy = String(environment.CODEX_ROUTER_NATIVE_PROXY_URL || "").trim();
+  const options = {
     allowH2: false,
     pipelining: 1,
     headersTimeout: ACCOUNT_CATALOG_TIMEOUT_MS,
     bodyTimeout: ACCOUNT_CATALOG_TIMEOUT_MS,
-  });
+  };
+  if (nativeProxy) {
+    return new ProxyAgentClass({ uri: parseNativeProxyUrl(nativeProxy), ...options });
+  }
+  const DispatcherClass = environmentHttpProxyConfigured(environment, execArgv)
+    ? EnvHttpProxyAgentClass
+    : AgentClass;
+  return new DispatcherClass(options);
 }
 
 /**

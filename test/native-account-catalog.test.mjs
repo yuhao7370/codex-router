@@ -3,8 +3,10 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { MockAgent } from "undici";
 
 import {
+  accountCatalogDispatcher,
   refreshNativeAccountCatalog,
 } from "../src/native-account-catalog.mjs";
 
@@ -15,6 +17,111 @@ const headersProvider = async () => ({
   "chatgpt-account-id": ACCOUNT,
 });
 const noLock = (operation) => operation();
+
+test("native account catalog gives the explicit native proxy priority over generic proxy settings", () => {
+  class CapturedProxy {
+    constructor(options) { this.options = options; }
+  }
+  class OtherDispatcher {}
+  const dispatcher = accountCatalogDispatcher({
+    environment: {
+      CODEX_ROUTER_NATIVE_PROXY_URL: " http://127.0.0.1:7897/path ",
+      NODE_USE_ENV_PROXY: "1",
+      HTTPS_PROXY: "http://127.0.0.1:9999",
+    },
+    execArgv: [],
+    ProxyAgentClass: CapturedProxy,
+    AgentClass: OtherDispatcher,
+    EnvHttpProxyAgentClass: OtherDispatcher,
+  });
+  assert.deepEqual(dispatcher.options, {
+    uri: "http://127.0.0.1:7897",
+    allowH2: false,
+    pipelining: 1,
+    headersTimeout: 5000,
+    bodyTimeout: 5000,
+  });
+});
+
+test("native account catalog retains generic proxy opt-in when no native proxy is configured", () => {
+  class Direct {}
+  class EnvironmentProxy {}
+  for (const [environment, expected] of [
+    [{}, Direct],
+    [{ HTTPS_PROXY: "http://127.0.0.1:9999" }, Direct],
+    [{ NODE_USE_ENV_PROXY: "1", HTTPS_PROXY: "http://127.0.0.1:9999" }, EnvironmentProxy],
+  ]) {
+    assert.ok(accountCatalogDispatcher({
+      environment,
+      execArgv: [],
+      AgentClass: Direct,
+      EnvHttpProxyAgentClass: EnvironmentProxy,
+    }) instanceof expected);
+  }
+});
+
+test("invalid native proxy fails without fetching or changing the cached account catalog", () =>
+  withCache(async (cachePath) => {
+    const contents = JSON.stringify(fixtureCache([{ slug: "gpt-stable" }]));
+    writeFileSync(cachePath, contents);
+    for (const proxy of ["socks5://localhost:7897", `http://user:${ACCESS}@localhost:7897`, "invalid"]) {
+      let constructed = false;
+      const forbidden = class {
+        constructor() {
+          constructed = true;
+          throw new Error("invalid native proxy reached a dispatcher");
+        }
+      };
+      const result = await refreshNativeAccountCatalog({
+        cachePath,
+        force: true,
+        version: "0.153.2",
+        headersProvider,
+        discoveryOff: () => false,
+        lock: noLock,
+        dispatcherFactory: () => accountCatalogDispatcher({
+          environment: { CODEX_ROUTER_NATIVE_PROXY_URL: proxy },
+          execArgv: [],
+          AgentClass: forbidden,
+          ProxyAgentClass: forbidden,
+          EnvHttpProxyAgentClass: forbidden,
+        }),
+      });
+      assert.equal(constructed, false);
+      assert.deepEqual(result, { status: "failed" });
+      assert.equal(readFileSync(cachePath, "utf8"), contents);
+    }
+  }));
+
+test("account refresh closes its scoped dispatcher after success and HTTP failure", () =>
+  withCache(async (cachePath) => {
+    for (const status of [200, 401]) {
+      const dispatcher = new MockAgent();
+      dispatcher.disableNetConnect();
+      const close = dispatcher.close.bind(dispatcher);
+      let closes = 0;
+      dispatcher.close = async () => { closes += 1; await close(); };
+      dispatcher.get("https://chatgpt.com").intercept({
+        path: "/backend-api/codex/models?client_version=0.153.2",
+        method: "GET",
+      }).reply(status, { models: [{ slug: "gpt-refreshed" }] });
+      try {
+        const result = await refreshNativeAccountCatalog({
+          cachePath,
+          force: true,
+          version: "0.153.2",
+          headersProvider,
+          discoveryOff: () => false,
+          lock: noLock,
+          dispatcherFactory: () => dispatcher,
+        });
+        assert.equal(result.status, status === 200 ? "updated" : "failed");
+        assert.equal(closes, 1);
+      } finally {
+        await close().catch(() => undefined);
+      }
+    }
+  }));
 
 function fixtureCache(models, overrides = {}) {
   return {

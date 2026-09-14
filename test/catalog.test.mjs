@@ -1611,3 +1611,48 @@ test(
     }
   },
 );
+
+
+test("account-only Daybreak survives capture merge, stale picker hides and routed slug collisions", () => {
+  const daybreak = { ...template, slug: "gpt-daybreak-blue-latest", display_name: "Daybreak Blue", context_window: 777000 };
+  const native = mergeNativeCatalogs({ models: [daybreak] }, { models: [template, { ...daybreak, visibility: "hide" }] });
+  assert.ok(native.models.some((m) => m.slug === daybreak.slug));
+  assert.equal(effectivePickerHiddenModels(new Set([daybreak.slug]), new Set(native.models.map((m) => m.slug))).has(daybreak.slug), false);
+  const collision = { ...grok, slug: daybreak.slug, displayName: "Unrelated external" };
+  const merged = buildMergedCatalog(native, [collision]);
+  const actual = merged.find((m) => m.slug === daybreak.slug);
+  assert.equal(actual.display_name, "Daybreak Blue");
+  assert.equal(actual.context_window, 777000);
+  assert.equal(actual.visibility, "list");
+});
+
+test("native Astra owns its picker row while the local-router route stays addressable", () => {
+  const astra = { ...template, slug: "gpt-6-astra", display_name: "Astra" };
+  const external = { ...grok, provider: "local-router", slug: "local-router/gpt-6-astra", upstreamModel: "gpt-6-astra", displayName: "Astra (curated)" };
+  const merged = buildMergedCatalog({ models: [astra] }, [external]);
+  assert.deepEqual(merged.filter((m) => m.visibility === "list").map((m) => m.slug), [astra.slug]);
+  assert.equal(merged.find((m) => m.slug === external.slug).visibility, "hide");
+  assert.equal(buildMergedCatalog({ models: [astra] }, [external], { includeNative: false })[0].visibility, "list");
+});
+
+test("external picker labels omit legacy curation suffixes", () => {
+  assert.equal(routedModel(template, { ...grok, displayName: "External (curated)" }).display_name, "External");
+});
+
+
+test("a hidden native entry does not suppress an independently available external route", () => {
+  const native = { ...template, slug: "gpt-native-hidden", visibility: "hide" };
+  const external = { ...grok, provider: "local-router", slug: "local-router/gpt-native-hidden", upstreamModel: native.slug };
+  const merged = buildMergedCatalog({ models: [native] }, [external]);
+  assert.equal(merged.find((m) => m.slug === external.slug).visibility, "list");
+});
+
+
+test("local-router protocol aliases retain routes without duplicating a canonical picker row", () => {
+  const canonical = { ...grok, provider: "local-router", slug: "local-router/example", upstreamModel: "example" };
+  const alias = { ...canonical, slug: "local-router/anthropic/example", upstreamModel: "anthropic/example" };
+  const merged = buildMergedCatalog({ models: [template] }, [canonical, alias]);
+  assert.equal(merged.find((m) => m.slug === canonical.slug).visibility, "list");
+  assert.equal(merged.find((m) => m.slug === alias.slug).visibility, "hide");
+  assert.equal(buildMergedCatalog({ models: [template] }, [alias])[1].visibility, "list");
+});
