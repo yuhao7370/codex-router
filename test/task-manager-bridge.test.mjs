@@ -316,3 +316,42 @@ test("poll intervals default, persist, and clamp", () => {
   assert.equal(bridge.readTaskManagerConfig().accountsIntervalMs, 60000);
   bridge.setTaskManagerIntervals({ logIntervalMs: 2000, accountsIntervalMs: 15000 });
 });
+
+test("native account fallback records outcome separately from injection attempts without credential data", () => {
+  const before = bridge.injectionStats();
+  const secret = "FALLBACK_SECRET_SENTINEL";
+  bridge.recordNativeAccountFallback({
+    fromAccountId: "injected-seat", model: "gpt-daybreak-blue-latest",
+    pathname: `/_codex-router/${secret}/v1/responses?token=${secret}`,
+    status: 200, fastSource: "native",
+    access_token: secret, error: secret, prompt: secret,
+  });
+  const stats = bridge.taskManagerRuntimeSnapshot().injections;
+  assert.equal(stats.count, before.count);
+  assert.equal(stats.fallbackCount, (before.fallbackCount || 0) + 1);
+  const event = stats.recent[0];
+  assert.deepEqual({ ...event, at: undefined }, {
+    at: undefined, kind: "native_fallback", fromAccountId: "injected-seat",
+    model: "gpt-daybreak-blue-latest", reason: "model_unavailable",
+    status: 200, path: "/v1/responses", fast: true, fastSource: "native",
+  });
+  assert.equal(event.accountId, undefined, "caller account identity is unknown");
+  assert.equal(JSON.stringify(stats).includes(secret), false);
+});
+
+test("native fallback keeps failed HTTP outcomes and bounds mixed recent events to twenty", () => {
+  const before = bridge.injectionStats();
+  for (let index = 0; index < 23; index += 1) {
+    bridge.recordNativeAccountFallback({ fromAccountId: "seat", model: "daybreak", pathname: "/responses", status: 403 });
+  }
+  bridge.recordInjection("seat", "/responses", "injected");
+  const stats = bridge.injectionStats();
+  assert.equal(stats.count, before.count + 1);
+  assert.equal(stats.fallbackCount, before.fallbackCount + 23);
+  assert.equal(stats.recent.length, 20);
+  assert.equal(stats.recent[0].fastSource, "injected");
+  assert.equal(stats.recent[0].fast, true);
+  assert.equal(stats.recent[1].kind, "native_fallback");
+  assert.equal(stats.recent[1].status, 403);
+  assert.equal(stats.recent[1].fast, undefined);
+});

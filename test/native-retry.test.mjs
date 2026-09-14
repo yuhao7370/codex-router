@@ -153,6 +153,7 @@ function startRouter({ nativePort, routerPort, stateDir, controlPort, backoffMs 
     CODEX_NATIVE_BASE_URL: `http://127.0.0.1:${nativePort}/backend-api/codex`,
     CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${nativePort}/v1`,
     MODEL_ROUTER_STATE_DIR: stateDir,
+    CODEX_HOME: path.join(stateDir, "codex"),
     CODEX_ROUTER_NATIVE_RETRY_BACKOFF_MS: String(backoffMs),
     CODEX_ROUTER_TASK_MANAGER_STANDALONE: controlPort === undefined ? "1" : "0",
     ...(controlPort === undefined ? {} : { CODEX_ROUTER_CONTROL_PORT: String(controlPort) }),
@@ -1231,4 +1232,103 @@ test("a native client close before a terminal response still meters zero", async
     await closeServer(native.server);
     rmSync(stateDir, { recursive: true, force: true });
   }
+});
+
+
+test("model access rejection retries through the caller account and leaves CTM injection selected", async () => {
+  const ctm = await mockCtm([{id:"seat-a",account_id:"acct-a",access_token:"tok-a",email:"a@example.com",usage:{weekly_used_percent:0,plan:"plus"}}]);
+  const attempts = [];
+  const native = await mockServer(async (request,response) => {
+    const body = await readBody(request);
+    attempts.push({headers:request.headers,body:JSON.parse(body.text),encoding:body.encoding});
+    const denied = request.headers.authorization === "Bearer tok-a" && JSON.parse(body.text).model === "gpt-daybreak-blue-latest";
+    response.writeHead(denied?403:200,{"Content-Type":"application/json"});
+    response.end(JSON.stringify(denied ? {error:{code:"model_not_found",message:"The model is unavailable to this account"}} : {id:"resp-native-fallback",output:[],usage:{input_tokens:1,output_tokens:1,total_tokens:2}}));
+  });
+  const stateDir=stateDirectory();writeFastConfig(stateDir,ctm.port);
+  const originalConfig=readFileSync(path.join(stateDir,"task-manager.json"),"utf8");
+  const routerPort=await openPort();const controlPort=await openPort();
+  const router=startRouter({nativePort:native.port,routerPort,controlPort,stateDir,retries:0});
+  try {
+    await waitFor(routerBase(routerPort)+"/models",router);
+    await waitUntil(async()=>Boolean((await fetch("http://127.0.0.1:"+controlPort+"/api/status").then(r=>r.json())).account),"CTM account missing",10000);
+    const turn={...largeNativeTurn(),model:"gpt-daybreak-blue-latest",service_tier:"default"};
+    const request=()=>fetch(routerBase(routerPort)+"/responses",{method:"POST",headers:{Authorization:"Bearer caller-native-token","chatgpt-account-id":"caller-native-account","Content-Type":"application/json"},body:JSON.stringify(turn)});
+    const response=await request();assert.equal(response.status,200,await response.text());
+    assert.equal(attempts.length,2);
+    assert.equal(attempts[0].headers.authorization,"Bearer tok-a");
+    assert.equal(attempts[1].headers.authorization,"Bearer caller-native-token");
+    assert.equal(attempts[1].headers["chatgpt-account-id"],"caller-native-account");
+    assert.equal(attempts[0].body.service_tier,"priority");
+    assert.equal(attempts[1].body.service_tier,"default");
+    assert.equal(attempts[1].encoding,attempts[0].encoding);
+    assert.equal(attempts[1].body.model,turn.model);
+    assert.equal(readFileSync(path.join(stateDir,"task-manager.json"),"utf8"),originalConfig);
+    const status=await fetch("http://127.0.0.1:"+controlPort+"/api/status").then(r=>r.json());
+    const event=status.injections.recent.find(e=>e.kind==="native_fallback");
+    assert.equal(event.model,turn.model);assert.equal(event.fromAccountId,"seat-a");assert.equal(event.status,200);
+    assert.doesNotMatch(JSON.stringify(event),/caller-native-token|tok-a/);
+    const metered = usageEvents(stateDir).find(e=>e.model===turn.model);
+    assert.equal(metered.retries,1);
+    assert.equal(metered.accountId,"caller-native-account");
+    turn.model="gpt-5.6-sol";const ordinary=await request();await ordinary.text();
+    assert.equal(attempts.at(-1).headers.authorization,"Bearer tok-a");
+  } finally {await stopChild(router);await closeServer(native.server);await closeServer(ctm.server);rmSync(stateDir,{recursive:true,force:true});}
+});
+
+
+test("native model access fallback is bounded, handles early SSE and never changes pool selection", async (t) => {
+  const model="gpt-daybreak-blue-latest";
+  const denied={error:{code:"model_not_found",message:"model access denied"}};
+  const sse="data: "+JSON.stringify({type:"response.created"})+"\n\n"+"data: "+JSON.stringify({type:"response.failed",response:{error:denied.error}})+"\n\n";
+  const output="data: "+JSON.stringify({type:"response.output_text.delta",delta:"already generated"})+"\n\n";
+  const ctm=await mockCtm([{id:"seat-a",account_id:"acct-a",access_token:"tok-a",email:"a@example.com",usage:{weekly_used_percent:0}}]);
+  const cases=[
+    {name:"fragmented early SSE denial",kind:"sse",authorization:"Bearer caller",expected:200,calls:2},
+    {name:"partial output never replays",kind:"output",authorization:"Bearer caller",expected:200,calls:1},
+    {name:"HTTP failure with existing output never replays",kind:"http-output",authorization:"Bearer caller",expected:403,calls:1},
+    {name:"native detail model denial",kind:"detail",authorization:"Bearer caller",expected:200,calls:2},
+    {name:"native also denied",kind:"both-denied",authorization:"Bearer caller",expected:403,calls:2},
+    {name:"no caller credential",kind:"http",expected:403,calls:1},
+    {name:"router caller key is not native auth",kind:"http",authorization:"Bearer "+CALLER_KEY,expected:403,calls:1},
+    {name:"router internal key is not native auth",kind:"http",authorization:"Bearer "+INTERNAL_KEY,expected:403,calls:1},
+    {name:"same account is not replayed",kind:"http",authorization:"Bearer tok-a",account:"acct-a",expected:403,calls:1},
+    {name:"same token different workspace can fall back",kind:"http",authorization:"Bearer tok-a",account:"original-workspace",expected:200,calls:2},
+    {name:"generic 403 is not a model denial",kind:"generic",authorization:"Bearer caller",expected:403,calls:1},
+    {name:"quota is not a model denial",kind:"quota",authorization:"Bearer caller",expected:429,calls:1},
+    {name:"caller fast survives fallback",kind:"http",authorization:"Bearer caller",tier:"priority",expected:200,calls:2},
+    {name:"native compaction keeps fallback account",kind:"http",authorization:"Bearer caller",compact:true,expected:200,calls:2},
+  ];
+  try {for(const scenario of cases) await t.test(scenario.name,async()=>{
+    const attempts=[];
+    const native=await mockServer(async(request,response)=>{
+      const body=await readBody(request);attempts.push({headers:request.headers,body:JSON.parse(body.text)});
+      const injected=request.headers.authorization==="Bearer tok-a"&&request.headers["chatgpt-account-id"]==="acct-a";
+      if(injected&&["sse","output"].includes(scenario.kind)){
+        response.writeHead(200,{"Content-Type":"text/event-stream"});
+        if(scenario.kind==="output")response.write(output);
+        response.write(sse.slice(0,40));setTimeout(()=>response.end(sse.slice(40)),20);return;
+      }
+      if(injected||scenario.kind==="both-denied"){
+        response.writeHead(scenario.kind==="quota"?429:403,{"Content-Type":"application/json"});
+        response.end(JSON.stringify(scenario.kind==="quota"?{error:{code:"insufficient_quota"}}:scenario.kind==="generic"?{error:{code:"account_deactivated"}}:scenario.kind==="http-output"?{...denied,output:[{type:"function_call",name:"write_file"}]}:scenario.kind==="detail"?{detail:"The model "+model+" is not supported with your account."}:denied));return;
+      }
+      response.writeHead(200,{"Content-Type":"application/json"});response.end(JSON.stringify({id:"resp-caller",output:[]}));
+    });
+    const stateDir=stateDirectory();writePoolConfig(stateDir,ctm.port);
+    const original=readFileSync(path.join(stateDir,"task-manager.json"),"utf8");
+    const routerPort=await openPort();const controlPort=await openPort();
+    const router=startRouter({nativePort:native.port,routerPort,controlPort,stateDir,retries:0});
+    try{
+      await waitFor(routerBase(routerPort)+"/models",router);
+      await waitUntil(async()=>Boolean((await fetch("http://127.0.0.1:"+controlPort+"/api/status").then(r=>r.json())).account),"CTM account missing",10000);
+      const response=await fetch(routerBase(routerPort)+"/responses"+(scenario.compact?"/compact":""),{method:"POST",headers:{"Content-Type":"application/json",...(scenario.authorization?{Authorization:scenario.authorization}:{}),...(scenario.account?{"chatgpt-account-id":scenario.account}:{})},body:JSON.stringify({model,input:[],...(scenario.tier?{service_tier:scenario.tier}:{})})});
+      const body=await response.text();assert.equal(response.status,scenario.expected,body);assert.equal(attempts.length,scenario.calls);
+      if(scenario.calls===2){assert.equal(attempts[1].headers.authorization,scenario.authorization);assert.equal(attempts[1].headers["chatgpt-account-id"],scenario.account);assert.equal(attempts[1].body.service_tier,scenario.tier);}
+      if(scenario.kind==="output")assert.match(body,/already generated/);
+      if(!["generic","quota","http-output"].includes(scenario.kind))assert.equal(readFileSync(path.join(stateDir,"task-manager.json"),"utf8"),original);
+      const status=await fetch("http://127.0.0.1:"+controlPort+"/api/status").then(r=>r.json());
+      assert.equal(status.injections.fallbackCount,scenario.calls-1);
+    }finally{await stopChild(router);native.server.closeAllConnections();await closeServer(native.server);rmSync(stateDir,{recursive:true,force:true});}
+  });}finally{await closeServer(ctm.server);}
 });

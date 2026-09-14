@@ -43,6 +43,7 @@ const INJECTION_ROUTE = /\/(?:v1\/)?(?:responses(?:\/compact)?|images\/(?:edits|
 // the app's own authorization.
 let cached = null;
 let injectionCount = 0;
+let nativeFallbackCount = 0;
 const injectionEvents = [];
 let lastRefreshFailure = null;
 let lastFailoverAt = 0;
@@ -357,13 +358,18 @@ function requestJson(port, token, pathname, method = "GET", body) {
   });
 }
 
-export function recordInjection(accountId, pathname, fastSource) {
+function recordInjectionEvent({ pathname, fastSource, ...event }) {
   const source = fastSource === "native" || fastSource === "injected" ? fastSource : undefined;
-  injectionCount += 1;
+  let route = "";
+  try {
+    route = new URL(String(pathname || "/"), "http://127.0.0.1").pathname.match(INJECTION_ROUTE)?.[0] || "";
+  } catch {
+    // Telemetry must not fail a request or retain a malformed request URL.
+  }
   injectionEvents.unshift({
     at: new Date().toISOString(),
-    accountId,
-    path: new URL(String(pathname || "/"), "http://127.0.0.1").pathname.match(INJECTION_ROUTE)?.[0] || "",
+    ...event,
+    path: route,
     ...(source ? { fast: true, fastSource: source } : {}),
   });
   if (injectionEvents.length > MAX_INJECTION_EVENTS) {
@@ -371,8 +377,29 @@ export function recordInjection(accountId, pathname, fastSource) {
   }
 }
 
+export function recordInjection(accountId, pathname, fastSource) {
+  injectionCount += 1;
+  recordInjectionEvent({ accountId, pathname, fastSource });
+}
+
+// Record only the response outcome of this request's model-access fallback.
+// The caller's real account identity is unknown here; never substitute the
+// managed account, persist credentials, or copy an upstream error envelope.
+export function recordNativeAccountFallback({ fromAccountId, model, pathname, status, fastSource }) {
+  nativeFallbackCount += 1;
+  recordInjectionEvent({
+    kind: "native_fallback",
+    fromAccountId: typeof fromAccountId === "string" ? fromAccountId.slice(0, 256) : undefined,
+    model: typeof model === "string" ? model.slice(0, 256) : undefined,
+    reason: "model_unavailable",
+    status: Number.isInteger(status) && status >= 100 && status <= 599 ? status : undefined,
+    pathname,
+    fastSource,
+  });
+}
+
 export function injectionStats() {
-  return { count: injectionCount, recent: injectionEvents.slice(0, 20) };
+  return { count: injectionCount, fallbackCount: nativeFallbackCount, recent: injectionEvents.slice(0, 20) };
 }
 
 function ctmHttpError(status) {

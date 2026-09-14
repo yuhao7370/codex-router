@@ -2683,3 +2683,27 @@ User-facing model names omit legacy (curated) suffixes; routing identity remains
 in slug, gatewayModel, provider and upstreamModel. Coverage is in catalog,
 model-picker-state, user-models, local-router-sync, local-router-auto-sync and
 native-account-catalog tests. Tests must isolate CODEX_HOME and router state.
+
+
+## CTM model-access fallback preserves the request's native account
+
+A native Responses or compact request rejected for an explicit model-access
+reason may retry once with the upstream credential the Codex caller originally
+sent. Never read a different stored account for this retry, change CTM selection,
+or mark the injected account globally failed merely because it lacks one model.
+Missing caller credentials, router caller/internal keys and an identical account
+are ineligible. Ordinary authentication, billing, quota and capacity failures
+retain their existing behavior.
+
+Only bounded structured HTTP errors and early SSE failures before generated
+output may authorize this fallback. Output-bearing failure envelopes cannot
+trigger replay. Preserve the caller's original model, tools, input, account ID
+and service tier; remove CTM-injected fast and regenerate the matching compressed
+body. Cancellation and the pre-byte retry gate remain mandatory.
+
+Record the source account ID, model, fixed reason and native response HTTP status
+in the Panel routing log, never credentials or upstream error text. HTTP 200 is
+labelled as a fallback response, not proof that a stream completed successfully.
+The retry counter and usage attribution must describe the caller-account attempt.
+Coverage lives in native-model-access, native-retry, task-manager-bridge and
+task-manager-fallback-ui tests, with isolated router state and CODEX_HOME.

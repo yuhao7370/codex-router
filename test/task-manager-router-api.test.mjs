@@ -18,7 +18,7 @@ const runtime = {
   pool: { ids: [], accounts: [], blocked: {} },
   failover: { enabled: false, lastFailoverAt: null, lastFailover: null },
   errors: [],
-  injections: { count: 0, recent: [] },
+  injections: { count: 0, fallbackCount: 0, recent: [] },
 };
 
 async function invoke(method, route) {

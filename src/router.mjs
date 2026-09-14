@@ -148,6 +148,7 @@ import {
   sleep,
 } from "./upstream-retry.mjs";
 import { nativeProxyFetch } from "./native-proxy.mjs";
+import { nativeModelAccessError, nativeModelAccessSse } from "./native-model-access.mjs";
 import { applyGrokApplyPatchGuidance } from "./grok-apply-patch-guidance.mjs";
 import {
   GROK_STRUCTURED_PATCH_CODEC,
@@ -248,6 +249,7 @@ import { VERSION } from "./version.mjs";
 import {
   nextInjectionAccount,
   notifyAccountFailure,
+  recordNativeAccountFallback,
   readTaskManagerConfig,
   recordCapacityFailure,
   recordInjection,
@@ -803,7 +805,7 @@ async function compressedNativeBody(body, headers) {
 const nativeSeats = new WeakMap();
 const authenticatedRequestRoutes = new WeakMap();
 
-function nativeHeaders(request, fastContext) {
+function nativeHeaders(request, fastContext, { injectAccount = true } = {}) {
   const headers = {
     "Content-Type": "application/json",
     "Accept-Encoding": "identity",
@@ -814,7 +816,7 @@ function nativeHeaders(request, fastContext) {
       headers[name] = Array.isArray(value) ? value.join(", ") : value;
     }
   }
-  const account = nextInjectionAccount();
+  const account = injectAccount ? nextInjectionAccount() : null;
   if (account?.accessToken) {
     headers.authorization = `Bearer ${account.accessToken}`;
     if (account.accountId) {
@@ -1206,7 +1208,7 @@ const CAPACITY_PEEK_TIMEOUT_MS = 3_000;
 // rather than as a 4xx status. Peek the first bytes of a 200 stream for that
 // error so the capacity retry can switch accounts before anything reaches the
 // client; when it is not capacity, relay the untouched branch unchanged.
-async function peekNativeCapacity(upstream, { waitForCapacity = true } = {}) {
+async function peekNativeCapacity(upstream, { waitForCapacity = true, modelAccessFor } = {}) {
   const contentType = String(upstream?.headers?.get("content-type") || "").trim();
   // A missing content-type is a headerless SSE stream, which is exactly what
   // the native upstream returns. Only skip peeking when the content-type
@@ -1220,6 +1222,7 @@ async function peekNativeCapacity(upstream, { waitForCapacity = true } = {}) {
   const reader = probe.getReader();
   let prefix = Buffer.alloc(0);
   let capacity = false;
+  let modelAccessDenied = false;
   const deadline = Date.now() + CAPACITY_PEEK_TIMEOUT_MS;
   try {
     while (prefix.length < MAX_CAPACITY_PEEK_BYTES) {
@@ -1236,14 +1239,19 @@ async function peekNativeCapacity(upstream, { waitForCapacity = true } = {}) {
           Buffer.from(result.value).subarray(0, remaining),
         ]);
         const text = prefix.toString("utf8");
+        if (modelAccessFor) {
+          const access = nativeModelAccessSse(text, modelAccessFor);
+          if (access === "denied") { modelAccessDenied = true; break; }
+          if (access === "output") break;
+        }
         if (CAPACITY_RESPONSE_RE.test(text)) {
           capacity = true;
           break;
         }
-        // Without an account pool there is no capacity retry to make. Relay
-        // the first received event immediately, including response.created,
-        // so a later transport failure cannot discard the native prelude.
-        if (!waitForCapacity) break;
+        // With neither pool capacity retry nor an eligible caller fallback,
+        // relay the first event immediately, including response.created, so
+        // a later transport failure cannot discard the native prelude.
+        if (!waitForCapacity && !modelAccessFor) break;
         // A normal output event proves the model is responding, so stop
         // peeking instead of waiting for a slow model to fill the window.
         if (
@@ -1261,7 +1269,36 @@ async function peekNativeCapacity(upstream, { waitForCapacity = true } = {}) {
     throw error;
   }
   void reader.cancel().catch(() => {});
-  return { capacity, response: responseWithBody(upstream, relay) };
+  return { capacity, modelAccessDenied, response: responseWithBody(upstream, relay) };
+}
+
+async function nativeModelAccessResponse(upstream, model) {
+  if (![400, 403, 404].includes(upstream.status) || !upstream.body) return false;
+  const reader = upstream.clone().body.getReader();
+  const chunks = [];
+  let bytes = 0;
+  const deadline = Date.now() + CAPACITY_PEEK_TIMEOUT_MS;
+  try {
+    while (bytes <= 32 * 1024) {
+      const chunk = await readHeaderlessSseChunk(reader, Math.max(0, deadline - Date.now()));
+      if (chunk === HEADERLESS_SSE_TIMEOUT) return false;
+      if (chunk.done) {
+        const payload = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+        if (payload?.output?.length || payload?.response?.output?.length) return false;
+        const error = payload?.error ?? payload?.detail;
+        return nativeModelAccessError(typeof error === "string" ? { message: error } : error, model);
+      }
+      bytes += chunk.value.byteLength;
+      if (bytes > 32 * 1024) return false;
+      chunks.push(Buffer.from(chunk.value));
+    }
+  } catch { return false; }
+  finally {
+    // A tee cancellation waits for the original response; it is relayed only
+    // after this classification returns, so do not await that cancellation.
+    void reader.cancel().catch(() => {});
+  }
+  return false;
 }
 
 async function boundedResponseText(
@@ -4349,6 +4386,8 @@ async function handleResponses(request, response, requestUrl) {
     }
     let upstream;
     let retries = 0;
+    let nativeModelDenied = false;
+    let nativeFallbackAttempted = false;
     if (route) {
       // Routed traffic can hit "model at capacity" from OpenAI-compatible
       // gateways too. Retry the same provider with backoff before relaying.
@@ -4398,6 +4437,11 @@ async function handleResponses(request, response, requestUrl) {
       // overloaded seat; relay the capacity error on the first attempt.
       const poolActive = Array.isArray(taskConfig.pool) && taskConfig.pool.length > 0;
       const nativeCapacityAttempts = poolActive ? capacityAttempts : 1;
+      const callerToken = bearerToken(request.headers.authorization);
+      const canUseCallerAccount = () => nativeSeats.has(headers) && callerToken &&
+        !callerBroughtNoUpstreamCredential(request) &&
+        (callerToken !== bearerToken(headers.authorization) ||
+          request.headers["chatgpt-account-id"] !== headers["chatgpt-account-id"]);
       let result;
       let capacityBackoffMs = 500;
       for (let attempt = 0; attempt < nativeCapacityAttempts; attempt += 1) {
@@ -4418,14 +4462,22 @@ async function handleResponses(request, response, requestUrl) {
         );
         upstream = result.response;
         retries += result.retries;
+        nativeModelDenied = nativeSeats.has(headers) &&
+          await nativeModelAccessResponse(upstream, requestedModel);
+        if (nativeModelDenied) break;
         let capacity = !upstream.ok && (await isAtCapacityResponse(upstream));
         let streamCapacity = false;
         if (!capacity && upstream.ok) {
-          const peek = await peekNativeCapacity(upstream, { waitForCapacity: poolActive });
+          const peek = await peekNativeCapacity(upstream, {
+            waitForCapacity: poolActive,
+            modelAccessFor: canUseCallerAccount() ? requestedModel : undefined,
+          });
+          nativeModelDenied = peek.modelAccessDenied === true;
           capacity = peek.capacity;
           streamCapacity = peek.capacity;
           upstream = peek.response;
         }
+        if (nativeModelDenied) break;
         if (capacity) {
           recordCapacityFailure(streamCapacity ? null : upstream.status, nativeAccountId);
         }
@@ -4449,6 +4501,40 @@ async function handleResponses(request, response, requestUrl) {
         // `{"detail":"Bad Request"}` upstream.
         if (nativeContentEncoding) headers["Content-Encoding"] = nativeContentEncoding;
       }
+      if (nativeModelDenied && canUseCallerAccount() && nothingRelayed(response)) {
+        controller.signal.throwIfAborted();
+        nativeFallbackAttempted = true;
+        const fromAccountId = nativeSeats.get(headers);
+        void upstream.body?.cancel().catch(() => {});
+        headers = nativeHeaders(request, undefined, { injectAccount: false });
+        nativeAccountId = injectedAccountId(headers);
+        // Drop CTM-injected fast; preserve the caller's tier, model, tools and
+        // input, with the Content-Encoding matching these rebuilt bytes.
+        const original = await nativeBodyFor(false);
+        routedBody = original.routedBody;
+        if (original.contentEncoding) headers["Content-Encoding"] = original.contentEncoding;
+        injectedFast = false;
+        try {
+          controller.signal.throwIfAborted();
+          retries += 1;
+          upstreamRetries = retries;
+          const fallback = await fetchWithRetry(target, {
+            method: "POST", headers, body: routedBody, signal: controller.signal,
+          }, {
+            retries: 0, fetchImpl: fetchObservedUpstream,
+            canRetry: () => nothingRelayed(response),
+          });
+          upstream = fallback.response;
+          recordNativeAccountFallback({
+            fromAccountId, model: requestedModel, pathname: requestUrl.pathname,
+            status: upstream.status,
+            fastSource: ["fast", "priority"].includes(String(payload.service_tier || "").toLowerCase()) ? "native" : undefined,
+          });
+        } catch (error) {
+          recordNativeAccountFallback({ fromAccountId, model: requestedModel, pathname: requestUrl.pathname });
+          throw error;
+        }
+      }
     }
     upstreamRetries = retries;
     upstreamStatus = upstream.status;
@@ -4461,7 +4547,7 @@ async function handleResponses(request, response, requestUrl) {
     // A native 401/402/403/429 means the injected account stopped working. Let
     // the bridge mark it failed so the poller can switch to a healthy account
     // when failover is enabled; the current turn still relays the error.
-    if (!route && !nativeCapacityFailure) {
+    if (!route && !nativeCapacityFailure && !nativeModelDenied && !nativeFallbackAttempted) {
       const quota =
         !upstream.ok &&
         upstream.status === 429 &&
