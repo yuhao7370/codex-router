@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
 import http from "node:http";
-import net from "node:net";
 import test from "node:test";
 
 import * as nativeProxy from "../src/native-proxy.mjs";
@@ -58,34 +57,55 @@ test("router child environments remove generic proxy variables", () => {
   );
 });
 
-test("native proxy fetch tunnels remote native targets through Mihomo", async () => {
+test("native proxy fetch forwards HTTP and tunnels HTTPS targets through Mihomo", async () => {
   assert.equal(typeof nativeProxy.nativeProxyFetch, "function");
   const upstream = http.createServer((_request, response) => {
-    response.setHeader("Connection", "close");
     response.end("native upstream");
   });
-  const proxy = http.createServer();
-  let connectTarget;
-  proxy.on("connect", (request, client, head) => {
-    connectTarget = request.url;
-    const upstreamSocket = net.connect(awaitedUpstreamPort, "127.0.0.1", () => {
-      client.write("HTTP/1.1 200 Connection Established\r\n\r\n");
-      if (head.length) upstreamSocket.write(head);
-      client.pipe(upstreamSocket);
-      upstreamSocket.pipe(client);
+  const upstreamPort = await listen(upstream);
+  let forwardedTarget;
+  // Undici 8 sends HTTP proxy requests in absolute form; HTTPS still uses
+  // CONNECT. Check both protocols rather than making the HTTP fixture wait
+  // forever for a tunnel that the client no longer opens.
+  const proxy = http.createServer((request, response) => {
+    forwardedTarget = request.url;
+    const hop = http.request({ hostname: "127.0.0.1", port: upstreamPort, path: "/health" }, (result) => {
+      response.writeHead(result.statusCode, result.headers);
+      result.pipe(response);
     });
-    upstreamSocket.on("error", () => client.destroy());
+    hop.on("error", () => response.destroy());
+    request.pipe(hop);
   });
-  const awaitedUpstreamPort = await listen(upstream);
+  const sockets = new Set();
+  proxy.on("connection", (socket) => {
+    sockets.add(socket);
+    socket.once("close", () => sockets.delete(socket));
+  });
+  let connectTarget;
+  proxy.on("connect", (request, client) => {
+    connectTarget = request.url;
+    // Deliberately refuse the TLS tunnel: routing can be proven without a
+    // trusted test certificate or changing TLS verification in production.
+    client.end("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n");
+  });
   const proxyPort = await listen(proxy);
   try {
     const fetchNative = nativeProxy.nativeProxyFetch({
       CODEX_ROUTER_NATIVE_PROXY_URL: `http://127.0.0.1:${proxyPort}`,
     });
-    const response = await fetchNative("http://native.test/health");
+    const response = await fetchNative("http://native.test/health", { signal: AbortSignal.timeout(5_000) });
     assert.equal(await response.text(), "native upstream");
-    assert.equal(connectTarget, "native.test:80");
+    assert.equal(forwardedTarget, "http://native.test/health");
+    assert.equal(connectTarget, undefined, "HTTP requests should use ordinary proxy forwarding");
+    await assert.rejects(
+      fetchNative("https://native.test/health", { signal: AbortSignal.timeout(5_000) }),
+      /fetch failed/,
+    );
+    assert.equal(connectTarget, "native.test:443");
   } finally {
+    // server.close does not close upgraded CONNECT sockets, and HTTP clients
+    // may retain idle pooled sockets. Their lifetime belongs to this fixture.
+    for (const socket of sockets) socket.destroy();
     await close(proxy);
     await close(upstream);
   }

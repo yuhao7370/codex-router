@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import path from "node:path";
+import os from "node:os";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
@@ -63,13 +64,19 @@ test("an unknown subcommand exits 2 with usage", () => {
 });
 
 test("install refuses before the tray has been built", () => {
-  // The checkout under test has no compiled Tauri binary, so this exercises
-  // the real guard rather than a stub. A missing binary must name the build
-  // command instead of registering a task that points at nothing.
-  const result = trayService("install");
-  assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /not built at/);
-  assert.match(result.stderr, /build-electron-companion\.ps1/);
+  const fixture = mkdtempSync(path.join(os.tmpdir(), "router-unbuilt-tray-"));
+  try {
+    const result = trayService("install", { env: {
+      CODEX_ROUTER_SOURCE_ROOT: fixture,
+      MODEL_ROUTER_STATE_DIR: path.join(fixture, "state"),
+      MODEL_ROUTER_SKIP_SERVICE_MANAGER: "1",
+    } });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /not built at/);
+    assert.match(result.stderr, /build-electron-companion\.ps1/);
+  } finally {
+    rmSync(fixture, { recursive: true, force: true });
+  }
 });
 
 test("the dispatcher routes Windows to the Task Scheduler manager", () => {

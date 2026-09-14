@@ -1,9 +1,24 @@
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
+import { usesDeepSeekResponses } from "./deepseek-responses.mjs";
 
+import {
+  genericProviderRuntimeDescriptor,
+  readGenericProviders,
+} from "./generic-provider-state.mjs";
+import {
+  normalizeSupportedEndpoints,
+  providerModelEndpoint,
+} from "./openai-endpoint-policy.mjs";
+import {
+  curatedModelInputModalities,
+  curatedModelIsFree,
+  curatedModelToolSchemaRecursion,
+} from "./opencode-curation.mjs";
 import { instructionOverlayExists } from "./instruction-overlays.mjs";
 import { SOURCE_ROOT } from "./paths.mjs";
 import { officialModelDisplayName, readUserModels } from "./user-models.mjs";
+import { curatableRequestProfile, requestProfileKnown } from "./request-profiles.mjs";
 
 export const REGISTRY_PATH =
   process.env.MODEL_ROUTER_REGISTRY ||
@@ -56,7 +71,7 @@ export function anonymousModelAllowed(provider, modelId) {
 // chain accept one unchanged rather than growing a parallel implementation.
 // Its `id` is the model slug, which is what makes a per-model credential file
 // and Keychain entry distinct from every other endpoint's.
-export function endpointForModel(model, providers = PROVIDERS) {
+export function endpointForModel(model, providers = RUNTIME_PROVIDERS) {
   const provider = providers.get(model?.provider);
   return provider?.perModelEndpoint ? model.endpoint : provider;
 }
@@ -239,6 +254,9 @@ function loadRegistry() {
       if (provider.keyless !== undefined && typeof provider.keyless !== "boolean") {
         fail(`provider ${provider.id} has an invalid keyless flag`);
       }
+      if (provider.explicitSelection !== undefined && typeof provider.explicitSelection !== "boolean") {
+        fail(`provider ${provider.id} has an invalid explicitSelection flag`);
+      }
       if (provider.keyless && provider.credential !== undefined) {
         fail(`keyless provider ${provider.id} must not declare a credential`);
       }
@@ -382,6 +400,38 @@ function loadRegistry() {
   };
 }
 
+// Operator-defined providers extend only the runtime view. The checked-in
+// registry stays immutable and authoritative for built-in provider identity,
+// native capabilities, and repository-certified model behavior. A malformed
+// generic document is one failed optional layer: keep every built-in route and
+// expose a diagnostic instead of taking down the router at module import.
+function loadRuntimeProviders(checkedInProviders) {
+  const providers = new Map(checkedInProviders);
+  const warnings = [];
+  try {
+    const genericProviders = readGenericProviders({
+      reservedProviderIds: checkedInProviders,
+    });
+    for (const provider of genericProviders) {
+      if (!provider.enabled) continue;
+      const descriptor = genericProviderRuntimeDescriptor(provider);
+      if (providers.has(descriptor.id)) {
+        throw new Error(`generic provider ${descriptor.id} collides with the checked-in registry`);
+      }
+      providers.set(descriptor.id, descriptor);
+    }
+  } catch (error) {
+    warnings.push(
+      `Ignored generic provider state: ${error instanceof Error ? error.message : String(error)}`,
+    );
+    return {
+      providers: new Map(checkedInProviders),
+      warnings: Object.freeze(warnings),
+    };
+  }
+  return { providers, warnings: Object.freeze(warnings) };
+}
+
 // Codex only renders the upgrade modal when the target slug is in the picker,
 // so a prompt pointing at a missing or unlisted model can never fire. Catch
 // that at load time instead of shipping a silent no-op. Targets may be
@@ -478,15 +528,50 @@ function endpointProblem(model, provider) {
 // an opaque id off a provider's catalog and has nothing better to show. A
 // checked-in fragment always knows, and more than one route can carry the same
 // upstream id, so the table must not overwrite a name the repository chose:
-// `opencode-free/ox-alpha` says which of the six Ox Alpha routes it is, and the
+// `openrouter/glm-5.3-flash` says which reseller route it is, and the
 // table would flatten that back to the curated label.
 function normalizedModel(model, provider, { curated = false } = {}) {
   const officialDisplayName = curated
     ? officialModelDisplayName(model.provider, model.upstreamModel)
     : undefined;
-  const presented = officialDisplayName && model.displayName !== officialDisplayName
+  // A documented free tier is applied for the same reason the name is: an entry
+  // curated before the tag existed carries neither, and re-curating is not
+  // something an installed machine should have to do to be told the price.
+  const documentedFree = curated
+    ? curatedModelIsFree(model.provider, model.upstreamModel)
+    : undefined;
+  const renamed = officialDisplayName && model.displayName !== officialDisplayName
     ? { ...model, displayName: officialDisplayName }
     : model;
+  const priced = documentedFree === true && renamed.isFree !== true
+    ? { ...renamed, isFree: true }
+    : renamed;
+  // Same rule again, and this one costs turns rather than clarity: without it
+  // an entry curated before the upstream's limitation was documented keeps
+  // sending cycles that come back as a 400 naming nothing.
+  const documentedRecursion = curated
+    ? curatedModelToolSchemaRecursion(model.provider, model.upstreamModel)
+    : undefined;
+  const withRecursion = documentedRecursion && !priced.toolSchemaRecursion
+    ? { ...priced, toolSchemaRecursion: documentedRecursion }
+    : priced;
+  // Image input is another published free-id fact Zen's catalog omits. A
+  // text-only stored default would keep Codex refusing paste forever; widen
+  // only when the documented set includes image and the entry still lacks it,
+  // so an already-correct text+image row stays byte-identical.
+  const documentedModalities = curated
+    ? curatedModelInputModalities(model.provider, model.upstreamModel)
+    : undefined;
+  const modalitiesMissingImage =
+    Array.isArray(documentedModalities) &&
+    documentedModalities.includes("image") &&
+    !(
+      Array.isArray(withRecursion.inputModalities) &&
+      withRecursion.inputModalities.includes("image")
+    );
+  const presented = modalitiesMissingImage
+    ? { ...withRecursion, inputModalities: [...documentedModalities] }
+    : withRecursion;
   if (!provider?.perModelEndpoint) return Object.freeze(presented);
   return Object.freeze({
     ...presented,
@@ -530,8 +615,38 @@ function modelProblem(model, providers, slugs, gatewayModels) {
   if (model.instructionOverlay !== undefined && !instructionOverlayExists(model.instructionOverlay)) {
     return `model ${model.slug} has an invalid instructionOverlay`;
   }
-  if (model.requestProfile !== undefined && typeof model.requestProfile !== "string") {
+  if (model.requestProfile !== undefined && !requestProfileKnown(model.requestProfile)) {
     return `model ${model.slug} has an invalid requestProfile`;
+  }
+  if (model.supportedEndpoints !== undefined) {
+    let supported;
+    try {
+      supported = normalizeSupportedEndpoints(model.supportedEndpoints, {
+        field: `model ${model.slug}.supportedEndpoints`,
+      });
+    } catch (error) {
+      return error instanceof Error ? error.message : String(error);
+    }
+    const conversational = providerModelEndpoint(provider);
+    if (!conversational && supported.includes("/embeddings")) {
+      return `model ${model.slug} cannot declare OpenAI endpoints for provider protocol ${provider.protocol}`;
+    }
+    if (model.listed && (!conversational || !supported.includes(conversational))) {
+      return `listed model ${model.slug} must support its provider's conversational endpoint`;
+    }
+  }
+  if (
+    provider.generic === true &&
+    model.requestProfile !== undefined &&
+    !curatableRequestProfile(model.requestProfile)
+  ) {
+    return `generic model ${model.slug} may use only an explicitly curatable requestProfile`;
+  }
+  // The router exposes Chat Completions and Responses request surfaces. A
+  // legacy text-completions catalog can still be inspected, but publishing a
+  // model from it would create a route no caller endpoint can execute.
+  if (provider.generic === true && provider.adapter === "openai-completions") {
+    return `generic model ${model.slug} uses unsupported openai-completions publication`;
   }
   if (
     model.requiresTrailingUserTurn !== undefined &&
@@ -564,6 +679,12 @@ function modelProblem(model, providers, slugs, gatewayModels) {
     return `model ${model.slug} has an invalid supportsParallelToolCalls`;
   }
   if (
+    model.supportsSearchHistory !== undefined &&
+    typeof model.supportsSearchHistory !== "boolean"
+  ) {
+    return `model ${model.slug} has an invalid supportsSearchHistory`;
+  }
+  if (
     model.experimentalSupportedTools !== undefined &&
     (!Array.isArray(model.experimentalSupportedTools) ||
       model.experimentalSupportedTools.some(
@@ -585,6 +706,18 @@ function modelProblem(model, providers, slugs, gatewayModels) {
   // never needs it, so only false is accepted.
   if (model.visionBridge !== undefined && model.visionBridge !== false) {
     return `model ${model.slug} may only set visionBridge to false`;
+  }
+  // An upstream that refuses a tool schema whose `$ref`s cycle needs the cycle
+  // broken before dispatch. This is a property of the upstream, not of the
+  // model's abilities, and it is deliberately separate from `requestProfile`:
+  // that field holds one value, and every route needing this so far also needs
+  // a profile of its own. `flatten` is the only verb, because rejecting the
+  // turn is what already happens without it.
+  if (
+    model.toolSchemaRecursion !== undefined &&
+    model.toolSchemaRecursion !== "flatten"
+  ) {
+    return `model ${model.slug} may only set toolSchemaRecursion to "flatten"`;
   }
   if (model.isFree !== undefined && typeof model.isFree !== "boolean") {
     return `model ${model.slug} has an invalid isFree flag`;
@@ -717,6 +850,11 @@ function modelProblem(model, providers, slugs, gatewayModels) {
 }
 
 const STATIC_MODEL_SLUG_ALIASES = new Map([
+  // Z.ai revealed the OpenCode Go Ox Alpha preview as GLM-5.3-Flash. The
+  // provider withdrew ox-alpha-free when it published the named model, so
+  // preserve existing picker and caller state on the new live route.
+  ["opencode-go/ox-alpha", "opencode-go/glm-5.3-flash"],
+  ["opencode-go/ox-alpha-free", "opencode-go/glm-5.3-flash"],
   // OpenCode moved Grok 4.5 from Chat Completions to Responses. Keep the old
   // public slug routable while catalog publication carries picker state to
   // the protocol-namespaced replacement.
@@ -766,6 +904,16 @@ function mergeUserModels(base, staticAliases) {
   );
   const aliases = new Map();
   const userModels = new Set();
+  // Slug -> why it was skipped. The router cites this when a caller asks for a
+  // slug that therefore has no route (#689), and the doctor reports it; the
+  // warning strings themselves stay unchanged for curate-models.
+  const skipped = new Map();
+  const skip = (model, reason) => {
+    warnings.push(`Skipped user model: ${reason}`);
+    if (typeof model?.slug === "string" && model.slug && !skipped.has(model.slug)) {
+      skipped.set(model.slug, reason);
+    }
+  };
   for (const model of readUserModels()) {
     // A mutable local overlay may describe routing and presentation, but it
     // cannot grant itself the repository's native-collaboration certificate.
@@ -773,9 +921,7 @@ function mergeUserModels(base, staticAliases) {
     // they are settled and never spend a cloud compatibility probe. Preserve
     // that denial, but refuse the positive certificate.
     if (model?.multiAgentVersion === "v2") {
-      warnings.push(
-        `Skipped user model: model ${model?.slug || "<unknown>"} may not declare multiAgentVersion v2`,
-      );
+      skip(model, `model ${model?.slug || "<unknown>"} may not declare multiAgentVersion v2`);
       continue;
     }
     const checkedIn = checkedInRoutes.get(`${model?.provider}\0${model?.upstreamModel}`);
@@ -790,28 +936,27 @@ function mergeUserModels(base, staticAliases) {
           || staticAliases.has(model.slug)
           || aliases.has(model.slug)
         ) {
-          warnings.push(
-            `Skipped user model: alias ${model.slug} for checked-in route ${checkedIn.slug} collides with an existing model or alias`,
+          skip(
+            model,
+            `alias ${model.slug} for checked-in route ${checkedIn.slug} collides with an existing model or alias`,
           );
           continue;
         }
         aliases.set(model.slug, checkedIn.slug);
       }
-      warnings.push(
-        `Skipped user model: ${model?.slug || "<unknown>"} duplicates checked-in route ${checkedIn.slug}`,
-      );
+      skip(model, `${model?.slug || "<unknown>"} duplicates checked-in route ${checkedIn.slug}`);
       continue;
     }
     if (
       typeof model?.slug === "string"
       && (staticAliases.has(model.slug) || aliases.has(model.slug))
     ) {
-      warnings.push(`Skipped user model: model slug ${model.slug} collides with an existing model alias`);
+      skip(model, `model slug ${model.slug} collides with an existing model alias`);
       continue;
     }
     const problem = modelProblem(model, base.providers, slugs, gatewayModels);
     if (problem) {
-      warnings.push(`Skipped user model: ${problem}`);
+      skip(model, problem);
       continue;
     }
     slugs.add(model.slug);
@@ -827,7 +972,7 @@ function mergeUserModels(base, staticAliases) {
     if (!userModels.has(model)) return true;
     const problem = upgradeTargetProblem(model, modelBySlug);
     if (problem) {
-      warnings.push(`Skipped user model: ${problem}`);
+      skip(model, problem);
       return false;
     }
     return true;
@@ -836,14 +981,24 @@ function mergeUserModels(base, staticAliases) {
     models: Object.freeze(kept),
     warnings: Object.freeze(warnings),
     aliases: new Map(aliases),
+    skipped: new Map(skipped),
   };
 }
 
 const registry = loadRegistry();
 const staticAliases = validatedStaticModelSlugAliases(registry);
-const merged = mergeUserModels(registry, staticAliases);
+const runtime = loadRuntimeProviders(registry.providers);
+const merged = mergeUserModels(
+  { ...registry, providers: runtime.providers },
+  staticAliases,
+);
 
 export const PROVIDERS = registry.providers;
+// Runtime routing and curation use this union. Keeping it separate from
+// PROVIDERS prevents mutable local state from becoming checked-in authority in
+// callers that intentionally audit or certify the repository registry.
+export const RUNTIME_PROVIDERS = runtime.providers;
+export const RUNTIME_PROVIDER_WARNINGS = runtime.warnings;
 // The immutable registry shipped by this checkout, before the operator's
 // mutable user-model overlay is merged. Repository certification gates must
 // bind to this set: a local overlay is useful routing configuration, but it
@@ -851,6 +1006,9 @@ export const PROVIDERS = registry.providers;
 export const CHECKED_IN_MODELS = registry.models;
 export const MODELS = merged.models;
 export const USER_MODEL_WARNINGS = merged.warnings;
+// Slug -> the reason that user model was left out of MODELS. A slug here may
+// still route through a curation alias; callers check MODEL_BY_SLUG first.
+export const USER_MODELS_SKIPPED = merged.skipped;
 // Old curated public slugs that now resolve to a checked-in route. Catalog
 // publication migrates picker decisions through these aliases before applying
 // defaults, so an update removes the duplicate without hiding the model.
@@ -860,7 +1018,7 @@ export const MODEL_SLUG_ALIASES = new Map([
 ]);
 export const LISTED_MODELS = Object.freeze(MODELS.filter((model) => model.listed));
 export const API_MODELS = Object.freeze(
-  MODELS.filter((model) => PROVIDERS.get(model.provider)?.kind === "openai-compatible"),
+  MODELS.filter((model) => RUNTIME_PROVIDERS.get(model.provider)?.kind === "openai-compatible"),
 );
 export const MODEL_BY_SLUG = new Map(MODELS.map((model) => [model.slug, model]));
 for (const [from, to] of MODEL_SLUG_ALIASES) {
@@ -872,5 +1030,10 @@ export const MODEL_BY_GATEWAY_ID = new Map(
 );
 
 export function providerForModel(model) {
-  return PROVIDERS.get(model.provider);
+  const provider = RUNTIME_PROVIDERS.get(model.provider);
+  // One credential/provider identity can serve both its legacy Chat aliases
+  // and the current direct Flash model's native Responses contract.
+  return usesDeepSeekResponses(model) && provider
+    ? { ...provider, protocol: "openai-responses" }
+    : provider;
 }

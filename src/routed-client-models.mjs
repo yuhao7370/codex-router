@@ -56,6 +56,9 @@ export function nativeClientModels(nativeCatalogModels) {
             .filter((level) => level?.effort)
             .map((level) => ({ effort: level.effort }))
         : [],
+      ...(typeof model.default_reasoning_level === "string"
+        ? { defaultEffort: model.default_reasoning_level }
+        : {}),
       priority: Number.isFinite(model.priority) ? -model.priority : undefined,
       native: true,
     }));
@@ -79,7 +82,8 @@ export function routedClientModels() {
   const selected = applySubagentProofs(
     selectedConfiguredListedModels().filter((model) => {
       const slug = String(model.slug);
-      return !hidden.has(slug) && (!picker.hasExplicitVisibility || visible.has(slug));
+      return !hidden.has(slug) &&
+        (!picker.hasExplicitVisibility || visible.has(slug));
     }),
     subagentProofSnapshot(),
     { hidden, disabled: readMultiAgentSettings().disabled },

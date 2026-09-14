@@ -19,6 +19,20 @@ import { fileURLToPath } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
+const fileSymlinkAvailable = (() => {
+  if (process.platform !== "win32") return true;
+  const dir = mkdtempSync(path.join(os.tmpdir(), "router-link-capability-"));
+  try {
+    writeFileSync(path.join(dir, "target"), "fixture");
+    symlinkSync(path.join(dir, "target"), path.join(dir, "link"), "file");
+    return true;
+  } catch (error) {
+    if (error.code === "EPERM") return false;
+    throw error;
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+})();
+const requiresFileSymlinks = { skip: fileSymlinkAvailable ? false : "Windows file-symlink privilege is required by the packaged fixture" };
+
 function scratch(prefix) {
   return mkdtempSync(path.join(realpathSync(os.tmpdir()), prefix));
 }
@@ -164,26 +178,34 @@ function runFix(env) {
   }
 }
 
-test("doctor --fix rebuilds dependencies in a checkout", () => {
+test("doctor --fix rebuilds dependencies in a checkout", requiresFileSymlinks, () => {
   // The baseline the packaged case departs from: --force-deps is what makes
   // repair able to fix a corrupted node_modules, and it must not be lost for
   // everyone in the course of exempting packaged installs.
   const { result, argv } = runFix({ CODEX_ROUTER_PACKAGE_MANAGER: "" });
   assert.notEqual(argv, undefined, `installer was never invoked: ${result.stderr}`);
-  assert.deepEqual(argv, process.platform === "win32" ? ["-CheckoutInstall", "-ForceDeps"] : ["--force-deps"]);
+  assert.deepEqual(
+    argv,
+    process.platform === "win32"
+      ? ["-CheckoutInstall", "-Target", "codex", "-ForceDeps"]
+      : ["--force-deps"],
+  );
 });
 
-test("doctor --fix repairs a packaged install without rebuilding dependencies", () => {
+test("doctor --fix repairs a packaged install without rebuilding dependencies", requiresFileSymlinks, () => {
   // Everything else repair does -- generated catalogs, the Codex config block,
   // the service -- lives outside the keg and is still worth doing, so the flag
   // is dropped rather than the whole repair being refused.
   const { result, argv } = runFix({ CODEX_ROUTER_PACKAGE_MANAGER: "homebrew" });
   assert.notEqual(argv, undefined, `installer was never invoked: ${result.stderr}`);
-  assert.deepEqual(argv, process.platform === "win32" ? ["-CheckoutInstall"] : []);
+  assert.deepEqual(
+    argv,
+    process.platform === "win32" ? ["-CheckoutInstall", "-Target", "codex"] : [],
+  );
   assert.match(result.stdout, /brew reinstall codex-router/);
 });
 
-test("the packaged repair note stays out of --json output", () => {
+test("the packaged repair note stays out of --json output", requiresFileSymlinks, () => {
   // doctor --json is parsed by the tray; a prose line on stdout breaks it.
   const { dir, fake } = fakeSourceRoot();
   try {

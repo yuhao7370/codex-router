@@ -233,14 +233,16 @@ function taskQueryScript(taskName = TASK_MANAGER_TASK_NAME) {
     "$actions = @($task[0].Actions)",
     "$action = if ($actions.Count -gt 0) { $actions[0] } else { $null }",
     "$triggers = @($task[0].Triggers)",
-    "$trigger = if ($triggers.Count -gt 0) { $triggers[0] } else { $null }",
+    "$trigger = $triggers | Where-Object { $_.CimClass.CimClassName -eq 'MSFT_TaskLogonTrigger' } | Select-Object -First 1",
+    "$heartbeats = @($triggers | Where-Object { $_.CimClass.CimClassName -eq 'MSFT_TaskTimeTrigger' })",
+    "$heartbeat = if ($heartbeats.Count -eq 1) { $heartbeats[0] } else { $null }",
     "$principal = $task[0].Principal",
     "$settings = $task[0].Settings",
     "function Resolve-TaskUserSid([string]$userId) { if ([string]::IsNullOrWhiteSpace($userId)) { return '' }; try { return ([Security.Principal.NTAccount]::new($userId)).Translate([Security.Principal.SecurityIdentifier]).Value } catch { return '' } }",
     "$currentSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value",
     "$principalSid = Resolve-TaskUserSid ([string]$principal.UserId)",
     "$triggerSid = Resolve-TaskUserSid ([string]$trigger.UserId)",
-    "$payload = [ordered]@{ exists = $true; state = $task[0].State.ToString(); currentUser = [Security.Principal.WindowsIdentity]::GetCurrent().Name; currentSid = $currentSid; principalSid = $principalSid; triggerSid = $triggerSid; actionCount = $actions.Count; action = [ordered]@{ execute = [string]$action.Execute; argument = [string]$action.Arguments }; principal = [ordered]@{ userId = [string]$principal.UserId; logonType = $principal.LogonType.ToString(); runLevel = $principal.RunLevel.ToString() }; triggerCount = $triggers.Count; trigger = [ordered]@{ type = [string]$trigger.CimClass.CimClassName; userId = [string]$trigger.UserId; enabled = [bool]$trigger.Enabled }; settings = [ordered]@{ restartCount = [int]$settings.RestartCount; restartInterval = [string]$settings.RestartInterval; executionTimeLimit = [string]$settings.ExecutionTimeLimit; disallowStartIfOnBatteries = [bool]$settings.DisallowStartIfOnBatteries; stopIfGoingOnBatteries = [bool]$settings.StopIfGoingOnBatteries; multipleInstances = $settings.MultipleInstances.ToString() } }",
+    "$payload = [ordered]@{ exists = $true; state = $task[0].State.ToString(); currentUser = [Security.Principal.WindowsIdentity]::GetCurrent().Name; currentSid = $currentSid; principalSid = $principalSid; triggerSid = $triggerSid; actionCount = $actions.Count; action = [ordered]@{ execute = [string]$action.Execute; argument = [string]$action.Arguments }; principal = [ordered]@{ userId = [string]$principal.UserId; logonType = $principal.LogonType.ToString(); runLevel = $principal.RunLevel.ToString() }; triggerCount = $triggers.Count; heartbeatCount = $heartbeats.Count; heartbeat = [ordered]@{ type = [string]$heartbeat.CimClass.CimClassName; enabled = [bool]$heartbeat.Enabled; startBoundary = [string]$heartbeat.StartBoundary; interval = [string]$heartbeat.Repetition.Interval; duration = [string]$heartbeat.Repetition.Duration; stopAtDurationEnd = [bool]$heartbeat.Repetition.StopAtDurationEnd }; trigger = [ordered]@{ type = [string]$trigger.CimClass.CimClassName; userId = [string]$trigger.UserId; enabled = [bool]$trigger.Enabled }; settings = [ordered]@{ startWhenAvailable = [bool]$settings.StartWhenAvailable; restartCount = [int]$settings.RestartCount; restartInterval = [string]$settings.RestartInterval; executionTimeLimit = [string]$settings.ExecutionTimeLimit; disallowStartIfOnBatteries = [bool]$settings.DisallowStartIfOnBatteries; stopIfGoingOnBatteries = [bool]$settings.StopIfGoingOnBatteries; multipleInstances = $settings.MultipleInstances.ToString() } }",
     "[Console]::Out.Write(($payload | ConvertTo-Json -Compress -Depth 5))",
   ].join("; ");
 }
@@ -285,6 +287,8 @@ export async function queryScheduledTask({
       triggerSid: task.triggerSid,
       principal: task.principal,
       triggerCount: task.triggerCount,
+      heartbeatCount: task.heartbeatCount,
+      heartbeat: task.heartbeat,
       trigger: task.trigger,
       settings: task.settings,
     };
@@ -293,7 +297,11 @@ export async function queryScheduledTask({
   }
 }
 
-export function scheduledTaskDefinitionIsCanonical(task, expectedAction) {
+export function scheduledTaskDefinitionIsCanonical(
+  task,
+  expectedAction,
+  { allowRouterHeartbeat = false } = {},
+) {
   if (!task?.exists || !task.action) return false;
   return task.actionCount === 1
     && normalized(task.action.execute) === normalized(expectedAction?.execute)
@@ -303,7 +311,21 @@ export function scheduledTaskDefinitionIsCanonical(task, expectedAction) {
     && task.principalSid === task.currentSid
     && normalized(task.principal?.logonType) === "interactive"
     && normalized(task.principal?.runLevel) === "limited"
-    && task.triggerCount === 1
+    // Old Router tasks and the independent manager have one logon trigger.
+    // Only the main Router may add the exact upstream recovery heartbeat.
+    && (task.triggerCount === 1 || (
+      allowRouterHeartbeat
+      && task.triggerCount === 2
+      && task.heartbeatCount === 1
+      && normalized(task.heartbeat?.type) === "msft_tasktimetrigger"
+      && task.heartbeat?.enabled === true
+      && typeof task.heartbeat?.startBoundary === "string"
+      && Number.isFinite(Date.parse(task.heartbeat.startBoundary))
+      && normalized(task.heartbeat?.interval) === "pt1m"
+      && normalized(task.heartbeat?.duration) === "p9999d"
+      && task.heartbeat?.stopAtDurationEnd === true
+      && task.settings?.startWhenAvailable === true
+    ))
     && normalized(task.trigger?.type) === "msft_tasklogontrigger"
     && task.triggerSid === task.currentSid
     && task.trigger?.enabled === true

@@ -196,6 +196,66 @@ test("scheduler query preserves resolved task identity SIDs", async () => {
   assert.equal(result.triggerSid, "S-1-5-21-100-200-300-1001");
 });
 
+test("task query preserves Router heartbeat evidence without accepting it for the manager", async () => {
+  const action = taskAction({ stateDir: "C:/state" });
+  const task = canonicalTask(action, {
+    triggerCount: 2, heartbeatCount: 1,
+    heartbeat: {
+      type: "MSFT_TaskTimeTrigger", enabled: true,
+      startBoundary: "2026-09-14T02:17:35Z", interval: "PT1M",
+      duration: "P9999D", stopAtDurationEnd: true,
+    },
+  });
+  task.settings.startWhenAvailable = true;
+  const result = await queryScheduledTask({
+    runPowerShell: (script) => {
+      assert.match(script, /heartbeatCount = \$heartbeats.Count/);
+      assert.match(script, /duration = \[string\]\$heartbeat.Repetition.Duration/);
+      assert.match(script, /startWhenAvailable = \[bool\]\$settings.StartWhenAvailable/);
+      return JSON.stringify(task);
+    },
+  });
+  assert.deepEqual(result.heartbeat, task.heartbeat);
+  assert.equal(result.heartbeatCount, 1);
+  assert.equal(taskActionIsCanonical(result, { stateDir: "C:/state" }), false);
+});
+
+test("Windows task query reads both trigger generations without registering tasks", {
+  skip: process.platform !== "win32",
+}, async () => {
+  for (const heartbeatEnabled of [false, true]) {
+    const result = await queryScheduledTask({
+      runPowerShell: (script) => {
+        const setup = [
+          '$fixtureUser = [Security.Principal.WindowsIdentity]::GetCurrent().Name',
+          '$fixtureLogon = New-ScheduledTaskTrigger -AtLogOn -User $fixtureUser',
+          '$fixtureHeartbeat = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 1) -RepetitionDuration (New-TimeSpan -Days 9999)',
+          '$fixtureTriggers = @($fixtureLogon)',
+          heartbeatEnabled ? '$fixtureTriggers += $fixtureHeartbeat' : '',
+          '$fixtureSettings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew -StartWhenAvailable',
+          '$script:fixtureDefinition = [pscustomobject]@{ TaskName = "Codex Router Task Manager"; TaskPath = "\\"; State = "Running"; Actions = @([pscustomobject]@{Execute = "wscript.exe"; Arguments = "fixture"}); Triggers = $fixtureTriggers; Principal = [pscustomobject]@{UserId = $fixtureUser; LogonType = "Interactive"; RunLevel = "Limited"}; Settings = $fixtureSettings }',
+          'function Get-ScheduledTask { param($ErrorAction); return $script:fixtureDefinition }',
+          script,
+        ].join("\n");
+        const child = spawnSync("powershell.exe", ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", setup], {
+          encoding: "utf8", windowsHide: true, timeout: 15000,
+        });
+        assert.equal(child.status, 0, child.stderr);
+        return child.stdout;
+      },
+    });
+    assert.equal(result.known, true);
+    assert.equal(result.triggerCount, heartbeatEnabled ? 2 : 1);
+    assert.equal(result.heartbeatCount, heartbeatEnabled ? 1 : 0);
+    assert.equal(result.triggerSid, result.currentSid);
+    if (heartbeatEnabled) {
+      assert.equal(result.heartbeat.interval, "PT1M");
+      assert.equal(result.heartbeat.duration, "P9999D");
+      assert.equal(result.heartbeat.stopAtDurationEnd, true);
+    }
+  }
+});
+
 test("status keeps a scheduler query failure unknown", async () => {
   const status = await taskManagerServiceStatus({
     queryTask: async () => ({ known: false }),

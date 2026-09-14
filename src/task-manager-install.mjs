@@ -229,7 +229,7 @@ export async function classifyTaskManagerPortOwner({
   );
   if (
     routerTask?.known === true
-    && scheduledTaskDefinitionIsCanonical(routerTask, routerTaskAction({ stateDir }))
+    && scheduledTaskDefinitionIsCanonical(routerTask, routerTaskAction({ stateDir }), { allowRouterHeartbeat: true })
     && routerEntrypointMatches
   ) {
     return "embedded";
@@ -425,7 +425,7 @@ export async function assertRouterTaskReplaceable({
   if (task?.known !== true) {
     throw new Error(`Task Scheduler could not identify "${ROUTER_TASK_NAME}"; refusing before snapshots.`);
   }
-  if (task.exists && !scheduledTaskDefinitionIsCanonical(task, routerTaskAction({ stateDir }))) {
+  if (task.exists && !scheduledTaskDefinitionIsCanonical(task, routerTaskAction({ stateDir }), { allowRouterHeartbeat: true })) {
     throw new Error(`Refusing to adopt or replace the noncanonical Scheduled Task "${ROUTER_TASK_NAME}".`);
   }
   return task;

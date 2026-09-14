@@ -4,10 +4,23 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
-import test from "node:test";
+import test, { after } from "node:test";
 import { fileURLToPath } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+
+// Discovery compares fixtures with the checked-in registry. Keep a developer's
+// locally curated models out of both this process and the child processes below
+// before model-registry.mjs resolves the overlay path at import time.
+const stateRoot = mkdtempSync(path.join(os.tmpdir(), "codex-router-model-discovery-test-"));
+const originalUserModels = process.env.MODEL_ROUTER_USER_MODELS;
+process.env.MODEL_ROUTER_USER_MODELS = path.join(stateRoot, "user-models.json");
+after(() => {
+  rmSync(stateRoot, { recursive: true, force: true });
+  if (originalUserModels === undefined) delete process.env.MODEL_ROUTER_USER_MODELS;
+  else process.env.MODEL_ROUTER_USER_MODELS = originalUserModels;
+});
+
 const { MODELS, PROVIDERS } = await import("../src/model-registry.mjs");
 const { discoverProviderModels, discoveredMetadata, modelIds } = await import(
   "../src/model-discovery.mjs"
@@ -31,7 +44,13 @@ test("model discovery compares fixtures without needing or exposing a key", () =
   const fixture = path.join(testRoot, "models.json");
   writeFileSync(
     fixture,
-    JSON.stringify({ data: [{ id: "deepseek-v4-pro" }, { id: "deepseek-v5-preview" }] }),
+    JSON.stringify({
+      data: [
+        { id: "deepseek-flash" },
+        { id: "deepseek-v4-pro" },
+        { id: "deepseek-v5-preview" },
+      ],
+    }),
   );
   try {
     const output = execFileSync(
@@ -43,6 +62,7 @@ test("model discovery compares fixtures without needing or exposing a key", () =
     assert.deepEqual(result.unregistered, ["deepseek-v5-preview"]);
     assert.deepEqual(result.addable, ["deepseek-v5-preview"]);
     assert.deepEqual(result.blocked, {});
+    assert.ok(result.registered.includes("deepseek-flash"));
     assert.ok(result.unavailable.includes("deepseek-v4-flash"));
     assert.doesNotMatch(output, /Bearer|api[_-]?key/i);
   } finally {
@@ -59,6 +79,7 @@ test("OpenCode Go discovery blocks live ids whose protocol route is not certifie
       { id: "grok-4.5" },
       { id: "future-responses-only-model" },
       { id: "glm-5" },
+      { id: "hy3-preview" },
     ] }),
   );
   try {
@@ -68,9 +89,10 @@ test("OpenCode Go discovery blocks live ids whose protocol route is not certifie
       { cwd: root, encoding: "utf8", env: { ...process.env, OPENCODE_API_KEY: "" } },
     );
     const result = JSON.parse(output);
-    assert.deepEqual(result.unregistered, ["future-responses-only-model", "glm-5"]);
+    assert.deepEqual(result.unregistered, ["future-responses-only-model", "hy3-preview"]);
     assert.deepEqual(result.addable, []);
     assert.deepEqual(Object.keys(result.blocked).sort(), result.unregistered);
+    assert.ok(result.registered.includes("glm-5"));
     assert.match(
       result.blocked["future-responses-only-model"],
       /provider catalog lists future-responses-only-model.*has not verified whether the model uses Chat, Messages, or Responses.*router compatibility limitation.*future update/s,
@@ -306,6 +328,7 @@ test("anonymous discovery keeps only each provider's documented free models", ()
     modelIds({ data: [
       { id: "z-ai/glm-5:free" },
       { id: "minimax/minimax-m2.1:free" },
+      { id: "tencent/hy4-preview" },
       { id: "z-ai/glm-5" },
     ] }, kilo),
     ["minimax/minimax-m2.1:free", "z-ai/glm-5:free"],
@@ -313,7 +336,7 @@ test("anonymous discovery keeps only each provider's documented free models", ()
 });
 
 test("the current OpenCode catalogs remain fully fetchable without preselecting Zen", () => {
-  // Captured from the two official endpoints on 2026-08-21. Free/Zen stay
+  // Captured from the two official endpoints on 2026-08-26. Free/Zen stay
   // catalog-only, so this proves the live response is filtered at discovery
   // time instead of turning a changing remote list into checked-in defaults.
   const zenIds = [
@@ -325,6 +348,7 @@ test("the current OpenCode catalogs remain fully fetchable without preselecting 
     "laguna-s-2.1-free",
     "mimo-v2.5-free",
     "muse-spark-1.2-contributor-free",
+    "muse-spark-1.3-contributor-free",
     "nemotron-3-ultra-free",
     "nemotron-3.5-lightning-free",
     "x-preview-f-free",
@@ -338,6 +362,7 @@ test("the current OpenCode catalogs remain fully fetchable without preselecting 
       "laguna-s-2.1-free",
       "mimo-v2.5-free",
       "muse-spark-1.2-contributor-free",
+      "muse-spark-1.3-contributor-free",
       "nemotron-3-ultra-free",
       "nemotron-3.5-lightning-free",
       "x-preview-f-free",
@@ -345,12 +370,12 @@ test("the current OpenCode catalogs remain fully fetchable without preselecting 
   );
 
   const goLive = [
-    "deepseek-v4-flash", "deepseek-v4-flash-vision-exp", "deepseek-v4-pro", "glm-5", "glm-5.1", "glm-5.2", "glm-5.3",
-    "gpt-5.6-luna", "grok-4.5", "hy3", "hy3-preview", "kimi-k2.5", "kimi-k2.6",
-    "kimi-k2.7-code", "kimi-k3", "mimo-v2-omni", "mimo-v2-pro", "mimo-v2.5",
+    "deepseek-v4-flash", "deepseek-v4-flash-vision-exp", "deepseek-v4-pro", "glm-5", "glm-5.1", "glm-5.2", "glm-5.3", "glm-5.3-flash",
+    "gpt-5.6-luna", "grok-4.5", "grok-4.6", "hy3", "hy3-preview", "kimi-k2.5", "kimi-k2.6",
+    "kimi-k2.7-code", "kimi-k3", "longcat-2.0", "mimo-v2-omni", "mimo-v2-pro", "mimo-v2.5",
     "mimo-v2.5-pro", "minimax-m2.5", "minimax-m2.7", "minimax-m3",
-    "muse-spark-1.2-contributor", "ox-alpha-free", "qwen3.5-plus", "qwen3.6-plus",
-    "qwen3.7-max", "qwen3.7-plus", "qwen3.8-max",
+    "muse-spark-1.2-contributor", "muse-spark-1.3-contributor", "qwen3.5-plus", "qwen3.6-plus",
+    "qwen3.7-max", "qwen3.7-plus", "qwen3.8-flash", "qwen3.8-max",
   ];
   assert.deepEqual(
     modelIds({ data: goLive.map((id) => ({ id })) }, PROVIDERS.get("opencode-go")),
@@ -360,11 +385,11 @@ test("the current OpenCode catalogs remain fully fetchable without preselecting 
 
 test("the checked-in OpenCode Go set matches the official current-model table", () => {
   const documented = [
-    "deepseek-v4-flash", "deepseek-v4-flash-vision-exp", "deepseek-v4-pro", "glm-5.1", "glm-5.2", "glm-5.3",
-    "gpt-5.6-luna", "grok-4.5", "hy3", "kimi-k2.6", "kimi-k2.7-code", "kimi-k3",
+    "deepseek-v4-flash", "deepseek-v4-flash-vision-exp", "deepseek-v4-pro", "deepseek-v4.1-flash", "glm-5", "glm-5.1", "glm-5.2", "glm-5.3", "glm-5.3-flash",
+    "gpt-5.6-luna", "grok-4.5", "grok-4.6", "hy3", "hy4-preview", "kimi-k2.5", "kimi-k2.6", "kimi-k2.7-code", "kimi-k3", "longcat-2.0",
     "mimo-v2.5", "mimo-v2.5-pro", "minimax-m2.5", "minimax-m2.7", "minimax-m3",
-    "muse-spark-1.2-contributor", "ox-alpha-free", "qwen3.6-plus", "qwen3.7-max",
-    "qwen3.7-plus", "qwen3.8-max",
+    "muse-spark-1.2-contributor", "muse-spark-1.3-contributor", "qwen3.5-plus", "qwen3.6-plus", "qwen3.7-max",
+    "qwen3.7-plus", "qwen3.8-flash", "qwen3.8-max",
   ].sort();
   const registered = MODELS
     .filter(({ provider }) => ["opencode-go", "opencode-go-messages", "opencode-go-responses"].includes(provider))
@@ -495,7 +520,7 @@ test("OpenRouter metadata preserves exact context, modalities, tools, and effort
   });
 });
 
-test("Venice records its Ox Alpha advertisement separately from the proven effective ladder", () => {
+test("Venice preserves its Ox Alpha advertisement for operator curation", () => {
   const metadata = modelCatalogMetadata({ data: [{
     id: "stealth-ox-alpha",
     context_length: 1_048_576,
@@ -517,10 +542,10 @@ test("Venice records its Ox Alpha advertisement separately from the proven effec
   }] }, PROVIDERS.get("venice"))["stealth-ox-alpha"];
   assert.equal(metadata.contextWindow, 1_048_576);
   assert.equal(metadata.maxOutputTokens, 131_072);
-  assert.deepEqual(metadata.reasoning.supportedEfforts, ["low", "high", "max"]);
-  assert.deepEqual(metadata.reasoning.advertisedSupportedEfforts, ["none", "low", "medium", "high"]);
-  assert.equal(metadata.reasoning.advertisedDefaultEffort, "high");
-  assert.equal(metadata.reasoning.defaultEffort, undefined);
+  assert.deepEqual(metadata.reasoning.supportedEfforts, ["none", "low", "medium", "high"]);
+  assert.equal(metadata.reasoning.defaultEffort, "high");
+  assert.equal(metadata.reasoning.advertisedSupportedEfforts, undefined);
+  assert.equal(metadata.reasoning.effectiveMetadataSource, undefined);
 });
 
 test("documented supplements do not invent MiniMax or OpenCode effort controls", () => {
@@ -533,9 +558,29 @@ test("documented supplements do not invent MiniMax or OpenCode effort controls",
   assert.deepEqual(minimax["MiniMax-M3"].reasoning, { supported: true, configurable: false });
 
   const opencode = modelCatalogMetadata(
-    { data: [{ id: "x-preview-f-free" }, { id: "big-pickle" }] },
+    { data: [{ id: "muse-spark-1.2-contributor-free" }, { id: "big-pickle" }] },
     PROVIDERS.get("opencode-free"),
   );
-  assert.deepEqual(opencode["x-preview-f-free"].reasoning.supportedEfforts, ["low", "high", "max"]);
+  // muse-spark-1.2-contributor-free is a Responses model, so it's not directly
+  // in opencode-free; this tests that discovery doesn't invent effort controls.
   assert.equal(opencode["big-pickle"], undefined);
+});
+
+test("live discovery never rewrites native GPT catalog metadata", async () => {
+  const nativeModel = MODELS.find((model) => model.slug === "commandcode/gpt-5.6-sol");
+  assert.ok(nativeModel, "the checked-in GPT model is present");
+  const before = structuredClone(nativeModel);
+  const testRoot = mkdtempSync(path.join(os.tmpdir(), "codex-router-native-preservation-"));
+  const fixture = path.join(testRoot, "models.json");
+  writeFileSync(fixture, JSON.stringify({ data: [{ id: "gpt-5.6-sol", context_length: 8 }] }));
+  const previousArgv = process.argv.slice();
+  process.argv.push("--fixture", fixture);
+  try {
+    const result = await discoverProviderModels("commandcode", { cache: false });
+    assert.deepEqual(result.discovered, ["gpt-5.6-sol"]);
+    assert.deepEqual(MODELS.find((model) => model.slug === nativeModel.slug), before);
+  } finally {
+    process.argv.splice(0, process.argv.length, ...previousArgv);
+    rmSync(testRoot, { recursive: true, force: true });
+  }
 });

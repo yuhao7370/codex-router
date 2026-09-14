@@ -15,6 +15,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { serviceGrokPatchHookEnvironment } from "../src/grok-patch-hook-settings.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -55,6 +56,60 @@ function render(script, platform, testRoot, target = "codex", sourceRoot = root)
   return serviceCommand(script, platform, testRoot, "render", target, sourceRoot);
 }
 
+test("service regeneration retains persisted hook opt-in on all platforms", () => {
+  const testRoot = mkdtempSync(path.join(os.tmpdir(), "router-hook-service-"));
+  const stateDir = path.join(testRoot, "codex router state");
+  mkdirSync(stateDir, { recursive: true });
+  const file = path.join(stateDir, "grok-patch-hook.json");
+  try {
+    for (const [platform, script] of [["darwin", "service-macos.mjs"], ["linux", "service-linux.mjs"], ["win32", "service-windows.mjs"]]) {
+      for (const [contents, enabled] of [['{"version":1,"enabled":true}', true], ['{"version":1,"enabled":false}', false], ['{"version":2,"enabled":true}', false], ['{', false]]) {
+        writeFileSync(file, contents, { mode: 0o600 });
+        const output = serviceCommand(script, platform, testRoot, "render", "codex", root, { CODEX_ROUTER_GROK_PATCH_HOOK: undefined });
+        assert.equal(output.includes("CODEX_ROUTER_GROK_PATCH_HOOK"), enabled, `${platform}: ${contents}`);
+      }
+    }
+    writeFileSync(file, '{"version":1,"enabled":true}', { mode: 0o600 });
+    for (const flag of ["0", "1", "true", ""]) {
+      assert.deepEqual(serviceGrokPatchHookEnvironment({ stateDir, environment: { CODEX_ROUTER_GROK_PATCH_HOOK: flag } }), { CODEX_ROUTER_GROK_PATCH_HOOK: flag === "1" ? "1" : "0" });
+    }
+  } finally {
+    rmSync(testRoot, { recursive: true, force: true });
+  }
+});
+
+function writePoolEnvironmentFixture(testRoot) {
+  const stateDir = path.join(testRoot, "codex router state");
+  const credentialId = "cred_ServiceEnvironment1234";
+  mkdirSync(stateDir, { recursive: true });
+  writeFileSync(path.join(stateDir, "provider-credentials.json"), `${JSON.stringify({
+    schemaVersion: 2,
+    credentials: [{
+      id: credentialId,
+      providerId: "opencode-go",
+      kind: "api_key",
+      state: "active",
+      secretRef: {
+        type: "environment",
+        providerId: "opencode-go",
+        target: "codex",
+        name: "OPENCODE_API_KEY",
+      },
+    }],
+  })}\n`, { mode: 0o600 });
+  writeFileSync(path.join(stateDir, "provider-api-key-pools.json"), `${JSON.stringify({
+    version: 1,
+    providers: {
+      "opencode-go": {
+        providerId: "opencode-go",
+        credentials: {
+          [credentialId]: { id: credentialId, providerId: "opencode-go" },
+        },
+      },
+    },
+  })}\n`, { mode: 0o600 });
+}
+
 // Mirrors src/service-windows.mjs: MODEL_ROUTER_STATE_DIR wins over every other
 // state-directory source, and the fixture name deliberately carries a space.
 function windowsStateDir(testRoot) {
@@ -87,6 +142,11 @@ test("background service definitions render for macOS, Linux, and Windows", () =
     assert.match(launchd, /<string>io\.github\.codex-router<\/string>/);
     assert.match(launchd, /<key>PATH<\/key>/);
     assert.match(launchd, /CODEX_ROUTER_STATE_DIR/);
+    // Background starves LiteLLM; Adaptive is a no-op without XPC and starves
+    // Node forwarders past the 30s OAuth health budget. Keep Standard.
+    assert.match(launchd, /<key>ProcessType<\/key>\s*<string>Standard<\/string>/);
+    assert.doesNotMatch(launchd, /<key>ProcessType<\/key>\s*<string>Adaptive<\/string>/);
+    assert.doesNotMatch(launchd, /<key>ProcessType<\/key>\s*<string>Background<\/string>/);
 
     const systemd = render("service-linux.mjs", "linux", testRoot);
     assert.match(systemd, /\[Service\]/);
@@ -161,7 +221,7 @@ test("the Windows service persists standalone Task Manager mode only while its p
   }
 });
 
-test("background services preserve the Antigravity client secret", () => {
+test("background services never copy the Antigravity client secret", () => {
   const testRoot = mkdtempSync(path.join(os.tmpdir(), "codex-router-antigravity-service-"));
   const secret = "test-antigravity-client-secret";
   try {
@@ -169,19 +229,50 @@ test("background services preserve the Antigravity client secret", () => {
       "service-macos.mjs", "darwin", testRoot, "render", "codex", root,
       { ANTIGRAVITY_CLIENT_SECRET: secret },
     );
-    assert.match(launchd, new RegExp(`<key>ANTIGRAVITY_CLIENT_SECRET</key>\\s*<string>${secret}</string>`));
+    assert.doesNotMatch(launchd, /ANTIGRAVITY_CLIENT_SECRET|test-antigravity-client-secret/);
 
     const systemd = serviceCommand(
       "service-linux.mjs", "linux", testRoot, "render", "codex", root,
       { ANTIGRAVITY_CLIENT_SECRET: secret },
     );
-    assert.match(systemd, new RegExp(`Environment="ANTIGRAVITY_CLIENT_SECRET=${secret}"`));
+    assert.doesNotMatch(systemd, /ANTIGRAVITY_CLIENT_SECRET|test-antigravity-client-secret/);
 
     const windows = serviceCommand(
       "service-windows.mjs", "win32", testRoot, "render", "codex", root,
       { ANTIGRAVITY_CLIENT_SECRET: secret },
     );
-    assert.match(windows, new RegExp(`set "ANTIGRAVITY_CLIENT_SECRET=${secret}"`));
+    assert.doesNotMatch(windows, /ANTIGRAVITY_CLIENT_SECRET|test-antigravity-client-secret/);
+  } finally {
+    rmSync(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("background services preserve only environment credentials referenced by a pool", () => {
+  const testRoot = mkdtempSync(path.join(os.tmpdir(), "codex-router-pool-environment-service-"));
+  const secret = "test-pooled-opencode-secret";
+  try {
+    writePoolEnvironmentFixture(testRoot);
+    const environment = {
+      OPENCODE_API_KEY: secret,
+      OPENCODE_GO_API_KEY: "unreferenced-secret-must-not-appear",
+    };
+    const launchd = serviceCommand(
+      "service-macos.mjs", "darwin", testRoot, "render", "codex", root, environment,
+    );
+    assert.match(launchd, new RegExp(`<key>OPENCODE_API_KEY</key>\\s*<string>${secret}</string>`));
+    assert.doesNotMatch(launchd, /unreferenced-secret-must-not-appear|OPENCODE_GO_API_KEY/);
+
+    const systemd = serviceCommand(
+      "service-linux.mjs", "linux", testRoot, "render", "codex", root, environment,
+    );
+    assert.match(systemd, new RegExp(`Environment="OPENCODE_API_KEY=${secret}"`));
+    assert.doesNotMatch(systemd, /unreferenced-secret-must-not-appear|OPENCODE_GO_API_KEY/);
+
+    const windows = serviceCommand(
+      "service-windows.mjs", "win32", testRoot, "render", "codex", root, environment,
+    );
+    assert.match(windows, new RegExp(`set "OPENCODE_API_KEY=${secret}"`));
+    assert.doesNotMatch(windows, /unreferenced-secret-must-not-appear|OPENCODE_GO_API_KEY/);
   } finally {
     rmSync(testRoot, { recursive: true, force: true });
   }
@@ -427,8 +518,7 @@ test("the Windows launcher starts the wrapper hidden and propagates its exit cod
       ),
       `launcher did not embed the wrapper path correctly:\n${script}`,
     );
-    // Without this line Task Scheduler reads every crash as a clean exit and
-    // the RestartCount/RestartInterval settings never fire again.
+    // LastTaskResult still needs the real exit code for doctor/readiness.
     assert.match(script, /\r\nWScript\.Quit status\r\n$/);
     // A failure to even start the wrapper must also surface as a failure.
     assert.match(script, /\r\nIf Err\.Number <> 0 Then\r\n {2}WScript\.Quit 1\r\nEnd If\r\n/);
@@ -466,10 +556,40 @@ test("the Windows scheduled task runs the VBS launcher through wscript.exe", () 
   }
 });
 
-// The scheduled task's restart policy is the reason the exit code matters:
-// Task Scheduler only re-triggers RestartCount/RestartInterval when the action
-// reports a failure, so a launcher that swallowed the wrapper's exit code would
-// trade a console window for a router that stays dead after its first crash.
+test("Windows installTask registers a minute heartbeat beside logon", () => {
+  // RestartOnFailure does not relaunch after a started action exits (issue #581).
+  // The heartbeat trigger is the supervisor; IgnoreNew drops it while Running.
+  const source = readFileSync(path.join(root, "src", "service-windows.mjs"), "utf8");
+  const install = source.slice(
+    source.indexOf("function installTask()"),
+    source.indexOf("function waitForTaskToStop()"),
+  );
+  assert.match(install, /New-ScheduledTaskTrigger -AtLogOn/);
+  assert.match(
+    install,
+    /New-ScheduledTaskTrigger -Once -At \(Get-Date\) -RepetitionInterval \(New-TimeSpan -Minutes 1\)/,
+  );
+  assert.match(install, /-Trigger @\(\$logon, \$heartbeat\)/);
+  assert.match(install, /-MultipleInstances IgnoreNew -StartWhenAvailable/);
+});
+
+test("Windows explicit stop disables heartbeat while start and restart re-enable it", () => {
+  const source = readFileSync(path.join(root, "src", "service-windows.mjs"), "utf8");
+  assert.match(source, /function setTaskEnabled\(enabled\)/);
+  assert.match(
+    source,
+    /command === "stop"\) \{[\s\S]*?setTaskEnabled\(false\);[\s\S]*?endTask\(\);/,
+  );
+  assert.match(
+    source,
+    /if \(command === "restart"\) endTask\(\);[\s\S]*?setTaskEnabled\(true\);[\s\S]*?schtasks\(\["\/Run"/,
+  );
+});
+
+// Propagating the wrapper exit code keeps LastTaskResult honest for doctor
+// and readiness. It is not what relaunches a dead router: RestartOnFailure
+// only covers actions that fail to start (issue #581). The minute heartbeat
+// trigger in installTask() is the supervisor.
 // Nothing off Windows can execute a .vbs, so -- exactly like
 // `install.ps1 parses under powershell.exe` in test/installer-scripts.test.mjs --
 // this is the only place that link is executed rather than reasoned about.
@@ -712,6 +832,59 @@ function runWindowsService(testRoot, command, extraEnv = {}) {
     },
   );
 }
+
+test(
+  "Windows stop disables the heartbeat before ending the active task",
+  { skip: process.platform === "win32" },
+  () => {
+    const testRoot = mkdtempSync(path.join(os.tmpdir(), "codex-router-win-explicit-stop-"));
+    try {
+      const stubs = schedulerStubs(path.join(testRoot, "scheduler"));
+      const result = runWindowsService(testRoot, "stop", { PATH: stubs.path });
+      assert.equal(result.status, 0, result.stderr);
+      assert.deepEqual(JSON.parse(result.stdout), { state: "stopped" });
+
+      const calls = stubs.calls();
+      const disable = calls.findIndex((line) => line.includes("/Change") && line.includes("/DISABLE"));
+      const end = calls.findIndex((line) => line.includes("/End"));
+      assert.ok(disable >= 0, `explicit stop did not disable the task:\n${calls.join("\n")}`);
+      assert.ok(end > disable, `task must be disabled before /End:\n${calls.join("\n")}`);
+      assert.equal(calls.some((line) => line.includes("/Run")), false);
+    } finally {
+      rmSync(testRoot, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "Windows start and restart re-enable heartbeat recovery before running",
+  { skip: process.platform === "win32" },
+  async (context) => {
+    for (const command of ["start", "restart"]) {
+      await context.test(command, () => {
+        const testRoot = mkdtempSync(path.join(os.tmpdir(), `codex-router-win-${command}-enable-`));
+        try {
+          const stubs = schedulerStubs(path.join(testRoot, "scheduler"));
+          const result = runWindowsService(testRoot, command, { PATH: stubs.path });
+          assert.equal(result.status, 0, result.stderr);
+          assert.deepEqual(JSON.parse(result.stdout), { state: "running" });
+
+          const calls = stubs.calls();
+          const enable = calls.findIndex((line) => line.includes("/Change") && line.includes("/ENABLE"));
+          const run = calls.findIndex((line) => line.includes("/Run"));
+          assert.ok(enable >= 0, `${command} did not re-enable the task:\n${calls.join("\n")}`);
+          assert.ok(run > enable, `${command} must enable before /Run:\n${calls.join("\n")}`);
+          if (command === "restart") {
+            const end = calls.findIndex((line) => line.includes("/End"));
+            assert.ok(end >= 0 && end < enable, `restart must end before enabling:\n${calls.join("\n")}`);
+          }
+        } finally {
+          rmSync(testRoot, { recursive: true, force: true });
+        }
+      });
+    }
+  },
+);
 
 test(
   "Windows status trusts a live launcher when Task Scheduler reports Ready",

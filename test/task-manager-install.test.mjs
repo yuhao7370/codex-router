@@ -584,6 +584,45 @@ test("main Router preflight accepts missing or canonical tasks and refuses drift
   }), /noncanonical.*Codex Router/i);
 });
 
+test("Router preflight accepts upstream heartbeat recovery and refuses changed definitions", async () => {
+  const stateDir = "C:/Router State";
+  const task = routerTask(stateDir);
+  task.triggerCount = 2;
+  task.heartbeatCount = 1;
+  task.heartbeat = {
+    type: "MSFT_TaskTimeTrigger", enabled: true,
+    startBoundary: "2026-09-14T02:17:35Z", interval: "PT1M",
+    duration: "P9999D", stopAtDurationEnd: true,
+  };
+  task.settings.startWhenAvailable = true;
+  assert.equal((await assertRouterTaskReplaceable({
+    stateDir, queryTask: async () => task,
+  })).exists, true);
+  assert.equal(await classifyTaskManagerPortOwner({
+    stateDir, sourceRoot: "C:/Router",
+    readPortOwner: () => ({ known: true, pid: 777 }),
+    readManagerHealth: async () => undefined,
+    readManagerTask: async () => ({ known: true, exists: false }),
+    readRouterTask: async () => task,
+    readProcessCommandLine: () => 'node "C:/Router/src/router.mjs"',
+  }), "embedded");
+  for (const overrides of [
+    { triggerCount: 3 }, { heartbeatCount: 0 }, { heartbeatCount: 2 },
+    { triggerSid: "S-1-5-21-other-user" },
+    { heartbeat: { ...task.heartbeat, type: "MSFT_TaskBootTrigger" } },
+    { heartbeat: { ...task.heartbeat, enabled: false } },
+    { heartbeat: { ...task.heartbeat, startBoundary: "" } },
+    { heartbeat: { ...task.heartbeat, interval: "PT1S" } },
+    { heartbeat: { ...task.heartbeat, duration: "P1D" } },
+    { heartbeat: { ...task.heartbeat, stopAtDurationEnd: false } },
+    { settings: { ...task.settings, startWhenAvailable: false } },
+  ]) {
+    await assert.rejects(assertRouterTaskReplaceable({
+      stateDir, queryTask: async () => ({ ...task, ...overrides }),
+    }), /noncanonical.*Codex Router/i);
+  }
+});
+
 test("Router topology is read only from the protected capability health leaf", async () => {
   const secret = "test-caller-capability-with-sufficient-length";
   let requested;

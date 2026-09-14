@@ -70,6 +70,13 @@ const QUOTA_PATTERNS = [
   // Both word orders occur in the wild: "usage limit reached" (zai) and
   // "reached your usage limit" (Kimi).
   /usage limit(?:s)? (?:reached|exceeded|hit)/i,
+  // zai 1310 names a weekly or monthly window without the words "usage" or
+  // "quota": "Weekly/Monthly Limit Exhausted. Your limit will reset at ...".
+  /(?:weekly|monthly|daily)\s+limit\s+exhausted/i,
+  // zai 1309/1314: a lapsed Coding Plan or enterprise package is renewed, not
+  // waited out or re-keyed: "Your GLM Coding Plan package has expired and is
+  // temporarily unavailable. You can resume using it after renewing...".
+  /(?:package|plan|subscription) has expired/i,
   /reached your (?:usage|monthly|daily) limit/i,
   /(?:monthly|daily|plan) usage limit/i,
   /purchase extra usage/i,
@@ -242,7 +249,11 @@ function describeFailure({
     };
   }
   if (status === 429) {
-    const hint = Number.isFinite(retryAfterSeconds)
+    // A named window is quoted; anything else asks for patience. `Retry-After:
+    // 0` is a real answer ("now") but not a useful sentence -- "retry in about
+    // 0s" reads as a rounding bug, and a provider that just refused this turn
+    // is not owed an instant second one.
+    const hint = Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0
       ? `Retry in about ${retryAfterSeconds}s.`
       : "Wait a bit and retry.";
     return {

@@ -40,15 +40,15 @@ test("userModelEntry fills conservative picker metadata", () => {
   assert.ok(entry.description.length > 0);
 });
 
-test("OpenCode's opaque free preview id is presented as Ox Alpha Free", () => {
+
+test("OpenCode Free Muse Spark curation uses the official picker label", () => {
   const entry = userModelEntry({
-    providerId: "opencode-free",
-    upstreamId: "x-preview-f-free",
+    providerId: "opencode-free-responses",
+    upstreamId: "muse-spark-1.3-contributor-free",
     priority: 100,
+    metadata: { isFree: true },
   });
-  assert.equal(entry.slug, "opencode-free/x-preview-f-free");
-  assert.equal(entry.upstreamModel, "x-preview-f-free");
-  assert.equal(entry.displayName, "Ox Alpha Free");
+  assert.equal(entry.displayName, "Muse Spark 1.3 Contributor (OpenCode Free)");
 });
 
 test("curation metadata can set sizing and the effort ladder", () => {
@@ -67,6 +67,7 @@ test("curation metadata can set sizing and the effort ladder", () => {
       ],
       defaultEffort: "medium",
       serviceTiers: [{ id: "priority", name: "Fast" }],
+      supportsSearchHistory: true,
       requiresTrailingUserTurn: true,
       isFree: true,
     },
@@ -76,6 +77,7 @@ test("curation metadata can set sizing and the effort ladder", () => {
   assert.equal(entry.reasoningLevels.length, 3);
   assert.equal(entry.defaultEffort, "medium");
   assert.deepEqual(entry.serviceTiers, [{ id: "priority", name: "Fast" }]);
+  assert.equal(entry.supportsSearchHistory, true);
   assert.equal(entry.requiresTrailingUserTurn, true);
   assert.equal(entry.isFree, true);
 });
@@ -92,6 +94,20 @@ test("curation metadata can expose provider-verified reasoning summaries", () =>
   });
   assert.equal(entry.supportsReasoningSummaries, true);
   assert.equal(entry.defaultReasoningSummary, "auto");
+});
+
+test("curation metadata preserves only explicit endpoint capabilities", () => {
+  const entry = userModelEntry({
+    providerId: "openrouter",
+    upstreamId: "vendor/embedding-model",
+    priority: 100,
+    metadata: {
+      supportedEndpoints: ["/embeddings"],
+      endpoint: "/audio/speech",
+    },
+  });
+  assert.deepEqual(entry.supportedEndpoints, ["/embeddings"]);
+  assert.equal(entry.endpoint, undefined);
 });
 
 test("curation metadata cannot replace identity or routing fields", () => {
@@ -180,6 +196,44 @@ test("registry merges valid user models and skips collisions", async () => {
     },
     // Unknown provider must be skipped, not fatal.
     userModelEntry({ providerId: "no-such-provider", upstreamId: "x-model", priority: 102 }),
+    // Endpoint-only models stay out of conversational pickers. A listed model
+    // that omits its provider's chat route would otherwise advertise a turn
+    // that the forwarder must refuse.
+    {
+      ...userModelEntry({
+        providerId: "openrouter",
+        upstreamId: "vendor/embedding-only-listed",
+        priority: 116,
+        metadata: { supportedEndpoints: ["/embeddings"] },
+      }),
+      listed: true,
+    },
+    {
+      ...userModelEntry({
+        providerId: "openrouter",
+        upstreamId: "vendor/embedding-only",
+        priority: 117,
+        metadata: { supportedEndpoints: ["/embeddings"] },
+      }),
+      listed: false,
+    },
+    {
+      ...userModelEntry({
+        providerId: "openrouter",
+        upstreamId: "vendor/bad-endpoint",
+        priority: 118,
+      }),
+      supportedEndpoints: ["/audio/speech"],
+    },
+    {
+      ...userModelEntry({
+        providerId: "anthropic-api",
+        upstreamId: "vendor/embedding-only",
+        priority: 119,
+        metadata: { supportedEndpoints: ["/embeddings"] },
+      }),
+      listed: false,
+    },
     // Announcement copy must be a non-empty string; a blank one is skipped.
     {
       ...userModelEntry({ providerId: "deepseek", upstreamId: "deepseek-blank-nux", priority: 103 }),
@@ -190,6 +244,10 @@ test("registry merges valid user models and skips collisions", async () => {
     {
       ...userModelEntry({ providerId: "deepseek", upstreamId: "deepseek-bad-search", priority: 106 }),
       searchTool: { mode: "emulated" },
+    },
+    {
+      ...userModelEntry({ providerId: "deepseek", upstreamId: "deepseek-bad-search-history", priority: 120 }),
+      supportsSearchHistory: "yes",
     },
     // Standalone search is Codex-side execution; it remains an explicit
     // per-model opt-in rather than a provider-wide default.
@@ -241,12 +299,18 @@ test("registry merges valid user models and skips collisions", async () => {
   const registry = await import("../src/model-registry.mjs");
   const slugs = registry.MODELS.map((model) => model.slug);
   assert.ok(slugs.includes("deepseek/deepseek-user-test"));
+  assert.equal(slugs.includes("openrouter/vendor/embedding-only-listed"), false);
+  assert.equal(slugs.includes("openrouter/vendor/embedding-only"), true);
+  assert.equal(slugs.includes("openrouter/vendor/bad-endpoint"), false);
+  assert.equal(slugs.includes("anthropic-api/vendor/embedding-only"), false);
   assert.equal(slugs.filter((slug) => slug === "deepseek/deepseek-v4-pro").length, 1);
-  assert.equal(slugs.filter((slug) => slug === "opencode-free/ox-alpha").length, 1);
-  assert.ok(!slugs.includes("opencode-free/x-preview-f-free"));
+  assert.equal(slugs.includes("opencode-free/ox-alpha"), false);
+  assert.equal(slugs.filter((slug) => slug === "opencode-free/x-preview-f-free").length, 1);
+  assert.equal(registry.MODEL_SLUG_ALIASES.has("opencode-free/x-preview-f-free"), false);
+  // Historical user state keeps x-preview-f-free under its opaque id with curated suffix.
   assert.equal(
-    registry.MODEL_SLUG_ALIASES.get("opencode-free/x-preview-f-free"),
-    "opencode-free/ox-alpha",
+    registry.MODEL_BY_SLUG.get("opencode-free/x-preview-f-free").displayName,
+    "x-preview-f-free (curated)",
   );
   assert.equal(registry.MODEL_SLUG_ALIASES.has("deepseek/deepseek-v4-pro"), false);
   assert.equal(registry.MODEL_BY_SLUG.get("deepseek/deepseek-v4-pro").provider, "deepseek");
@@ -255,12 +319,25 @@ test("registry merges valid user models and skips collisions", async () => {
     "opencode-go-responses/grok-4.5",
   );
   assert.equal(
+    registry.MODEL_SLUG_ALIASES.get("opencode-go/ox-alpha"),
+    "opencode-go/glm-5.3-flash",
+  );
+  assert.equal(
+    registry.MODEL_SLUG_ALIASES.get("opencode-go/ox-alpha-free"),
+    "opencode-go/glm-5.3-flash",
+  );
+  assert.equal(
+    registry.MODEL_BY_SLUG.get("opencode-go/ox-alpha"),
+    registry.MODEL_BY_SLUG.get("opencode-go/glm-5.3-flash"),
+  );
+  assert.equal(
     registry.MODEL_BY_SLUG.get("opencode-go/grok-4.5").provider,
     "opencode-go-responses",
   );
   assert.ok(!slugs.includes("no-such-provider/x-model"));
   assert.ok(!slugs.includes("deepseek/deepseek-blank-nux"));
   assert.ok(!slugs.includes("deepseek/deepseek-bad-search"));
+  assert.ok(!slugs.includes("deepseek/deepseek-bad-search-history"));
   assert.ok(slugs.includes("deepseek/deepseek-standalone-search"));
   assert.ok(!slugs.includes("deepseek/deepseek-bad-detail"));
   assert.ok(!slugs.includes("deepseek/deepseek-bad-trailing-turn"));
@@ -276,11 +353,26 @@ test("registry merges valid user models and skips collisions", async () => {
   assert.ok(registry.USER_MODEL_WARNINGS.length >= 4);
   assert.ok(registry.USER_MODEL_WARNINGS.some((warning) => /may not declare multiAgentVersion v2/.test(warning)));
   assert.ok(registry.USER_MODEL_WARNINGS.some((warning) => (
-    /alias deepseek\/deepseek-v4-pro/.test(warning) && /collides with an existing model or alias/.test(warning)
+    /deepseek\/deepseek-v4-pro/.test(warning) && /duplicates checked-in route/.test(warning)
   )));
   assert.ok(registry.USER_MODEL_WARNINGS.some((warning) => (
-    /alias opencode-go\/grok-4\.5/.test(warning) && /collides with an existing model or alias/.test(warning)
+    /opencode-go\/grok-4\.5/.test(warning) && /collides with an existing model alias/.test(warning)
   )));
+  // The router cites why a slug has no route (#689), so each skipped entry's
+  // reason is kept by slug, including the ones dropped after the merge settles.
+  assert.match(
+    registry.USER_MODELS_SKIPPED.get("deepseek/deepseek-self-certified"),
+    /may not declare multiAgentVersion v2/,
+  );
+  assert.match(
+    registry.USER_MODELS_SKIPPED.get("no-such-provider/x-model"),
+    /references unknown provider no-such-provider/,
+  );
+  assert.match(
+    registry.USER_MODELS_SKIPPED.get("deepseek/deepseek-bad-upgrade"),
+    /upgrades to unknown model no-such\/model/,
+  );
+  assert.equal(registry.USER_MODELS_SKIPPED.has("deepseek/deepseek-user-test"), false);
   const merged = registry.MODEL_BY_SLUG.get("deepseek/deepseek-user-test");
   assert.equal(merged.listed, true);
   assert.equal(merged.availabilityNux, "Now available through your DeepSeek key.");

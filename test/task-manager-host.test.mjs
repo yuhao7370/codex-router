@@ -15,13 +15,15 @@ const SIGNAL_PROXY = `data:text/javascript,${encodeURIComponent(
 )}`;
 
 async function waitForHealth(origin, child, errors) {
-  const deadline = Date.now() + 5_000;
+  // Windows startup proves process identity and writes private process state.
+  // Give its bounded PowerShell probes room under full-suite contention.
+  const deadline = Date.now() + (process.platform === "win32" ? 30_000 : 5_000);
   while (Date.now() < deadline) {
     if (child.exitCode !== null) {
       throw new Error(`Host exited early (${child.exitCode}): ${errors()}`);
     }
     try {
-      const response = await fetch(`${origin}/health`);
+      const response = await fetch(`${origin}/health`, { signal: AbortSignal.timeout(1_000) });
       if (response.ok) return response;
     } catch {
       // The isolated host has not bound yet.

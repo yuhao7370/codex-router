@@ -2,9 +2,9 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import {
+  applyGrokFileToolsOverlay,
   applyInstructionOverlay,
-  applyTokenMaxxingOverlay,
-  tokenMaxxingActive,
+  grokFileToolsOverlayFor,
 } from "../src/instruction-overlays.mjs";
 import { MODEL_BY_SLUG } from "../src/model-registry.mjs";
 
@@ -20,37 +20,27 @@ test("Grok 4.6 OAuth distinguishes local files from discovered MCP resources", (
   assert.match(instructions, /Keep using read_mcp_resource for valid resources/i);
 });
 
-test("token maxxing activates exactly at seventy percent of auto-compaction", () => {
-  const base = {
-    enabled: true,
-    autoCompact: 100_000,
-  };
-  assert.equal(tokenMaxxingActive({ ...base, estimatedTokens: 69_999 }), false);
-  assert.equal(tokenMaxxingActive({ ...base, estimatedTokens: 70_000 }), true);
-  assert.equal(tokenMaxxingActive({ ...base, estimatedTokens: 90_000 }), true);
-  assert.equal(tokenMaxxingActive({ ...base, estimatedTokens: 90_000, enabled: false }), false);
-  assert.equal(tokenMaxxingActive({ ...base, estimatedTokens: undefined }), false);
+test("Grok file-tool overlay is available without replacing the catalog MCP overlay", () => {
+  const model = MODEL_BY_SLUG.get("grok-oauth/grok-4.6");
+  assert.equal(model?.instructionOverlay, "filesystem-mcp-discipline");
+  const gated = applyInstructionOverlay("Base instructions.", "grok-file-tools");
+  assert.match(gated, /search_replace/);
+  assert.match(gated, /read_file/);
+  assert.match(gated, /run_terminal_command is only for processes/i);
+  assert.match(gated, /Do not dump minified node_modules/i);
+  assert.doesNotMatch(gated, /Create files with write/);
+  assert.doesNotMatch(gated, /write is create-only/);
+  const withWrite = applyInstructionOverlay("Base instructions.", "grok-file-tools-write");
+  assert.match(withWrite, /Create files with write/);
+  assert.match(withWrite, /write is create-only/);
 });
 
-test("the pressure overlay is terse, recoverable, and can stand alone", () => {
-  const inactive = applyTokenMaxxingOverlay("Base instructions.", {
-    enabled: true,
-    estimatedTokens: 69_999,
-    autoCompact: 100_000,
-  });
-  assert.equal(inactive, "Base instructions.");
-
-  const active = applyTokenMaxxingOverlay("Base instructions.", {
-    enabled: true,
-    estimatedTokens: 70_000,
-    autoCompact: 100_000,
-  });
-  assert.match(active, /^Base instructions\./u);
-  assert.match(active, /Be terse in commentary and final prose/u);
-  assert.match(active, /Repeat its named source call only when omitted detail is necessary/u);
-
-  assert.match(
-    applyTokenMaxxingOverlay(undefined, { active: true }),
-    /^## Context pressure mode/u,
-  );
+test("file-tool overlay only names the installed façade tools", () => {
+  const searchOnly = grokFileToolsOverlayFor(new Set(["search_replace"]));
+  assert.match(searchOnly, /search_replace/);
+  assert.doesNotMatch(searchOnly, /read_file/);
+  assert.doesNotMatch(searchOnly, /run_terminal_command/);
+  const applied = applyGrokFileToolsOverlay("Base.", new Set(["search_replace", "write"]));
+  assert.match(applied, /Create files with write/);
+  assert.doesNotMatch(applied, /read_file/);
 });

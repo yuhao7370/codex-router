@@ -14,6 +14,7 @@ test("the Windows operational scripts parse in Windows PowerShell", { skip: proc
     "deploy-codex-router.ps1",
     "restart-codex-router.ps1",
     "codex-router.ps1",
+    "src/windows-process-tree.ps1",
     "scripts/build-electron-companion.ps1",
   ]) {
     const target = path.join(root, name).replaceAll("'", "''");
@@ -128,10 +129,13 @@ test("full Windows disable and uninstall purge only Task Manager artifacts befor
   for (const command of ["disable", "uninstall"]) {
     const start = source.indexOf(`  "${command}" {`);
     const end = source.indexOf("\n  }", start);
-    const branch = source.slice(start, end);
-    const purge = branch.indexOf('src\\task-manager-install.mjs" @("purge")');
-    const service = branch.indexOf('src\\service.mjs" @("uninstall")');
-    assert.ok(purge >= 0 && service > purge, `${command} must purge the manager before Router uninstall`);
-    assert.doesNotMatch(branch, /tray-service|win-unpacked|control-center/i);
+    assert.match(source.slice(start, end), /Remove-TargetIntegration/);
   }
+  const helper = source.slice(source.indexOf("function Remove-TargetIntegration {"),
+    source.indexOf("function Open-ControlCenterWindow {"));
+  const lastClient = helper.indexOf("if ([string]::IsNullOrWhiteSpace($Remaining))");
+  const purge = helper.indexOf('src\\task-manager-install.mjs" @("purge")');
+  const service = helper.indexOf('src\\service.mjs" @("uninstall")');
+  assert.ok(lastClient >= 0 && purge > lastClient && service > purge);
+  assert.doesNotMatch(helper, /tray-service|win-unpacked|control-center/i);
 });

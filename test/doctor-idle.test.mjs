@@ -5,9 +5,12 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { openPort } from "./port-pool.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const callerSecret = "doctor-idle-caller-capability-with-sufficient-length";
+const routerPort = String(await openPort());
+const managerPort = String(await openPort());
 
 // The stub leaves a tombstone when `codex login` runs against the user's real
 // CODEX_HOME: under --no-discovery every probe that would make Codex read its
@@ -48,6 +51,7 @@ function child(script, args, env) {
     cwd: root,
     env,
     encoding: "utf8",
+    timeout: 45_000,
   });
 }
 
@@ -75,7 +79,11 @@ function stageIdleHome() {
     ...process.env,
     CODEX_BIN: writeCodexStub(codexHome, loginSentinel, codexHome, accountSentinel),
     CODEX_HOME: codexHome,
-    CODEX_ROUTER_PORT: "46193",
+    CODEX_ROUTER_PORT: routerPort,
+    MODEL_ROUTER_PORT: routerPort,
+    MODEL_ROUTER_CONTROL_PORT: managerPort,
+    // Never query the operator's actual scheduled services from this fixture.
+    CODEX_ROUTER_SERVICE_PLATFORM: "test-fixture",
     CODEX_ROUTER_STATE_DIR: stateDir,
     MODEL_ROUTER_STATE_DIR: stateDir,
     MODEL_ROUTER_TARGET: "codex",
@@ -140,6 +148,14 @@ test(
       // must be environmental -- no running service, no installed skill pack,
       // and on CI no LiteLLM virtual environment either.
       const failed = report.checks.filter((check) => check.status === "fail");
+      if (process.platform === "win32") {
+        for (const name of [
+          "Task Manager service", "Task Manager health",
+          "Task Manager privacy", "Task Manager topology",
+        ]) {
+          assert.equal(byName.get(name)?.status, "fail", `${name} must not report an installed manager`);
+        }
+      }
       const allowed = new Set([
         "Background service",
         "Router health",
@@ -148,7 +164,12 @@ test(
         // The staged secrets get POSIX modes, not the Windows ACL the real
         // writers apply, so these two rows are staging noise on win32 only.
         ...(process.platform === "win32"
-          ? ["Internal service key", "Router caller key"]
+          ? [
+              "Internal service key", "Router caller key",
+              // No standalone service is installed in this isolated fixture.
+              "Task Manager service", "Task Manager health",
+              "Task Manager privacy", "Task Manager topology",
+            ]
           : []),
       ]);
       assert.deepEqual(

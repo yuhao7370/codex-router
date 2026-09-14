@@ -2,6 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 
 import { writePrivateJson } from "./file-security.mjs";
+import { curatedModelDisplayName } from "./opencode-curation.mjs";
 import { STATE_DIR } from "./paths.mjs";
 
 // User-curated models live outside the checked-in config/ registry tree so a checkout update
@@ -53,6 +54,7 @@ export function hasDefaultUserModelReasoning(entry) {
 // identity and routing fields always come from the provider id and the
 // discovered model id.
 const METADATA_FIELDS = new Set([
+  "displayName",
   "description",
   "contextWindow",
   "autoCompact",
@@ -60,12 +62,15 @@ const METADATA_FIELDS = new Set([
   "reasoningLevels",
   "defaultEffort",
   "serviceTiers",
+  "supportsSearchHistory",
   "supportsReasoningSummaries",
   "defaultReasoningSummary",
   "availabilityNux",
   "upgradeTo",
   "requiresTrailingUserTurn",
   "isFree",
+  "toolSchemaRecursion",
+  "supportedEndpoints",
 ]);
 
 // Some providers deliberately publish opaque preview ids while documenting a
@@ -73,11 +78,13 @@ const METADATA_FIELDS = new Set([
 // and upstream id: the id remains the routing identity, and a reseller cannot
 // accidentally rename another provider's model with the same slug.
 const OFFICIAL_MODEL_DISPLAY_NAMES = new Map([
-  ["opencode-free/x-preview-f-free", "Ox Alpha Free"],
 ]);
 
 export function officialModelDisplayName(providerId, upstreamId) {
-  return OFFICIAL_MODEL_DISPLAY_NAMES.get(`${providerId}/${upstreamId}`);
+  return (
+    OFFICIAL_MODEL_DISPLAY_NAMES.get(`${providerId}/${upstreamId}`) ||
+    curatedModelDisplayName(providerId, upstreamId)
+  );
 }
 
 function gatewaySafe(value) {

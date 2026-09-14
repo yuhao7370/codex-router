@@ -3,19 +3,39 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
+  readProviderCatalogCache,
   providerCatalogIdentityFingerprint,
   withProviderCatalogCacheTransaction,
+  writeProviderCatalogCache,
 } from "./model-catalog-cache.mjs";
 import { modelCatalogMetadata } from "./model-catalog-metadata.mjs";
 import {
+  mergeDiscoveredModels,
+  modelMetadataFromPreset,
+  modelMetadataFromProviderRecord,
+} from "./model-capabilities.mjs";
+import { genericProviderDiscoverySnapshot } from "./generic-providers.mjs";
+import {
   anonymousModelAllowed,
+  CHECKED_IN_MODELS,
   MODELS,
-  PROVIDERS,
+  RUNTIME_PROVIDERS,
   resolveProviderBaseUrl,
 } from "./model-registry.mjs";
 import { curatedModelBlockReason } from "./opencode-curation.mjs";
+import {
+  OPENCODE_SESSION_FALLBACKS,
+  applyOpenCodeSessionHeaders,
+  isOpenCodeProvider,
+} from "./opencode-session.mjs";
 import { providerCatalogRouteIds } from "./provider-catalogs.mjs";
+import { readUserModels } from "./user-models.mjs";
 import { credentialStatus, resolveProviderCredential } from "./provider-credentials.mjs";
+import { VERSION } from "./version.mjs";
+import {
+  fetchUntrustedModelCatalog,
+  validateModelCatalogPayload,
+} from "./untrusted-model-discovery.mjs";
 import {
   ensureFreshGitHubCopilotSession,
   githubCopilotCatalogHeaders,
@@ -41,7 +61,7 @@ const EFFORT_DESCRIPTIONS = {
 };
 
 function modelEntries(payload, provider) {
-  const data = Array.isArray(payload) ? payload : payload?.data;
+  const data = Array.isArray(payload) ? payload : payload?.data ?? payload?.models;
   if (!Array.isArray(data)) throw new Error("The provider returned an invalid model list.");
   const candidates = provider?.authMode === "anonymous"
     ? data.filter((item) => anonymousModelAllowed(provider, item?.id))
@@ -124,6 +144,71 @@ export function discoveredMetadata(item) {
   return metadata;
 }
 
+// OpenAI's documented `/models` response uses `id`, but compatible local
+// servers commonly return `model` (and a few return the canonical name as
+// `upstreamId`). Keep discovery provider-agnostic without changing the
+// filtering policy for built-in providers.
+function modelRecordId(item) {
+  return String(item?.id ?? item?.model ?? item?.upstreamId ?? item?.slug ?? "").trim();
+}
+
+function modelRecords(payload, provider) {
+  const data = Array.isArray(payload) ? payload : payload?.data ?? payload?.models;
+  if (!Array.isArray(data)) throw new Error("The provider returned an invalid model list.");
+  const ids = new Set(modelIds(payload, provider));
+  return data.filter((item) => ids.has(modelRecordId(item)));
+}
+
+function metadataFromRecords(payload, provider) {
+  const metadata = {};
+  for (const record of modelRecords(payload, provider)) {
+    try {
+      const entry = modelMetadataFromProviderRecord(record);
+      metadata[entry.upstreamId] = entry;
+    } catch {
+      // Model ids remain useful even when an optional provider capability
+      // record is malformed. Discovery must not discard the whole catalog.
+    }
+  }
+  return metadata;
+}
+
+function providerPresetMetadata(providerId) {
+  return CHECKED_IN_MODELS
+    .filter((model) => model.provider === providerId)
+    .flatMap((model) => {
+      try {
+        return [modelMetadataFromPreset(model)];
+      } catch {
+        return [];
+      }
+    });
+}
+
+function providerUserMetadata(providerId) {
+  return readUserModels()
+    .filter((model) => model.provider === providerId)
+    .flatMap((model) => {
+      try {
+        return [modelMetadataFromPreset(model)];
+      } catch {
+        // A malformed user-owned override must not block discovery for the
+        // provider or affect native GPT entries in the merged catalog.
+        return [];
+      }
+    });
+}
+
+function mergedProviderModels(providerId, liveMetadata, defaults) {
+  return mergeDiscoveredModels({
+    providerId,
+    live: Object.values(liveMetadata || {}),
+    verifiedPresets: providerPresetMetadata(providerId),
+    userOverrides: providerUserMetadata(providerId),
+    defaults,
+  });
+}
+
 function zeroPrice(value) {
   if (value === undefined || value === null || value === "") return false;
   const numeric = Number(value);
@@ -137,7 +222,7 @@ function zeroPrice(value) {
 // price, or zero input and output token prices.
 export function freeModelIds(payload, provider) {
   if (provider?.id !== "orca") return [];
-  const data = Array.isArray(payload) ? payload : payload?.data;
+  const data = Array.isArray(payload) ? payload : payload?.data ?? payload?.models;
   if (!Array.isArray(data)) throw new Error("The provider returned an invalid model list.");
   const callable = new Set(modelIds(payload, provider));
   return data
@@ -183,12 +268,12 @@ function advertisedContextLength(item) {
 // the provider sized in silence is absent rather than guessed: curation falls
 // back to its conservative default only when nothing was advertised.
 export function modelContextLengths(payload, provider) {
-  const data = Array.isArray(payload) ? payload : payload?.data;
+  const data = Array.isArray(payload) ? payload : payload?.data ?? payload?.models;
   if (!Array.isArray(data)) return {};
   const kept = new Set(modelIds(payload, provider));
   const lengths = {};
   for (const item of data) {
-    const id = String(item?.id || "").trim();
+    const id = modelRecordId(item);
     if (!id || !kept.has(id) || id in lengths) continue;
     const length = advertisedContextLength(item);
     if (length !== undefined) lengths[id] = length;
@@ -213,6 +298,11 @@ async function providerDiscoveryIdentity(provider) {
 function sameProviderDiscoveryIdentity(left, right) {
   return providerDiscoveryIdentityFingerprint(left)
     === providerDiscoveryIdentityFingerprint(right);
+}
+
+function discoveryEndpoint(identity) {
+  const baseUrl = identity?.baseUrl || identity?.session?.apiServerUrl;
+  return typeof baseUrl === "string" && baseUrl.trim() ? `${baseUrl.replace(/\/+$/, "")}/models` : undefined;
 }
 
 export function providerDiscoveryIdentityFingerprint(identity) {
@@ -244,7 +334,11 @@ function credentialChangedError(provider) {
 
 async function providerPayload(provider, identity) {
   const fixture = option("--fixture");
-  if (fixture) return JSON.parse(readFileSync(path.resolve(fixture), "utf8"));
+  if (fixture) {
+    const payload = JSON.parse(readFileSync(path.resolve(fixture), "utf8"));
+    validateModelCatalogPayload(payload);
+    return payload;
+  }
   if (provider.id === "devin-cli") {
     const { listCascadeModels } = await import("./devin-cli-forwarder.mjs");
     const models = await listCascadeModels({
@@ -278,15 +372,17 @@ async function providerPayload(provider, identity) {
       ...githubCopilotCatalogHeaders(session.token),
     };
   }
-  const response = await fetch(`${baseUrl}/models`, {
-    headers,
-    signal: AbortSignal.timeout(30_000),
-  });
-  const payload = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    throw new Error(payload?.error?.message || `Provider model discovery returned HTTP ${response.status}.`);
+  if (isOpenCodeProvider(provider)) {
+    headers["User-Agent"] = `codex-router/${VERSION}`;
+    applyOpenCodeSessionHeaders(headers, {
+      provider,
+      fallback: OPENCODE_SESSION_FALLBACKS.discovery,
+    });
   }
-  return payload;
+  return fetchUntrustedModelCatalog(`${baseUrl}/models`, {
+    headers,
+    allowPrivate: Boolean(provider.keyless),
+  });
 }
 
 /**
@@ -299,10 +395,24 @@ async function providerPayload(provider, identity) {
  */
 export async function discoverProviderModels(
   providerId,
-  { refresh = false, cache = true, fixture = false, loadPayload = providerPayload } = {},
+  { refresh = false, cache = true, fixture = false, scope, loadPayload = providerPayload } = {},
 ) {
-  const provider = PROVIDERS.get(providerId);
+  const provider = RUNTIME_PROVIDERS.get(providerId);
   if (!provider) throw new Error(`Unknown provider: ${providerId}`);
+  if (provider.generic === true) {
+    const fixturePath = option("--fixture");
+    const genericFixture = fixturePath
+      ? JSON.parse(readFileSync(path.resolve(fixturePath), "utf8"))
+      : fixture && fixture !== true
+        ? fixture
+        : undefined;
+    return discoverGenericProviderModels(providerId, {
+      refresh,
+      cache,
+      scope,
+      ...(genericFixture !== undefined ? { fixture: genericFixture } : {}),
+    });
+  }
   // Discovery asks one endpoint what it serves. A per-model-endpoint provider
   // is not an endpoint, so there is no single host to ask and no answer that
   // would mean anything for the models under it. Refusing beats picking one of
@@ -330,11 +440,11 @@ export async function discoverProviderModels(
     ({ cached, identity } = await withProviderCatalogCacheTransaction(async (catalog) => {
       const currentIdentity = await providerDiscoveryIdentity(provider);
       const currentFingerprint = providerDiscoveryIdentityFingerprint(currentIdentity);
-      const held = refresh ? undefined : catalog.read(providerId);
+      const held = refresh ? undefined : catalog.read(providerId, { scope });
       if (held?.identityFingerprint === currentFingerprint) {
         return { cached: held, identity: currentIdentity };
       }
-      if (held) catalog.forget([providerId]);
+      if (held) catalog.forget([providerId], { scope });
       return { cached: undefined, identity: currentIdentity };
     }));
   }
@@ -342,16 +452,19 @@ export async function discoverProviderModels(
   let free;
   let contextLengths;
   let metadata;
+  let modelMetadata;
   let fetchedAt;
   if (cached) {
     discovered = cached.discovered;
     free = cached.free || [];
     contextLengths = cached.contextLengths || {};
     metadata = cached.metadata || {};
+    modelMetadata = cached.modelMetadata || {};
     fetchedAt = cached.fetchedAt;
   } else {
     identity ||= usingFixture ? undefined : await providerDiscoveryIdentity(provider);
     const payload = await loadPayload(provider, identity);
+    validateModelCatalogPayload(payload);
     discovered = modelIds(payload, provider);
     free = freeModelIds(payload, provider);
     contextLengths = modelContextLengths(payload, provider);
@@ -369,6 +482,7 @@ export async function discoverProviderModels(
       discovered.map((id) => [id, { ...(legacyMetadata[id] || {}), ...(metadata[id] || {}) }])
         .filter(([, value]) => Object.keys(value).length > 0),
     );
+    modelMetadata = metadataFromRecords(payload, provider);
     fetchedAt = new Date().toISOString();
     if (storeAnswer) {
       await withProviderCatalogCacheTransaction(async (catalog) => {
@@ -381,8 +495,17 @@ export async function discoverProviderModels(
           free,
           contextLengths,
           metadata,
+          modelMetadata,
           fetchedAt,
+          scope,
           identityFingerprint: providerDiscoveryIdentityFingerprint(identity),
+          provenance: {
+            schema: "codex-router/provider-catalog/v1",
+            providerId,
+            endpoint: discoveryEndpoint(identity),
+            identityFingerprint: providerDiscoveryIdentityFingerprint(identity),
+            ...(scope ? { scope } : {}),
+          },
         });
       });
     }
@@ -425,6 +548,7 @@ export async function discoverProviderModels(
     // Missing fields stay missing: discovery is an evidence record, not a
     // reason to invent curation defaults or enable a route automatically.
     ...(Object.keys(metadata || {}).length ? { metadata } : {}),
+    modelMetadata: mergedProviderModels(providerId, modelMetadata),
     // Whether this list came from the provider just now or from the last time
     // it was asked. The surfaces that show it say which, so a stale list is
     // never mistaken for a live one.
@@ -437,6 +561,112 @@ export async function discoverProviderModels(
     fetchedAt,
     ...(provider.id === "orca" ? { free } : {}),
     note: "Discovery never edits the registry. New models must pass the live compatibility test before they are listed in Codex.",
+  };
+}
+
+export async function discoverGenericProviderModels(
+  providerId,
+  {
+    fetchImpl = globalThis.fetch,
+    timeoutMs = 30_000,
+    resolveHost,
+    proxyResolvesDestination,
+    fixture,
+    refresh = false,
+    cache = true,
+    scope,
+  } = {},
+) {
+  const snapshot = genericProviderDiscoverySnapshot(providerId);
+  const { descriptor, identityFingerprint } = snapshot;
+  // Fixtures are test/operator input and must never become a persistent
+  // catalog answer. Live generic catalogs use the same bounded, provider- and
+  // account-scoped cache as built-in discovery, so opening a dashboard does
+  // not repeatedly hit a local or remote endpoint.
+  const usingFixture = fixture !== undefined;
+  const storeAnswer = cache && !usingFixture;
+  const held = refresh || !storeAnswer ? undefined : readProviderCatalogCache(providerId, { scope });
+  const cached = held?.identityFingerprint === identityFingerprint ? held : undefined;
+  let discovered;
+  let modelMetadata;
+  let fetchedAt;
+  if (cached) {
+    discovered = cached.discovered;
+    modelMetadata = cached.modelMetadata || {};
+    fetchedAt = cached.fetchedAt;
+  } else {
+    const payload = usingFixture
+      ? (typeof fixture === "string" ? JSON.parse(fixture) : fixture)
+      : await snapshot.fetchCatalog({
+          fetchImpl,
+          timeoutMs,
+          resolveHost,
+          proxyResolvesDestination,
+        });
+    validateModelCatalogPayload(payload);
+    discovered = modelIds(payload, descriptor);
+    modelMetadata = metadataFromRecords(payload, descriptor);
+    fetchedAt = new Date().toISOString();
+    if (storeAnswer) {
+      if (genericProviderDiscoverySnapshot(providerId).identityFingerprint !== identityFingerprint) {
+        throw new Error(`Generic provider ${providerId} credentials changed while its model catalog was loading.`);
+      }
+      await writeProviderCatalogCache(providerId, {
+        discovered,
+        modelMetadata,
+        fetchedAt,
+        scope,
+        identityFingerprint,
+        provenance: {
+          schema: "codex-router/provider-catalog/v1",
+          providerId,
+          endpoint: `${descriptor.baseUrl}/models`,
+          identityFingerprint,
+          ...(scope ? { scope } : {}),
+        },
+      });
+    }
+  }
+  const merged = mergeDiscoveredModels({
+    providerId,
+    live: Object.values(modelMetadata),
+    userOverrides: providerUserMetadata(providerId),
+    defaults: {},
+  });
+  const registered = MODELS
+    .filter((model) => model.provider === providerId)
+    .map((model) => model.upstreamModel)
+    .sort();
+  const registeredSet = new Set(registered);
+  const discoveredSet = new Set(discovered);
+  const unregistered = discovered.filter((id) => !registeredSet.has(id));
+  const publicationBlocked = descriptor.adapter === "openai-completions"
+    ? "This endpoint exposes legacy OpenAI Completions. Codex Router can inspect its catalog, but has no completions caller surface and will not publish an unusable route."
+    : undefined;
+  const blocked = publicationBlocked
+    ? Object.fromEntries(unregistered.map((id) => [id, publicationBlocked]))
+    : {};
+  const contextLengths = Object.fromEntries(
+    Object.entries(modelMetadata)
+      .filter(([, metadata]) => Number.isInteger(metadata?.contextWindow))
+      .map(([id, metadata]) => [id, metadata.contextWindow]),
+  );
+  return {
+    provider: providerId,
+    descriptor: { ...descriptor, headers: undefined },
+    discovered,
+    registered,
+    unregistered,
+    addable: unregistered.filter((id) => !Object.hasOwn(blocked, id)),
+    blocked,
+    unavailable: registered.filter((id) => !discoveredSet.has(id)),
+    contextLengths,
+    modelMetadata: merged,
+    cached: Boolean(cached),
+    stale: Boolean(cached?.stale),
+    fetchedAt,
+    note: publicationBlocked ||
+      "Discovery never grants request behavior or edits the registry; curation must explicitly select every published model and any request profile.",
   };
 }
 

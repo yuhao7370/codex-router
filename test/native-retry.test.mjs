@@ -88,7 +88,9 @@ function run(env) {
 }
 
 async function waitFor(url, child) {
-  const deadline = Date.now() + 5_000;
+  // Parallel suite startup includes module loading and Windows filesystem work.
+  // This bounds readiness only; request/retry timing assertions remain unchanged.
+  const deadline = Date.now() + 30_000;
   while (Date.now() < deadline) {
     if (child.exitCode !== null) {
       throw new Error(`Child exited early (${child.exitCode}): ${child.testErrors()}`);

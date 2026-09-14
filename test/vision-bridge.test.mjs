@@ -61,7 +61,6 @@ const FLAGSHIP_VISION = {
   inputModalities: ["text", "image"],
   priority: 1,
 };
-
 function userTurn(parts) {
   return [{ type: "message", role: "user", content: parts }];
 }

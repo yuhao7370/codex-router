@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { MIMEType } from "node:util";
 
 import { CALLER_PATH_PREFIX, authenticatedRoute } from "./caller-auth.mjs";
+import { installStableFetchTransport } from "./fetch-transport.mjs";
 import {
   activeAccount,
   clearBlockedAccount,
@@ -36,6 +37,8 @@ import {
   rebuildCatalog,
   syncLocalRouterModels,
 } from "./local-router-sync.mjs";
+
+installStableFetchTransport();
 
 const HOST = "127.0.0.1";
 const PORT = Number(
@@ -378,7 +381,7 @@ export function startTaskManagerUi({
         const result = await syncLocalRouterModels();
         let catalogRebuilt = false;
         if (result.added.length > 0) {
-          rebuildCatalog();
+          await rebuildCatalog();
           catalogRebuilt = true;
         }
         sendJson(response, 200, {
@@ -398,7 +401,7 @@ export function startTaskManagerUi({
         const result = await cleanLocalRouterModels();
         let catalogRebuilt = false;
         if (result.removed.length > 0) {
-          rebuildCatalog();
+          await rebuildCatalog();
           catalogRebuilt = true;
         }
         sendJson(response, 200, {

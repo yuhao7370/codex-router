@@ -191,7 +191,7 @@ export function supportsImageInput(model) {
 }
 
 export function visionCapableModels(models) {
-  return (Array.isArray(models) ? models : []).filter(supportsImageInput);
+  return (Array.isArray(models) ? models : []).filter((model) => supportsImageInput(model));
 }
 
 function engineCostRank(model) {
