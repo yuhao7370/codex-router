@@ -359,7 +359,7 @@
       <div class="card">
         <div class="card-head">
           <h2>注入日志</h2>
-          <span class="stat-foot" style="margin:0">成功 <span class="mono" id="injection-count">0</span> 次 · <span class="mono" id="log-countdown">…</span> 后刷新</span>
+          <span class="stat-foot" style="margin:0">注入 <span class="mono" id="injection-count">0</span> 次 · 原生回退 <span class="mono" id="fallback-count">0</span> 次 · <span class="mono" id="log-countdown">…</span> 后刷新</span>
         </div>
         <div id="injection-log" class="result">暂无注入记录</div>
       </div>
@@ -605,15 +605,23 @@
     }
     const injections = status.injections || { count: 0, recent: [] };
     el('injection-count').textContent = String(injections.count);
-    const recent = (injections.recent || []).slice(0, 10);
+    el('fallback-count').textContent = String(injections.fallbackCount || 0);
+    const recent = (injections.recent || []).slice(0, 20);
     el('injection-log').textContent = recent.length
       ? recent.map(function (e) {
-          const info = accountIndex.get(e.accountId);
-          const email = (info && info.email) ? info.email : shortId(e.accountId);
+          const accountId = e.kind === 'native_fallback' ? e.fromAccountId : e.accountId;
+          const info = accountIndex.get(accountId);
+          const email = (info && info.email) ? info.email : shortId(accountId);
           const plan = (info && info.plan) ? ' · ' + info.plan : '';
           const speed = e.fastSource === 'native'
             ? ' · 原生 fast'
             : (e.fastSource === 'injected' || e.fast ? ' · 注入 fast' : ' · 标准');
+          if (e.kind === 'native_fallback') {
+            const outcome = e.status >= 200 && e.status < 300 ? '已回退' : '回退请求失败';
+            return formatTime(e.at) + '  ' + email + ' → 原生账号 · ' +
+              (e.model || '未知模型') + ' · 模型无权限 · ' + outcome +
+              '(HTTP ' + (e.status || '状态未知') + ')' + speed;
+          }
           return formatTime(e.at) + '  ' + email + plan + speed;
         }).join(String.fromCharCode(10))
       : '暂无注入记录';
