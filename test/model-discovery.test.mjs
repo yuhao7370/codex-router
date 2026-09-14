@@ -219,7 +219,7 @@ test("Copilot discovery exposes only account-enabled Responses models with tools
   assert.deepEqual(modelIds(payload, PROVIDERS.get("github-copilot")), ["gpt-responses"]);
 });
 
-test("local-router discovery is unauthenticated and drops anthropic aliases", async () => {
+test("local-router discovery is unauthenticated and retains all advertised IDs", async () => {
   let headers;
   const local = await localServer((request, response) => {
     headers = request.headers;
@@ -236,7 +236,7 @@ test("local-router discovery is unauthenticated and drops anthropic aliases", as
   process.env.MODEL_ROUTER_LOCAL_OPENAI_BASE_URL = `http://127.0.0.1:${local.port}/v1`;
   try {
     const result = await discoverProviderModels("local-router");
-    assert.deepEqual(result.discovered, ["deepseek-v4-pro"]);
+    assert.deepEqual(result.discovered, ["anthropic/deepseek-v4-pro", "deepseek-v4-pro"]);
     assert.equal(headers.authorization, undefined);
     assert.equal(headers["x-api-key"], undefined);
   } finally {

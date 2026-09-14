@@ -7,6 +7,7 @@ import test from "node:test";
 const dir = mkdtempSync(path.join(os.tmpdir(), "cr-local-router-sync-"));
 process.env.CODEX_ROUTER_STATE_DIR = dir;
 
+process.env.CODEX_HOME = path.join(process.env.CODEX_ROUTER_STATE_DIR, "codex");
 const {
   cleanLocalRouterModels,
   mergeLocalRouterModels,
@@ -196,4 +197,58 @@ test("prunes local-router models the service no longer advertises", () => {
     result.models.some((model) => model.provider === "deepseek"),
     "non-local-router models are preserved",
   );
+});
+
+test("sync uses fresh discovery IDs rather than the process registry's stale unregistered list", async () => {
+  const { readUserModels, writeUserModels, userModelEntry } = await import("../src/user-models.mjs");
+  const tuned = userModelEntry({ providerId: "local-router", upstreamId: "test-tuned", priority: 100,
+    metadata: { contextWindow: 999999, displayName: "My tuned model" } });
+  writeUserModels([tuned]);
+  const result = await syncLocalRouterModels({ discover: async () => ({
+    discovered: ["test-tuned", "test-fresh-a", "test-fresh-b", "test-fresh-a"],
+    unregistered: [], metadataById: {}, unavailable: [],
+  }) });
+  assert.deepEqual(result.added, ["test-fresh-a", "test-fresh-b"]);
+  assert.deepEqual(readUserModels().find((model) => model.upstreamModel === "test-tuned"), tuned);
+});
+
+test("sync makes new discoveries visible and retains a subsequent explicit hide", async () => {
+  const { readVisibleModels, readHiddenModels, setModelVisible } = await import("../src/model-picker-state.mjs");
+  const discover = async () => ({ discovered: ["test-default-visible"], unregistered: [], metadataById: {}, unavailable: [] });
+  await syncLocalRouterModels({ discover });
+  assert.ok(readVisibleModels().has("local-router/test-default-visible"));
+  setModelVisible("local-router/test-default-visible", false);
+  await syncLocalRouterModels({ discover });
+  assert.ok(readHiddenModels().has("local-router/test-default-visible"));
+  assert.ok(!readVisibleModels().has("local-router/test-default-visible"));
+});
+
+test("sync never prunes temporarily absent user models", async () => {
+  const { readUserModels, writeUserModels, userModelEntry } = await import("../src/user-models.mjs");
+  const absent = userModelEntry({ providerId: "local-router", upstreamId: "test-temporarily-offline", priority: 100 });
+  writeUserModels([absent]);
+  await syncLocalRouterModels({ discover: async () => ({
+    discovered: [], unregistered: [], metadataById: {}, unavailable: [],
+  }) });
+  assert.deepEqual(readUserModels(), [absent]);
+});
+
+test("sync re-reads user edits after acquiring the shared overlay lock", async () => {
+  const { withModelOverlayLock } = await import("../src/model-overlay-lock.mjs");
+  const { readUserModels, writeUserModels, userModelEntry } = await import("../src/user-models.mjs");
+  let release;
+  let entered;
+  const acquired = new Promise((resolve) => { entered = resolve; });
+  const held = withModelOverlayLock(async () => {
+    entered();
+    await new Promise((resolve) => { release = resolve; });
+    writeUserModels([userModelEntry({ providerId: "deepseek", upstreamId: "concurrent-edit", priority: 100 })]);
+  });
+  await acquired;
+  const syncing = syncLocalRouterModels({ discover: async () => ({
+    discovered: ["concurrent-discovery"], unregistered: [], metadataById: {}, unavailable: [],
+  }) });
+  release();
+  await Promise.all([held, syncing]);
+  assert.deepEqual(readUserModels().map((model) => model.upstreamModel), ["concurrent-edit", "concurrent-discovery"]);
 });

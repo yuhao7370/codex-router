@@ -11,6 +11,7 @@ import {
   writeTaskManagerProcessState,
 } from "./task-manager-process.mjs";
 import { startTaskManagerUi } from "./task-manager-ui.mjs";
+import { startLocalRouterAutoSync } from "./local-router-auto-sync.mjs";
 
 const callerSecret = assertCallerSecret(readFileSync(CALLER_SECRET_PATH, "utf8").trim());
 const serviceController = createRouterServiceController();
@@ -37,8 +38,17 @@ try {
   throw error;
 }
 
-server.once("close", clearOwnProcessState);
+// The host survives Router service restarts. Running discovery in the Router
+// itself would let Windows taskkill /T terminate the worker that reloads it.
+const localRouterAutoSync = startLocalRouterAutoSync({
+  onError: () => console.error("[codex-router] Local model discovery did not finish; it will retry."),
+});
+server.once("close", () => {
+  localRouterAutoSync.stop();
+  clearOwnProcessState();
+});
 server.once("error", (error) => {
+  localRouterAutoSync.stop();
   clearOwnProcessState();
   console.error(`[codex-router] Task Manager host failed: ${error.message}`);
   process.exitCode = 1;
@@ -46,6 +56,7 @@ server.once("error", (error) => {
 
 for (const signal of ["SIGINT", "SIGTERM"]) {
   process.on(signal, () => {
+    localRouterAutoSync.stop();
     if (!server.listening) {
       clearOwnProcessState();
       process.exit(0);

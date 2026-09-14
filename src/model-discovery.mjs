@@ -96,13 +96,10 @@ function modelEntries(payload, provider) {
         item.supported_endpoints.includes("/responses")
       )
     : data;
-  const visible = provider?.id === "local-router"
-    ? candidates.filter((item) => !String(item?.id || "").startsWith("anthropic/"))
-    : candidates;
   const seen = new Set();
   const entries = [];
-  for (const item of visible) {
-    const id = String(item?.id || "").trim();
+  for (const item of candidates) {
+    const id = modelRecordId(item);
     if (!id || seen.has(id)) continue;
     seen.add(id);
     entries.push({ id, raw: item });

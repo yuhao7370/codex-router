@@ -2651,3 +2651,35 @@ start does not exist at request latency. The port has to already be open.
   hide checked-in assets such as tray icons and documentation screenshots.
 - Files that are meant to ship — icons, fixtures, docs assets — go in their
   real home under version control, not in `generated/`.
+
+
+## Local-router automatic model discovery (fork behavior)
+
+The explicitly selected local-router provider is synchronized by the independent
+Task Manager host at startup and every five minutes. Discovery-disabled and
+unselected installations do not start a worker. Every advertised ID is added to
+the protected user-model overlay under the shared overlay lock; existing model
+metadata and explicit visibility decisions survive. This is the local-router
+exception to the upstream curated-model opt-in default.
+
+New local-router entries default visible once through seedModelsVisible. A
+manual or automatic refresh must never clear an explicit hide. Publication uses
+a fresh process to write both gateway routes and every installed client catalog,
+then reloads the managed Router. Record synchronization success only after those
+steps; failures must remain retryable even after the overlay has been written.
+Do not host the reloading worker inside the Router process tree on Windows:
+taskkill /T would kill the worker during its own reload.
+
+Native account entries own their original slugs and visibility. A listed native
+model suppresses the matching local-router upstream ID only in the signed-in
+picker; the namespaced external route remains available to existing tasks. A
+hidden native entry must not suppress a usable external route. Paired local
+anthropic/ protocol aliases keep their internal route but do not consume a
+second picker row or login-free alias slot. Never use a
+model-name allowlist to preserve newly released native models. Native account
+catalog refresh honors CODEX_ROUTER_NATIVE_PROXY_URL like native turns.
+
+User-facing model names omit legacy (curated) suffixes; routing identity remains
+in slug, gatewayModel, provider and upstreamModel. Coverage is in catalog,
+model-picker-state, user-models, local-router-sync, local-router-auto-sync and
+native-account-catalog tests. Tests must isolate CODEX_HOME and router state.

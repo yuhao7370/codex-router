@@ -1,8 +1,7 @@
-import { spawnSync } from "node:child_process";
-import path from "node:path";
-
 import { discoverProviderModels } from "./model-discovery.mjs";
-import { SOURCE_ROOT } from "./paths.mjs";
+import { CHECKED_IN_MODELS } from "./model-registry.mjs";
+import { withModelOverlayLock } from "./model-overlay-lock.mjs";
+import { seedModelsVisible } from "./model-picker-state.mjs";
 import { readUserModels, userModelEntry, writeUserModels } from "./user-models.mjs";
 
 // The local-router provider fronts an OpenAI-compatible service running on this
@@ -15,9 +14,9 @@ export function mergeLocalRouterModels({ existing, unregistered, metadataById = 
   const mine = existing.filter((model) => model.provider === "local-router");
   const others = existing.filter((model) => model.provider !== "local-router");
   const curated = new Set(mine.map((model) => model.upstreamModel));
-  const additions = (Array.isArray(unregistered) ? unregistered : [])
+  const additions = [...new Set((Array.isArray(unregistered) ? unregistered : [])
     .map((id) => String(id))
-    .filter((id) => id && !curated.has(id));
+    .filter((id) => id && !curated.has(id)))];
 
   const nextMine = [...mine];
   for (let index = 0; index < additions.length; index += 1) {
@@ -40,22 +39,33 @@ export function mergeLocalRouterModels({ existing, unregistered, metadataById = 
   };
 }
 
-export async function syncLocalRouterModels({ discover = discoverProviderModels } = {}) {
+export async function syncLocalRouterModels({
+  discover = discoverProviderModels,
+  lock = withModelOverlayLock,
+} = {}) {
   const discovery = await discover("local-router", { refresh: true });
-  const merged = mergeLocalRouterModels({
-    existing: readUserModels(),
-    unregistered: discovery.unregistered,
-    metadataById: discovery.metadataById,
+  return lock(() => {
+    // The process registry predates other writers' edits. Re-read the durable
+    // overlay under the shared lock and compare the live list only to shipped
+    // entries; discovery.unregistered can otherwise omit a deleted user model.
+    const shipped = CHECKED_IN_MODELS.filter((model) => model.provider === "local-router");
+    const shippedIds = new Set(shipped.map((model) => model.upstreamModel));
+    const merged = mergeLocalRouterModels({
+      existing: readUserModels(),
+      unregistered: discovery.discovered.filter((id) => !shippedIds.has(id)),
+      metadataById: discovery.metadataById,
+    });
+    if (merged.added.length > 0) writeUserModels(merged.models);
+    seedModelsVisible([...shipped, ...merged.models]
+      .filter((model) => model.provider === "local-router")
+      .map((model) => model.slug));
+    return {
+      discovered: discovery.discovered.length,
+      added: merged.added,
+      total: merged.total,
+      unavailable: discovery.unavailable,
+    };
   });
-  if (merged.added.length > 0) {
-    writeUserModels(merged.models);
-  }
-  return {
-    discovered: discovery.discovered.length,
-    added: merged.added,
-    total: merged.total,
-    unavailable: discovery.unavailable,
-  };
 }
 
 // Remove local-router user models the live service no longer advertises. Only
@@ -79,38 +89,19 @@ export function planLocalRouterRemovals({ existing, available }) {
 
 export async function cleanLocalRouterModels({ discover = discoverProviderModels } = {}) {
   const discovery = await discover("local-router", { refresh: true });
-  const merged = planLocalRouterRemovals({
-    existing: readUserModels(),
-    available: discovery.discovered,
+  return withModelOverlayLock(() => {
+    const merged = planLocalRouterRemovals({
+      existing: readUserModels(),
+      available: discovery.discovered,
+    });
+    if (merged.removed.length > 0) writeUserModels(merged.models);
+    return {
+      removed: merged.removed,
+      total: merged.total,
+      discovered: discovery.discovered.length,
+    };
   });
-  if (merged.removed.length > 0) {
-    writeUserModels(merged.models);
-  }
-  return {
-    removed: merged.removed,
-    total: merged.total,
-    discovered: discovery.discovered.length,
-  };
 }
 
-// Rebuild merged-models.json (what Codex's picker reads) without re-capturing
-// the native catalog. The router reloads the registry on its next start, so a
-// fresh model is both listed in Codex and routable once the process restarts.
-export function rebuildCatalog() {
-  const result = spawnSync(
-    process.execPath,
-    [path.join(SOURCE_ROOT, "src", "catalog.mjs")],
-    {
-      cwd: SOURCE_ROOT,
-      env: { ...process.env, MODEL_ROUTER_TARGET: "codex" },
-      encoding: "utf8",
-    },
-  );
-  if (result.error) throw result.error;
-  if (result.status !== 0) {
-    throw new Error(
-      (result.stderr || "Codex model catalog could not be refreshed.").trim(),
-    );
-  }
-  return result.stdout || "";
-}
+// Always publish the gateway and every installed client from fresh process state.
+export { publishModelOverlayFresh as rebuildCatalog } from "./model-overlay-publication.mjs";
