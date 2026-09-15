@@ -243,7 +243,9 @@ export async function restartRouterServiceIfInstalled({
     env,
     signal,
     deadline: operationDeadline,
-    stdio: "inherit",
+    // Captured output keeps the Windows Job runner windowless. Inheriting
+    // stdio explicitly selects a visible console in runProcessTree.
+    stdio: "capture",
   });
   assertOperationActive(signal, operationDeadline);
   if (result.error || result.status !== 0) {

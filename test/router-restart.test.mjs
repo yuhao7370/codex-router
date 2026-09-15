@@ -347,3 +347,13 @@ test("a failed restart fails loudly instead of pretending the route is live", as
     /could not be restarted/,
   );
 });
+
+
+test("programmatic restart never requests an inherited visible console", async () => {
+  const calls=[];
+  await restartRouterServiceIfInstalled({spawn:(_command,args,options)=>{
+    calls.push({action:args.at(-1),stdio:options.stdio});
+    return args.at(-1)==="status" ? INSTALLED_STATUS : {status:0,stdout:""};
+  }});
+  assert.equal(calls.find(call=>call.action==="restart").stdio,"capture");
+});

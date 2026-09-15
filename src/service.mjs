@@ -77,7 +77,7 @@ export async function runServiceCommandUnlocked(
   const result = spawnSync(
     process.execPath,
     [path.join(SOURCE_ROOT, "src", script), ...args],
-    { stdio: "inherit", env: childEnvironment },
+    { stdio: "inherit", env: childEnvironment, windowsHide: true },
   );
   if (result.error) throw result.error;
   if (result.status !== 0) return result.status ?? 1;
