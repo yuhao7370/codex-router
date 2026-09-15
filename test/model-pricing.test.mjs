@@ -8,6 +8,7 @@ import path from "node:path";
 // first imported, so loadPricingIndex never reads the operator's real state.
 const stateDir = mkdtempSync(path.join(os.tmpdir(), "model-pricing-test-"));
 process.env.MODEL_ROUTER_STATE_DIR = stateDir;
+process.env.CODEX_HOME = path.join(stateDir, "codex");
 
 const pricing = await import(`../src/model-pricing.mjs?test=${Date.now()}`);
 
@@ -117,4 +118,32 @@ test("persisted models.dev overrides win over seed while seed stays as fallback"
   assert.equal(index.get("deepseek-v4-flash").input, 999);
   assert.equal(index.get("claude-opus-4-8").input, 5);
   assert.equal(pricing.pricingSyncState().source, "models.dev");
+});
+
+test("Daybreak Blue uses Sol rates and costs across native and routed names", () => {
+  const index = pricing.loadPricingIndex();
+  const sol = pricing.findModelPricing("gpt-5.6-sol", index);
+  const usage = { inputTokens: 2_000_000, outputTokens: 1_000_000, cachedInputTokens: 1_000_000 };
+  for (const name of ["gpt-daybreak-blue-latest", "openai/gpt-daybreak-blue-latest", "local-router/anthropic/gpt-daybreak-blue-latest@high"]) {
+    const blue = pricing.findModelPricing(name, index);
+    assert.ok(blue, `missing price for ${name}`);
+    assert.equal(blue.modelId, "gpt-daybreak-blue-latest");
+    assert.equal(blue.displayName, "Daybreak Blue");
+    assert.equal(blue.cacheWrite, sol.cacheWrite);
+    assert.deepEqual(pricing.computeUsageCost(blue, usage), pricing.computeUsageCost(sol, usage));
+  }
+  assert.equal(pricing.findModelPricing("gpt-daybreak-red-latest", index), undefined);
+});
+
+test("Daybreak fallback follows synced Sol prices without replacing an explicit Daybreak price", () => {
+  const sol = { input: 7, output: 21, cacheRead: 0.4, cacheWrite: 2 };
+  const snapshot = (models) => writeFileSync(pricing.MODEL_PRICING_PATH, JSON.stringify({ version: 1, models }));
+  snapshot({ "gpt-5.6-sol": sol });
+  let blue = pricing.findModelPricing("gpt-daybreak-blue-latest");
+  assert.ok(blue);
+  for (const key of Object.keys(sol)) assert.equal(blue[key], sol[key]);
+  snapshot({ "gpt-5.6-sol": sol, "gpt-daybreak-blue-latest": { ...sol, input: 11 } });
+  blue = pricing.findModelPricing("gpt-daybreak-blue-latest");
+  assert.equal(blue.input, 11);
+  assert.equal(pricing.findModelPricing("gpt-5.6-sol").input, 7);
 });

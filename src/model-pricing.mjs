@@ -233,6 +233,15 @@ export function loadPricingIndex() {
       });
     }
   }
+  // User-requested price equivalence while Daybreak has no independent price.
+  // Derive after overrides so the fallback follows the latest Sol rates.
+  if (!index.has("gpt-daybreak-blue-latest")) {
+    index.set("gpt-daybreak-blue-latest", {
+      ...index.get("gpt-5.6-sol"),
+      modelId: "gpt-daybreak-blue-latest",
+      displayName: "Daybreak Blue",
+    });
+  }
   return index;
 }
 
