@@ -2655,20 +2655,20 @@ start does not exist at request latency. The port has to already be open.
 
 ## Local-router automatic model discovery (fork behavior)
 
-The explicitly selected local-router provider is synchronized by the independent
-Task Manager host at startup and every five minutes. Discovery-disabled and
-unselected installations do not start a worker. Every advertised ID is added to
-the protected user-model overlay under the shared overlay lock; existing model
-metadata and explicit visibility decisions survive. This is the local-router
-exception to the upstream curated-model opt-in default.
+The independent Task Manager discovers the explicitly selected local-router
+provider at startup and every five minutes. Background work updates only the
+provider catalog cache: it must never modify user models, picker state, gateway
+or client catalogs, or restart a service. Discovery-disabled and unselected
+installations do not start a worker.
 
-New local-router entries default visible once through seedModelsVisible. A
-manual or automatic refresh must never clear an explicit hide. Publication uses
-a fresh process to write both gateway routes and every installed client catalog,
-then reloads the managed Router. Record synchronization success only after those
-steps; failures must remain retryable even after the overlay has been written.
-Do not host the reloading worker inside the Router process tree on Windows:
-taskkill /T would kill the worker during its own reload.
+Only the user's Sync models action applies discovery. It adds models under the
+shared overlay lock, preserves existing metadata and explicit hidden choices,
+and defaults new entries visible through seedModelsVisible. A fresh process
+publishes the gateway and installed client catalogs before the explicit Router
+reload. Record success only after reload; a failed apply must remain retryable
+even if it already wrote its models. Programmatic service operations capture
+output so their Windows Job runners stay windowless; never use inherited stdio
+for a background restart. The independent host survives the Router reload.
 
 Native account entries own their original slugs and visibility. A listed native
 model suppresses the matching local-router upstream ID only in the signed-in

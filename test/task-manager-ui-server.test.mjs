@@ -473,3 +473,24 @@ test("standalone browser errors never expose runtime or provider credentials", a
     await close(server);
   }
 });
+
+
+test("only an explicit Sync models POST applies cached discovery and does not schedule another restart", async () => {
+  const deps = dependencies();
+  const calls = [];
+  const { server, origin } = await start({
+    mode: "standalone", callerSecret: CALLER_KEY, ...deps,
+    syncLocalModels: async (options) => { calls.push(options); return { discovered: 2, added: [], total: 2, published: true }; },
+    restartRouter: () => assert.fail("apply already handles its one restart"),
+  });
+  try {
+    const url = new URL("api/local-router/models/sync", origin + taskManagerPath(CALLER_KEY));
+    await fetch(origin + "/api/status");
+    assert.equal(calls.length, 0);
+    const response = await fetch(url, { method: "POST", headers: mutationHeaders(origin), body: "{}" });
+    assert.equal(response.status, 200);
+    const result = await response.json();
+    assert.equal(result.catalogRebuilt, true, "a previous failed apply can be retried with zero new additions");
+    assert.deepEqual(calls, [{ apply: true }]);
+  } finally { await close(server); }
+});

@@ -46,6 +46,7 @@ function publicationFingerprint() {
 }
 
 export async function autoSyncLocalRouterModels({
+  apply = false,
   enabled = localRouterAutoSyncEnabled,
   discover = discoverProviderModels,
   publish = applyModelOverlayPublication,
@@ -55,6 +56,16 @@ export async function autoSyncLocalRouterModels({
   // Discovery already has a 30-second HTTP deadline; it must not hold up an
   // unrelated manual model edit while waiting for the local service.
   const discovery = await discover("local-router", { refresh: true });
+  if (!enabled()) return { skipped: true };
+  // Polling is inventory-only. Loading routes requires a disruptive service
+  // restart and is reserved for the user's explicit Sync models action.
+  if (apply !== true) {
+    return {
+      discovered: discovery.discovered.length,
+      pending: discovery.unregistered?.length || 0,
+      published: false,
+    };
+  }
   return withModelOverlayLock(async () => {
     if (!enabled()) return { skipped: true };
     const result = await syncLocalRouterModels({

@@ -379,10 +379,11 @@
         </div>
         <div class="field">
           <label>模型列表</label>
-          <button class="ghost" id="sync-models-btn">更新模型列表</button>
+          <button class="ghost" id="sync-models-btn">同步模型</button>
           <button class="ghost" id="prune-models-btn">清理下架模型</button>
           <span class="result" id="sync-models-result" hidden></span>
         </div>
+        <p class="hint">后台只缓存模型列表。点击“同步模型”才会应用更改并短暂重启 Router。</p>
         <div class="field">
           <label>轮询</label>
           <input id="log-interval-input" type="number" min="1" max="60" style="width:72px"> <span class="muted">日志秒</span>
@@ -954,12 +955,15 @@
   });
 
   el('sync-models-btn').addEventListener('click', async function () {
-    setResult('sync-models-result', true, '正在更新…');
+    el('sync-models-btn').disabled = true;
+    setResult('sync-models-result', true, '正在同步并应用…');
     try {
       const result = await api('api/local-router/models/sync', { method: 'POST' });
       setResult('sync-models-result', Boolean(result.ok), result.message);
     } catch (error) {
-      setResult('sync-models-result', false, '更新失败：' + error.message);
+      setResult('sync-models-result', false, '同步失败：' + error.message);
+    } finally {
+      el('sync-models-btn').disabled = false;
     }
   });
 

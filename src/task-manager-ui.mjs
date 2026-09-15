@@ -32,6 +32,7 @@ import {
 } from "./task-manager-bridge.mjs";
 import { mergeDeletedAccounts, panelUsageSnapshot } from "./provider-usage.mjs";
 import { pricingSyncState, syncModelsDevPricing } from "./model-pricing.mjs";
+import { autoSyncLocalRouterModels } from "./local-router-auto-sync.mjs";
 import {
   cleanLocalRouterModels,
   rebuildCatalog,
@@ -204,6 +205,7 @@ export function startTaskManagerUi({
   restartRouter,
   quiet = false,
   syncPricing = syncModelsDevPricing,
+  syncLocalModels = autoSyncLocalRouterModels,
   pricingSyncDelayMs = 5_000,
   writeDiagnostic = (message) => console.error(message),
 } = {}) {
@@ -378,6 +380,22 @@ export function startTaskManagerUi({
         return sendJson(response, 200, { ...result, pricing: pricingSyncState() });
       }
       if (request.method === "POST" && route === "/api/local-router/models/sync") {
+        if (standalone) {
+          // This host survives the explicit Router restart. The persisted
+          // publication checkpoint also lets a second click retry an earlier
+          // failed apply after its models were already written to the overlay.
+          const result = await syncLocalModels({ apply: true });
+          return sendJson(response, 200, {
+            ok: true,
+            ...result,
+            catalogRebuilt: result.published === true,
+            message: result.skipped
+              ? "local-router 未启用或模型发现已关闭，未更改模型。"
+              : result.published
+                ? "模型已同步并重载 Router；请完全退出并重新打开 Codex。"
+                : "模型列表已是最新，没有需要应用的更改。",
+          });
+        }
         const result = await syncLocalRouterModels();
         let catalogRebuilt = false;
         if (result.added.length > 0) {

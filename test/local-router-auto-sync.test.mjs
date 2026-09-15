@@ -27,9 +27,9 @@ test("automatic sync makes no request when disabled or unselected", async () => 
   assert.equal(result.skipped, true);
 });
 
-test("failed publication retries the persisted models on the next fresh worker run", async () => {
+test("explicit apply retries failed publication the persisted models on the next fresh worker run", async () => {
   const statePath = path.join(process.env.CODEX_ROUTER_STATE_DIR, "retry.json");
-  const options = { enabled: () => true, statePath, discover: discovery(["auto-first", "auto-second"]) };
+  const options = { enabled: () => true, apply: true, statePath, discover: discovery(["auto-first", "auto-second"]) };
   await assert.rejects(autoSyncLocalRouterModels({ ...options, publish: async () => { throw new Error("publication failed"); } }), /publication failed/);
   assert.ok(readUserModels().some((model) => model.upstreamModel === "auto-first"));
   assert.equal(existsSync(statePath), false);
@@ -67,10 +67,10 @@ test("monitor runs immediately then every five minutes, has one detached hidden 
   children[1].emit("exit", 0); tick(); assert.equal(children.length, 2);
 });
 
-test("failed service reload also retries and a later discovery preserves hidden choices", async () => {
+test("explicit apply retries failed service reload and preserves hidden choices", async () => {
   const { setModelVisible, readHiddenModels } = await import("../src/model-picker-state.mjs");
   const statePath = path.join(process.env.CODEX_ROUTER_STATE_DIR, "reload-retry.json");
-  const options = { enabled: () => true, statePath, discover: discovery(["auto-hidden"]) };
+  const options = { enabled: () => true, apply: true, statePath, discover: discovery(["auto-hidden"]) };
   await assert.rejects(autoSyncLocalRouterModels({ ...options, publish: async () => { throw new Error("reload failed"); } }), /reload failed/);
   setModelVisible("local-router/auto-hidden", false);
   let publications = 0;
@@ -91,4 +91,19 @@ test("selection is checked again after discovery before writing or publishing", 
   });
   assert.equal(result.skipped, true);
   assert.ok(!readUserModels().some((model) => model.upstreamModel === "must-not-write-after-deselect"));
+});
+
+
+test("background discovery caches only, even when new models appear", async () => {
+  const before = JSON.stringify(readUserModels());
+  let request;
+  const result = await autoSyncLocalRouterModels({
+    enabled: () => true,
+    discover: async (...args) => { request = args; return { discovered: ["background-new"], unregistered: ["background-new"], unavailable: [] }; },
+    publish: () => assert.fail("background discovery must never publish or restart"),
+  });
+  assert.deepEqual(request, ["local-router", { refresh: true }]);
+  assert.equal(result.published, false);
+  assert.equal(result.pending, 1);
+  assert.equal(JSON.stringify(readUserModels()), before);
 });
