@@ -188,6 +188,30 @@
   td.mono { font-family: ui-monospace, Consolas, monospace; font-size: 12px; color: var(--muted); }
   .muted { color: var(--muted); }
 
+  /* ===== 账号详情弹窗 ===== */
+  .modal-backdrop {
+    position: fixed; inset: 0; z-index: 50;
+    display: flex; align-items: center; justify-content: center;
+    background: rgba(15, 23, 42, 0.45);
+  }
+  .modal-backdrop[hidden] { display: none; }
+  .modal {
+    width: min(560px, calc(100% - 48px));
+    max-height: calc(100% - 48px); overflow-y: auto;
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 18px 20px;
+    box-shadow: 0 18px 48px rgba(15, 23, 42, 0.22);
+  }
+  .modal .card-head { margin-bottom: 12px; }
+  .modal-body-row {
+    display: flex; gap: 10px; padding: 7px 0;
+    border-bottom: 1px solid #eef1f6; font-size: 13px;
+  }
+  .modal-body-row:last-child { border-bottom: 0; }
+  .modal-body-row .k { flex: none; width: 104px; color: var(--muted); }
+  .modal-body-row .v { flex: 1; word-break: break-all; }
+  .modal textarea { min-height: 96px; margin-top: 10px; }
+
   /* ===== 表单 ===== */
   .field { display: flex; gap: 10px; align-items: center; margin: 10px 0; flex-wrap: wrap; }
   .field:first-of-type { margin-top: 0; }
@@ -407,6 +431,20 @@
   </div>
 </div>
 
+<div class="modal-backdrop" id="account-modal" hidden>
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="account-modal-title">
+    <div class="card-head">
+      <h2 id="account-modal-title">账号详情</h2>
+      <button class="ghost" id="account-modal-close">关闭</button>
+    </div>
+    <div id="account-modal-body"></div>
+    <div class="field">
+      <button class="ghost" id="copy-auth-json">复制 auth.json</button>
+      <span class="result" id="copy-auth-json-result" hidden></span>
+    </div>
+  </div>
+</div>
+
 <script src="usage-panel.js"></script>
 <script>
   function endpoint(path) {
@@ -523,11 +561,108 @@
         plan: account.usage && account.usage.plan
           ? String(account.usage.plan).toUpperCase()
           : '',
+        account,
       };
       if (account.account_id) accountIndex.set(account.account_id, info);
       if (account.id) accountIndex.set(account.id, info);
     }
   }
+
+  // ===== 账号详情弹窗 =====
+  let selectedAccountId = null;
+
+  function quotaText(usedPercent, resetAt) {
+    if (typeof usedPercent !== 'number') return '—';
+    const remaining = Math.max(0, Math.min(100, 100 - usedPercent));
+    const reset = typeof resetAt === 'number' && resetAt > 0
+      ? ' · ' + new Date(resetAt * 1000).toLocaleString()
+      : '';
+    return remaining + '% 剩余' + reset;
+  }
+
+  function accountDetailRows(account) {
+    const usage = account.usage || {};
+    const source = account.source === 'native' ? '原生（Codex CLI 登录）' : '托管';
+    const plan = usage.plan ? String(usage.plan).toUpperCase() : '—';
+    return [
+      ['邮箱', account.email || '—'],
+      ['类型', source + ' · ' + plan],
+      ['账号 ID', account.id || '—'],
+      ['5h 窗口', quotaText(usage.five_hour_used_percent, usage.five_hour_reset_at)],
+      ['Weekly 窗口', quotaText(usage.weekly_used_percent, usage.weekly_reset_at)],
+      ['Credits', typeof usage.credits === 'number' ? String(usage.credits) : '—'],
+      ['额度刷新时间', usage.fetched_at ? formatAge(usage.fetched_at) : '—'],
+    ];
+  }
+
+  function renderAccountModal() {
+    const modal = el('account-modal');
+    const info = selectedAccountId ? accountIndex.get(selectedAccountId) : null;
+    if (!info || !info.account) {
+      modal.hidden = true;
+      selectedAccountId = null;
+      return;
+    }
+    const body = el('account-modal-body');
+    body.textContent = '';
+    for (const [label, value] of accountDetailRows(info.account)) {
+      const row = document.createElement('div');
+      row.className = 'modal-body-row';
+      const key = document.createElement('span');
+      key.className = 'k';
+      key.textContent = label;
+      const val = document.createElement('span');
+      val.className = 'v';
+      val.textContent = value;
+      row.append(key, val);
+      body.appendChild(row);
+    }
+  }
+
+  function closeAccountModal() {
+    selectedAccountId = null;
+    el('account-modal').hidden = true;
+  }
+
+  function openAccountModal(id) {
+    selectedAccountId = id;
+    hideResult('copy-auth-json-result');
+    renderAccountModal();
+    el('account-modal').hidden = false;
+  }
+
+  el('account-modal-close').addEventListener('click', closeAccountModal);
+
+  el('account-modal').addEventListener('click', function (event) {
+    if (event.target === el('account-modal')) closeAccountModal();
+  });
+
+  document.addEventListener('keydown', function (event) {
+    if (event.key === 'Escape' && !el('account-modal').hidden) closeAccountModal();
+  });
+
+  el('copy-auth-json').addEventListener('click', async function () {
+    if (!selectedAccountId) return;
+    try {
+      const exported = await api(
+        'api/accounts/auth-json?id=' + encodeURIComponent(selectedAccountId),
+      );
+      const text = JSON.stringify(exported, null, 2);
+      try {
+        await navigator.clipboard.writeText(text);
+        setResult('copy-auth-json-result', true, '已复制');
+      } catch (error) {
+        // A denied or unavailable clipboard must still let the user copy by hand.
+        const fallback = document.createElement('textarea');
+        fallback.value = text;
+        el('account-modal-body').appendChild(fallback);
+        fallback.select();
+        setResult('copy-auth-json-result', false, '剪贴板不可用，请手动复制');
+      }
+    } catch (error) {
+      setResult('copy-auth-json-result', false, '导出失败：' + error.message);
+    }
+  });
 
   function normalizeImport(raw) {
     let data;
@@ -689,7 +824,8 @@
           '<td>' + (blocked
             ? '<button data-id="' + escapeHtml(id) + '" class="ghost unblock-btn">解除</button>'
             : '<button data-id="' + escapeHtml(id) + '" class="ghost select-btn"' +
-              (account.is_default ? ' disabled' : '') + '>选择</button>') + '</td>';
+              (account.is_default ? ' disabled' : '') + '>选择</button>') +
+            '<button data-id="' + escapeHtml(id) + '" class="ghost detail-btn">详情</button></td>';
         body.appendChild(tr);
       }
       if (accounts.length === 0) {
@@ -738,6 +874,13 @@
           }
         });
       }
+      for (const btn of document.querySelectorAll('.detail-btn')) {
+        btn.addEventListener('click', function () {
+          openAccountModal(btn.getAttribute('data-id'));
+        });
+      }
+      // Keep an open modal's quota current as the account poll refreshes.
+      if (selectedAccountId) renderAccountModal();
     } catch (error) {
       setResult('accounts-error', false, '获取账号失败：' + error.message);
     }

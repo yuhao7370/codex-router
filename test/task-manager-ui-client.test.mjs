@@ -53,3 +53,26 @@ test("initial load reuses status, loads independent data in parallel, and delays
   assert.match(boot, /schedulePolls\(\)/);
   assert.doesNotMatch(boot, /\bpollLog\(\);[\s\S]*\bpollAccounts\(\);/);
 });
+
+test("account detail modal exposes quota fields and copies auth.json", () => {
+  const html = readFileSync(path.join(root, "src", "task-manager-ui.html"), "utf8");
+
+  for (const id of [
+    "account-modal",
+    "account-modal-body",
+    "account-modal-close",
+    "copy-auth-json",
+    "copy-auth-json-result",
+  ]) {
+    assert.match(html, new RegExp(`id=["']${id}["']`));
+  }
+
+  assert.match(html, /detail-btn/);
+  assert.match(html, /api\(\s*['"]api\/accounts\/auth-json\?id=/);
+  assert.match(html, /navigator\.clipboard\.writeText/);
+  // A null 5h window and a missing credits block must render as em dashes
+  // rather than NaN or an empty cell.
+  assert.match(html, /five_hour_used_percent/);
+  assert.match(html, /credits/);
+  assert.match(html, /weekly_used_percent/);
+});
