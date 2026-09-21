@@ -148,7 +148,9 @@
   button.ghost:hover { background: #f4f6fa; }
   button:disabled { opacity: 0.4; cursor: default; transform: none; filter: none; box-shadow: none; }
   .head-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-  .select-btn, .unblock-btn, #refresh-accounts, #save-pool, #clear-pool { padding: 7px 13px; font-size: 12px; margin: 0; }
+  .select-btn, .unblock-btn, .detail-btn, #refresh-accounts, #save-pool, #clear-pool { padding: 7px 13px; font-size: 12px; margin: 0; }
+  /* The row has two actions side by side; keep them the same size and apart. */
+  .detail-btn { margin-left: 6px; }
 
   /* ===== 结果框 / 日志 ===== */
   .result {

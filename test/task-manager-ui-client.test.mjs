@@ -68,6 +68,10 @@ test("account detail modal exposes quota fields and copies auth.json", () => {
   }
 
   assert.match(html, /detail-btn/);
+  // The row renders 选择 and 详情 side by side. They only match in size while
+  // .detail-btn shares the compact metrics rule with .select-btn; dropping it
+  // from that selector list is exactly the bug this pins.
+  assert.match(html, /\.select-btn,\s*\.unblock-btn,\s*\.detail-btn,/);
   assert.match(html, /api\(\s*['"]api\/accounts\/auth-json\?id=/);
   assert.match(html, /navigator\.clipboard\.writeText/);
   // A null 5h window and a missing credits block must render as em dashes
