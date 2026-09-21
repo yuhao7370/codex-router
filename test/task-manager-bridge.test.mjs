@@ -355,3 +355,64 @@ test("native fallback keeps failed HTTP outcomes and bounds mixed recent events 
   assert.equal(stats.recent[1].status, 403);
   assert.equal(stats.recent[1].fast, undefined);
 });
+
+test("account export forwards the id and returns CTM's auth.json document", async () => {
+  const seen = [];
+  const server = http.createServer((request, response) => {
+    seen.push({ url: request.url, auth: request.headers.authorization });
+    response.writeHead(200, { "Content-Type": "application/json" });
+    response.end(
+      JSON.stringify({ tokens: { access_token: "access-a", refresh_token: "refresh-a" } }),
+    );
+  });
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+
+  try {
+    const address = server.address();
+    assert.ok(typeof address === "object" && address);
+    bridge.setTaskManagerPort(address.port);
+    bridge.setTaskManagerToken("manager-secret");
+
+    const exported = await bridge.exportTaskManagerAccount("user/with space");
+
+    assert.equal(exported.tokens.refresh_token, "refresh-a");
+    assert.equal(seen[0].url, "/api/auth/export?id=user%2Fwith%20space");
+    assert.equal(seen[0].auth, "Bearer manager-secret");
+  } finally {
+    bridge.setTaskManagerToken("");
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test("account export surfaces CTM failures without returning credentials", async () => {
+  const server = http.createServer((_request, response) => {
+    response.writeHead(404, { "content-type": "application/json" });
+    response.end(JSON.stringify({ error: "账号不存在" }));
+  });
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+
+  try {
+    const address = server.address();
+    assert.ok(typeof address === "object" && address);
+    bridge.setTaskManagerPort(address.port);
+    bridge.setTaskManagerToken("manager-secret");
+
+    await assert.rejects(
+      () => bridge.exportTaskManagerAccount("missing"),
+      (error) => {
+        assert.match(error.message, /HTTP 404/);
+        assert.equal(error.message.includes("manager-secret"), false);
+        return true;
+      },
+    );
+  } finally {
+    bridge.setTaskManagerToken("");
+    await new Promise((resolve) => server.close(resolve));
+  }
+});

@@ -11,6 +11,7 @@ import {
   clearBlockedAccount,
   clearErrorLog,
   errorLog,
+  exportTaskManagerAccount,
   failoverStatus,
   importTaskManagerAccount,
   injectionStats,
@@ -202,6 +203,7 @@ export function startTaskManagerUi({
   runtimeClient,
   serviceController,
   listAccounts = listTaskManagerAccounts,
+  exportAccount = exportTaskManagerAccount,
   restartRouter,
   quiet = false,
   syncPricing = syncModelsDevPricing,
@@ -491,6 +493,17 @@ export function startTaskManagerUi({
       }
       if (request.method === "GET" && route === "/api/accounts") {
         return sendJson(response, 200, await readAccounts());
+      }
+      if (request.method === "GET" && route === "/api/accounts/auth-json") {
+        const id = url.searchParams.get("id");
+        if (!id) {
+          return sendJson(response, 400, { error: "missing id" });
+        }
+        try {
+          return sendJson(response, 200, await exportAccount(id));
+        } catch (error) {
+          return sendJson(response, 404, { error: safeError(error) });
+        }
       }
       if (request.method === "POST" && route === "/api/select") {
         const body = await readJsonBody(request);

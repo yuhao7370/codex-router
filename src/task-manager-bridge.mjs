@@ -445,6 +445,22 @@ export async function listTaskManagerAccounts() {
   return body;
 }
 
+// The one bridge call that returns long-lived credentials. Its result is passed
+// straight through to the caller's clipboard and is never cached, logged, or
+// folded into a runtime snapshot.
+export async function exportTaskManagerAccount(id) {
+  const state = readTaskManagerConfig();
+  const { status, body } = await requestJson(
+    state.port,
+    tokenFor(state),
+    `/api/auth/export?id=${encodeURIComponent(String(id))}`,
+  );
+  if (status !== 200) {
+    throw ctmHttpError(status);
+  }
+  return body;
+}
+
 export async function selectTaskManagerAccount(id, { updateRuntime = true } = {}) {
   const state = readTaskManagerConfig();
   const { status, body } = await requestJson(

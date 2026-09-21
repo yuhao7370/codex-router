@@ -494,3 +494,57 @@ test("only an explicit Sync models POST applies cached discovery and does not sc
     assert.deepEqual(calls, [{ apply: true }]);
   } finally { await close(server); }
 });
+
+test("account auth.json export is proxied and rejects a missing id", async () => {
+  const deps = dependencies();
+  const { server, origin } = await start({
+    mode: "standalone",
+    callerSecret: CALLER_KEY,
+    ...deps,
+    exportAccount: async (id) => ({
+      tokens: { access_token: `access-${id}`, refresh_token: "r" },
+    }),
+  });
+
+  try {
+    // `taskManagerPath` already ends in "/" -- adding another one would make
+    // the route "//api/..." and the server would answer 404.
+    const apiBase = `${origin}${taskManagerPath(CALLER_KEY)}api/`;
+
+    const ok = await fetch(`${apiBase}accounts/auth-json?id=a`);
+    assert.equal(ok.status, 200);
+    assert.deepEqual(await ok.json(), {
+      tokens: { access_token: "access-a", refresh_token: "r" },
+    });
+
+    assert.equal((await fetch(`${apiBase}accounts/auth-json`)).status, 400);
+  } finally {
+    await close(server);
+  }
+});
+
+test("account auth.json export reports a refused account without echoing secrets", async () => {
+  const deps = dependencies();
+  const { server, origin } = await start({
+    mode: "standalone",
+    callerSecret: CALLER_KEY,
+    ...deps,
+    exportAccount: async () => {
+      const error = new Error("Task Manager request failed (HTTP 404).");
+      error.status = 404;
+      throw error;
+    },
+  });
+
+  try {
+    const response = await fetch(
+      `${origin}${taskManagerPath(CALLER_KEY)}api/accounts/auth-json?id=gone`,
+    );
+    assert.equal(response.status, 404);
+    const payload = await response.json();
+    assert.equal(payload.error.includes("404"), true);
+    assert.equal(typeof payload.tokens, "undefined");
+  } finally {
+    await close(server);
+  }
+});
