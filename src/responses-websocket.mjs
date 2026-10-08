@@ -943,28 +943,8 @@ class ResponsesWebSocketPeer {
   }
 
   enqueue(text) {
-    this.pendingRequests += 1;
-    if (this.pendingRequests > MAX_QUEUED_REQUESTS) {
-      this.fail(1008, "Too many queued Responses requests.");
-      return;
-    }
-    this.queue = this.queue
-      .then(() => this.process(text))
-      .catch(() => {
-        if (!this.closed) {
-          this.sendError(500, {
-            type: "local_router_error",
-            message: "The local router could not complete the WebSocket request.",
-          });
-        }
-      })
-      .finally(() => {
-        this.pendingRequests -= 1;
-      });
-  }
-
-  async process(text) {
-    if (this.closed) return;
+    // Decode once, before the queue: interruption must stop the active HTTP
+    // stream even while that stream is waiting for another provider event.
     if (!jsonNestingAllowed(text)) {
       this.sendError(400, {
         type: "invalid_request_error",
@@ -982,6 +962,46 @@ class ResponsesWebSocketPeer {
       });
       return;
     }
+    if (request?.type === "response.interrupt") {
+      if (typeof request.response_id !== "string" || !request.response_id ||
+          request.mode !== "discard_partial_items") {
+        this.sendError(400, {
+          type: "invalid_request_error",
+          message: "response.interrupt requires response_id and mode=discard_partial_items.",
+        });
+        return;
+      }
+      const active = this.activeResponse;
+      // A late or repeated interrupt cannot stop the next response on this
+      // socket. The matching response.completed is the acknowledgement.
+      if (active?.id === request.response_id && !active.terminalSeen) {
+        active.interrupted = true;
+        active.controller.abort(new Error("Responses request interrupted."));
+      }
+      return;
+    }
+    this.pendingRequests += 1;
+    if (this.pendingRequests > MAX_QUEUED_REQUESTS) {
+      this.fail(1008, "Too many queued Responses requests.");
+      return;
+    }
+    this.queue = this.queue
+      .then(() => this.process(request))
+      .catch(() => {
+        if (!this.closed) {
+          this.sendError(500, {
+            type: "local_router_error",
+            message: "The local router could not complete the WebSocket request.",
+          });
+        }
+      })
+      .finally(() => {
+        this.pendingRequests -= 1;
+      });
+  }
+
+  async process(request) {
+    if (this.closed) return;
     if (!request || Array.isArray(request) || request.type !== "response.create") {
       this.sendError(400, {
         type: "invalid_request_error",
@@ -1080,6 +1100,8 @@ class ResponsesWebSocketPeer {
     }
 
     const controller = new AbortController();
+    const active = { controller, outputItems: [] };
+    this.activeResponse = active;
     const onClose = () => controller.abort(this.abortController.signal.reason);
     this.abortController.signal.addEventListener("abort", onClose, { once: true });
     let upstream;
@@ -1197,6 +1219,7 @@ class ResponsesWebSocketPeer {
       await relaySse(
         upstream.body,
         async (data) => {
+          if (active.interrupted) return false;
           let event;
           try {
             event = JSON.parse(data);
@@ -1211,6 +1234,15 @@ class ResponsesWebSocketPeer {
           // connection reuse, but never graft a provider trailer onto the next
           // continuation baseline.
           if (terminalSeen) return true;
+          if (event.type === "response.created" && typeof event.response?.id === "string") {
+            active.id = event.response.id;
+          }
+          if (Number.isSafeInteger(event.sequence_number)) active.sequence = event.sequence_number;
+          // Record terminal ownership before writing: a completion racing an
+          // interrupt wins, and must never be replaced by a synthetic terminal.
+          if (["response.completed", "response.failed", "response.incomplete", "error"].includes(event.type)) {
+            active.terminalSeen = true;
+          }
           // Native Codex maps WebSocket `error` events only when they carry
           // an HTTP failure status. SSE can instead signal failure by ending
           // its body; the persistent socket has no such turn boundary.
@@ -1227,6 +1259,8 @@ class ResponsesWebSocketPeer {
             } else {
               continuationOverflow = true;
             }
+            active.outputItems = outputItems;
+            active.continuationOverflow = continuationOverflow;
           }
           if (event.type === "response.completed") {
             completed = event.response;
@@ -1249,6 +1283,7 @@ class ResponsesWebSocketPeer {
           maxEventBytes: this.options.maxEventBytes,
         },
       );
+      if (active.interrupted) return;
       if (completed?.id && !terminalFailure) {
         const output = reconciledContinuationOutput(completed.output, outputItems);
         this.continuations.clear();
@@ -1274,8 +1309,32 @@ class ResponsesWebSocketPeer {
         });
       }
     } finally {
+      if (this.activeResponse === active) this.activeResponse = undefined;
       this.abortController.signal.removeEventListener("abort", onClose);
       controller.abort();
+      if (active.interrupted && !active.terminalSeen && !this.closed) {
+        // The HTTP bridge cannot send the interrupt upstream over its socket.
+        // Abort that one HTTP stream and finish the Codex step using only items
+        // already delivered as done. Never promote a partial tool call/text or
+        // invent usage for a provider response stopped before its usage event.
+        active.terminalSeen = true;
+        this.continuations.clear();
+        const continuation = !active.continuationOverflow
+          ? continuationState(fullRequest.input, active.outputItems, this.options.maxContinuationBytes)
+          : undefined;
+        if (continuation) this.continuations.set(active.id, continuation);
+        await this.sendJsonWithBackpressure({
+          type: "response.completed",
+          sequence_number: (active.sequence ?? -1) + 1,
+          response: {
+            id: active.id,
+            status: "completed",
+            // Done items already reached the client. Repeating them here could
+            // exceed the per-event limit and would imply an authoritative full
+            // output even when the bounded continuation cache overflowed.
+          },
+        });
+      }
     }
   }
 }

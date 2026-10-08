@@ -1574,6 +1574,143 @@ test("accepts fragmented text and closes on unmasked or oversized frames", async
   assert.equal(fragmentClose.payload.readUInt16BE(0), 1009);
 });
 
+test("response.interrupt stops a held stream and continues without partial tool calls", async (t) => {
+  const bodies = [];
+  let aborted = false;
+  let finishNext;
+  const done = { id: "msg-done", type: "message", role: "assistant", status: "completed", content: [{ type: "output_text", text: "Completed work." }] };
+  const { server, port } = await startServer(async (request, response) => {
+    const chunks = [];
+    for await (const chunk of request) chunks.push(chunk);
+    bodies.push(JSON.parse(Buffer.concat(chunks).toString("utf8")));
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    const emit = (event) => response.write(`data: ${JSON.stringify(event)}\n\n`);
+    if (bodies.length === 1) {
+      response.once("close", () => { aborted = true; });
+      emit({ type: "response.created", sequence_number: 0, response: { id: "resp-interrupt" } });
+      emit({ type: "response.output_item.done", sequence_number: 1, output_index: 0, item: done });
+      emit({ type: "response.output_item.added", sequence_number: 2, output_index: 1, item: { type: "function_call", id: "fc-partial", call_id: "call-partial", name: "exec", arguments: "" } });
+      emit({ type: "response.function_call_arguments.delta", sequence_number: 3, output_index: 1, delta: '{"unfinished":' });
+      // Deliberately never send another event. The interrupt must not wait for
+      // a provider byte, for EOF, or behind the queued follow-up request.
+    } else {
+      emit({ type: "response.created", response: { id: "resp-next" } });
+      finishNext = () => { emit({ type: "response.completed", response: { id: "resp-next", output: [], usage: { input_tokens: 12 } } }); response.end(); };
+    }
+  });
+  t.after(() => server.close());
+  const { peer } = await connect(port);
+  t.after(() => peer.socket.destroy());
+  const original = createRequest();
+  peer.sendJson(original);
+  for (let i = 0; i < 4; i++) await peer.nextJson();
+  const interrupt = { type: "response.interrupt", response_id: "resp-interrupt", mode: "discard_partial_items" };
+  peer.sendJson(interrupt);
+  peer.sendJson(interrupt);
+  const followup = [{ type: "message", role: "user", content: "New direction." }];
+  peer.sendJson(createRequest({ previous_response_id: "resp-interrupt", input: followup }));
+  const terminal = await peer.nextJson();
+  assert.equal(terminal.type, "response.completed");
+  assert.equal(terminal.sequence_number, 4);
+  assert.deepEqual(terminal.response, { id: "resp-interrupt", status: "completed" });
+  assert.equal(terminal.response.usage, undefined, "interruption must not invent zero billed usage");
+  assert.equal((await peer.nextJson()).response.id, "resp-next");
+  await waitFor(() => aborted && bodies.length === 2);
+  assert.deepEqual(bodies[1].input, [...original.input, done, ...followup]);
+  assert.equal(bodies[1].previous_response_id, undefined);
+  peer.sendJson(interrupt); // A late interrupt for the old response must be harmless.
+  peer.sendFrame(0x9, "barrier");
+  assert.equal((await peer.nextFrame()).opcode, 0xa);
+  finishNext();
+  const next = await peer.nextJson();
+  assert.equal(next.type, "response.completed");
+  assert.equal(next.response.id, "resp-next");
+  assert.deepEqual(next.response.usage, { input_tokens: 12 });
+  assert.equal(bodies.length, 2, "an interrupt is never forwarded as another inference");
+  peer.close();
+});
+
+test("response.interrupt after completion preserves the terminal and the next request", async (t) => {
+  let release;
+  let calls = 0;
+  const { server, port } = await startServer(async (_request, response) => {
+    calls++;
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    const id = `resp-race-${calls}`;
+    response.write(`data: ${JSON.stringify({ type: "response.created", response: { id } })}\n\n`);
+    response.write(`data: ${JSON.stringify({ type: "response.completed", response: { id, output: [], usage: { total_tokens: 7 } } })}\n\n`);
+    if (calls === 1) release = () => response.end();
+    else response.end();
+  });
+  t.after(() => server.close());
+  const { peer } = await connect(port);
+  t.after(() => peer.socket.destroy());
+  peer.sendJson(createRequest());
+  await peer.nextJson();
+  assert.deepEqual((await peer.nextJson()).response.usage, { total_tokens: 7 });
+  peer.sendJson({ type: "response.interrupt", response_id: "resp-race-1", mode: "discard_partial_items" });
+  peer.sendFrame(0x9, "barrier");
+  assert.equal((await peer.nextFrame()).opcode, 0xa);
+  release();
+  peer.sendJson(createRequest({ previous_response_id: "resp-race-1", input: [] }));
+  assert.equal((await peer.nextJson()).response.id, "resp-race-2");
+  const terminal = await peer.nextJson();
+  assert.equal(terminal.type, "response.completed");
+  assert.deepEqual(terminal.response.usage, { total_tokens: 7 });
+  peer.close();
+});
+
+test("response.interrupt with oversized done items requires a full-history retry", async (t) => {
+  let calls = 0;
+  const { server, port } = await startServer(async (_request, response) => {
+    calls++;
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.write('data: {"type":"response.created","response":{"id":"resp-overflow"}}\n\n');
+    response.write(`data: ${JSON.stringify({ type: "response.output_item.done", item: { type: "message", role: "assistant", content: "x".repeat(512) } })}\n\n`);
+  }, { maxContinuationBytes: 128 });
+  t.after(() => server.close());
+  const { peer } = await connect(port);
+  t.after(() => peer.socket.destroy());
+  peer.sendJson(createRequest());
+  await peer.nextJson();
+  await peer.nextJson();
+  peer.sendJson({ type: "response.interrupt", response_id: "resp-overflow", mode: "discard_partial_items" });
+  const terminal = await peer.nextJson();
+  assert.equal(terminal.type, "response.completed");
+  assert.equal(terminal.response.output, undefined, "do not publish a truncated authoritative output array");
+  peer.sendJson(createRequest({ previous_response_id: "resp-overflow", input: [] }));
+  assert.equal((await peer.nextJson()).error.code, "previous_response_not_found");
+  assert.equal(calls, 1, "never silently continue with truncated history");
+  peer.close();
+});
+
+test("response.interrupt validates its mode and cannot cancel a different response", async (t) => {
+  let finish;
+  const { server, port } = await startServer(async (_request, response) => {
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.write('data: {"type":"response.created","response":{"id":"resp-active"}}\n\n');
+    finish = () => response.end('data: {"type":"response.completed","response":{"id":"resp-active","output":[]}}\n\n');
+  });
+  t.after(() => server.close());
+  const { peer } = await connect(port);
+  t.after(() => peer.socket.destroy());
+  peer.sendJson(createRequest());
+  await peer.nextJson();
+  for (const request of [
+    { type: "response.interrupt", response_id: "resp-active", mode: "unknown" },
+    { type: "response.interrupt", mode: "discard_partial_items" },
+  ]) {
+    peer.sendJson(request);
+    assert.equal((await peer.nextJson()).status, 400);
+  }
+  peer.sendJson({ type: "response.interrupt", response_id: "someone-elses-response", mode: "discard_partial_items" });
+  peer.sendFrame(0x9, "barrier");
+  assert.equal((await peer.nextFrame()).opcode, 0xa);
+  finish();
+  assert.equal((await peer.nextJson()).type, "response.completed");
+  peer.close();
+});
+
 test("aborts the internal HTTP request when the WebSocket disappears", async (t) => {
   let requestStarted = false;
   let requestAborted = false;
