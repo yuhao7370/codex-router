@@ -584,6 +584,36 @@ test("main Router preflight accepts missing or canonical tasks and refuses drift
   }), /noncanonical.*Codex Router/i);
 });
 
+test("Router ownership accepts the explicit VBScript engine and refuses altered actions", async () => {
+  const stateDir = "C:/Router State";
+  const task = routerTask(stateDir);
+  const legacyArgument = task.action.argument;
+  for (const argument of [legacyArgument, `//E:VBScript ${legacyArgument}`]) {
+    const candidate = { ...task, action: { ...task.action, argument } };
+    assert.equal((await assertRouterTaskReplaceable({
+      stateDir, queryTask: async () => candidate,
+    })).exists, true);
+    assert.equal(await classifyTaskManagerPortOwner({
+      stateDir, sourceRoot: "C:/Router",
+      readPortOwner: () => ({ known: true, pid: 777 }),
+      readManagerHealth: async () => undefined,
+      readManagerTask: async () => ({ known: true, exists: false }),
+      readRouterTask: async () => candidate,
+      readProcessCommandLine: () => 'node "C:/Router/src/router.mjs"',
+    }), "embedded");
+  }
+  for (const action of [
+    { ...task.action, argument: `//E:JScript ${legacyArgument}` },
+    { ...task.action, argument: `//E:VBScript ${legacyArgument} extra.vbs` },
+    { ...task.action, argument: `//E:VBScript ${legacyArgument.replace("start-codex-router-hidden", "foreign")}` },
+    { execute: "cscript.exe", argument: `//E:VBScript ${legacyArgument}` },
+  ]) {
+    await assert.rejects(assertRouterTaskReplaceable({
+      stateDir, queryTask: async () => ({ ...task, action }),
+    }), /noncanonical.*Codex Router/i);
+  }
+});
+
 test("Router preflight accepts upstream heartbeat recovery and refuses changed definitions", async () => {
   const stateDir = "C:/Router State";
   const task = routerTask(stateDir);

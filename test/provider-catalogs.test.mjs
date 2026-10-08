@@ -11,14 +11,15 @@ import {
 
 test("every selectable provider remains a canonical UI family", () => {
   const canonical = [...PROVIDERS.values()].filter((provider) => !provider.variantOf);
-  assert.equal(canonical.length, 41);
-  assert.equal(PROVIDERS.size, 46);
+  assert.equal(canonical.length, 45);
+  assert.equal(PROVIDERS.size, 53);
   assert.ok(canonical.some((provider) => provider.id === "local-router"));
 });
 
 test("catalog capability comes from backend provider definitions", () => {
   assert.equal(providerCatalogKind(PROVIDERS.get("anthropic-api")), "models-endpoint");
   assert.equal(providerCatalogKind(PROVIDERS.get("devin-cli")), "devin");
+  assert.equal(providerCatalogKind(PROVIDERS.get("vertex")), "vertex");
   assert.equal(providerCatalogKind(PROVIDERS.get("kimi-oauth")), undefined);
   assert.equal(providerCatalogKind(PROVIDERS.get("grok-oauth")), undefined);
   assert.equal(providerCatalogKind(PROVIDERS.get("local")), undefined);
@@ -45,7 +46,11 @@ test("shared credentials expose distinct catalogs without duplicate protocol row
     "opencode-go-messages",
     "opencode-go-responses",
   ]);
-  assert.deepEqual(providerCatalogRouteIds("opencode-zen"), ["opencode-zen"]);
+  assert.deepEqual(providerCatalogRouteIds("opencode-zen"), [
+    "opencode-zen",
+    "opencode-zen-messages",
+    "opencode-zen-responses",
+  ]);
   assert.deepEqual(providerCatalogRouteIds("commandcode"), [
     "commandcode",
     "commandcode-messages",
@@ -55,5 +60,7 @@ test("shared credentials expose distinct catalogs without duplicate protocol row
     "opencode-go-messages",
     "opencode-go-responses",
     "opencode-zen",
+    "opencode-zen-messages",
+    "opencode-zen-responses",
   ]));
 });

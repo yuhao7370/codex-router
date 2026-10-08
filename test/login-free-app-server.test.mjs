@@ -294,11 +294,16 @@ async function verifySignedOutTurn(binary, { initialProvider = "openai" } = {}) 
     await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
     const port = server.address().port;
     server.on("upgrade", (request, socket, head) => {
-      upgrades.push({ headers: request.headers, url: request.url });
+      const upgrade = { headers: request.headers, url: request.url, inferenceRequests: 0 };
+      upgrades.push(upgrade);
       upgradedSockets.add(socket);
       socket.once("close", () => upgradedSockets.delete(socket));
       handleResponsesWebSocketUpgrade(request, socket, head, {
         callerKey: CALLER_KEY,
+        fetchImpl: (url, init) => {
+          upgrade.inferenceRequests += 1;
+          return fetch(url, init);
+        },
         authenticateUpgrade: (upgradeRequest, requestUrl) =>
           requestUrl.pathname === "/v1/responses" &&
           upgradeRequest.headers.authorization === `Bearer ${CALLER_KEY}`
@@ -312,6 +317,7 @@ async function verifySignedOutTurn(binary, { initialProvider = "openai" } = {}) 
       CODEX_HOME: codexHome,
       CODEX_ROUTER_PORT: String(port),
       CODEX_ROUTER_STATE_DIR: stateDir,
+      MODEL_ROUTER_STATE_DIR: stateDir,
       MODEL_ROUTER_TARGET: "codex",
     });
     const bundled = JSON.parse(codexSync(binary, ["debug", "models", "--bundled"], env));
@@ -355,9 +361,15 @@ async function verifySignedOutTurn(binary, { initialProvider = "openai" } = {}) 
     const notifications = await runAppServerTurn(binary, env, model, expectedProvider);
     assert.equal(requests.length, 1);
     if (upgrades.length > 0) {
-      assert.equal(upgrades.length, 1);
-      assert.equal(upgrades[0].url, "/v1/responses");
-      assert.equal(upgrades[0].headers.authorization, `Bearer ${CALLER_KEY}`);
+      // Codex can open an unused connection separately from the turn's
+      // connection. Count inference at the adapter boundary, and authenticate
+      // every handshake, instead of requiring one TCP/WebSocket connection.
+      assert.equal(upgrades.filter((upgrade) => upgrade.inferenceRequests > 0).length, 1);
+      assert.equal(upgrades.reduce((count, upgrade) => count + upgrade.inferenceRequests, 0), 1);
+      for (const upgrade of upgrades) {
+        assert.equal(upgrade.url, "/v1/responses");
+        assert.equal(upgrade.headers.authorization, `Bearer ${CALLER_KEY}`);
+      }
       assert.equal(
         requests[0].url,
         `/_codex-router/${CALLER_KEY}/v1/responses`,

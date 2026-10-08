@@ -63,6 +63,31 @@ test("publishing preserves every other section, route, and comment", () => {
   assert.ok(after.includes("    codex-router:"));
 });
 
+test("an apostrophe elsewhere in the document does not move the route", () => {
+  // A plain scalar carrying an apostrophe used to read as an unterminated
+  // quoted scalar, which hid every key after it from the scan. The route then
+  // landed past the end of `providers:` -- here, inside the block scalar that
+  // follows -- so the harness never saw a route and the user's value grew four
+  // lines of YAML.
+  const settings = [
+    "llm-pi-ai:",
+    "  providers:",
+    "    my-proxy:",
+    "      api: openai-completions",
+    "      note: don't edit this by hand",
+    "theme: dark",
+    "instructions: |",
+    "  it's fine to edit this",
+    "",
+  ].join("\n");
+  const after = applyRouteToSettings(settings, ROUTE);
+  const lines = after.split("\n");
+  assert.equal(lines.indexOf("    codex-router:"), lines.indexOf("      note: don't edit this by hand") + 1);
+  assert.ok(lines.indexOf("    codex-router:") < lines.indexOf("theme: dark"));
+  assert.ok(after.includes("instructions: |\n  it's fine to edit this\n"));
+  assert.equal(removeRouteFromSettings(after), settings);
+});
+
 test("publishing twice is byte-identical", () => {
   const once = applyRouteToSettings(USER_SETTINGS, ROUTE);
   assert.equal(applyRouteToSettings(once, ROUTE), once);
@@ -97,6 +122,93 @@ test("an inline providers mapping is refused rather than rewritten", () => {
 
 test("a settings document this build cannot read plainly is refused untouched", () => {
   assert.throws(() => applyRouteToSettings("a: 1\na: 2\n", ROUTE), /defined twice/);
+});
+
+test("publishing beside a route key this reader cannot register is refused", () => {
+  // `children` holds only the mapping keys the lexer registered, so a provider
+  // id carrying a slash is invisible there while its own `baseURL` is hoisted
+  // into `providers`. The indent copied off "the first sibling" was then that
+  // hoisted child's, and the route went in two columns too deep -- nested
+  // inside the user's provider, where the harness never looks, while every
+  // status read agreed the publish had worked.
+  const settings = [
+    "llm-pi-ai:",
+    "  providers:",
+    "    openrouter/free:",
+    "      api: openai-completions",
+    "      baseURL: https://openrouter.ai/api/v1",
+    "",
+  ].join("\n");
+  assert.throws(
+    () => applyRouteToSettings(settings, ROUTE),
+    /line 3 \(openrouter\/free:\) is not a mapping entry this reader can account for/,
+  );
+});
+
+test("publishing into a providers: written as a sequence is refused", () => {
+  // Splicing a mapping entry beside sequence items produced a settings file no
+  // YAML reader would take back, and the harness reads this file on every run.
+  const settings = [
+    "llm-pi-ai:",
+    "  providers:",
+    "    - id: my-proxy",
+    "      baseURL: https://proxy.example/v1",
+    "",
+  ].join("\n");
+  assert.throws(
+    () => applyRouteToSettings(settings, ROUTE),
+    /line 3 \(- id: my-proxy\) is not a mapping entry this reader can account for/,
+  );
+});
+
+test("removing the route leaves a sibling the reader cannot register in place", () => {
+  // An install published by an earlier build already has this on disk. The
+  // sequence registers no keys at all, so `providers.children.size` was 1 --
+  // ours -- and the collapse took `llm-pi-ai` with it: 143 bytes of somebody
+  // else's routes replaced by an empty file.
+  const published = [
+    "llm-pi-ai:",
+    "  providers:",
+    "    - id: my-proxy",
+    "      baseURL: https://proxy.example/v1",
+    "    codex-router:",
+    '      baseURL: "http://127.0.0.1:4202/v1"',
+    "",
+  ].join("\n");
+  const after = removeRouteFromSettings(published);
+  assert.ok(after.includes("    - id: my-proxy"));
+  assert.ok(after.includes("      baseURL: https://proxy.example/v1"));
+  assert.ok(!after.includes("codex-router"));
+});
+
+test("removing the route leaves the user's own comment in place", () => {
+  // `endIndex` stops before a trailing comment block, so a note the user wrote
+  // above our key is inside the parent's range without being inside ours. One
+  // comment line was enough to empty the whole file.
+  const published = [
+    "llm-pi-ai:",
+    "  providers:",
+    "    # my own routes live in providers.d",
+    "    codex-router:",
+    '      baseURL: "http://127.0.0.1:4202/v1"',
+    "",
+  ].join("\n");
+  const after = removeRouteFromSettings(published);
+  assert.ok(after.includes("    # my own routes live in providers.d"));
+  assert.ok(!after.includes("codex-router"));
+});
+
+test("a credentials envelope this reader cannot account for is refused untouched", () => {
+  // `refs` holding an entry the key grammar declines registers no sibling, so
+  // the indent fell back to `refs.indent + 2` while the entries on disk sat at
+  // four. That mixed-indent block is not YAML any parser reads back, and the
+  // whole file is the harness's credential store -- every adapter's key, not
+  // just ours.
+  const credentials = ["version: 1", "refs:", "    other/ref: sk-other", ""].join("\n");
+  assert.throws(
+    () => applyCredential(credentials, "CODEX_ROUTER_CALLER_KEY", "sk-ours"),
+    /is not a mapping entry this reader can account for/,
+  );
 });
 
 test("a credential is set beside the user's other keys and removed cleanly", () => {
@@ -296,6 +408,77 @@ test("a nested document under refs is refused rather than edited", () => {
   );
 });
 
+test("the harness's records section is kept byte for byte beside the envelope", () => {
+  // Version 1 of the harness's store has three sections. `records` holds tagged
+  // records such as a stored browser session and is nested by design; refusing
+  // it blocked every client publication once the harness had stored one.
+  const records =
+    "records:\n" +
+    "  client-connection/browser-session:\n" +
+    "    kind: grant\n" +
+    "    payload:\n" +
+    "      secret: session-secret\n" +
+    "      version: 2\n";
+  const before = `${records}refs:\n  OTHER_KEY: existing\nversion: 1\n`;
+  const after = applyCredential(before, "CODEX_ROUTER_CALLER_KEY", "secret-value");
+  assert.equal(
+    after,
+    `${records}refs:\n  OTHER_KEY: existing\n  CODEX_ROUTER_CALLER_KEY: "secret-value"\nversion: 1\n`,
+  );
+  assert.equal(applyCredential(after, "CODEX_ROUTER_CALLER_KEY", "secret-value"), after);
+  assert.equal(removeCredential(after, "CODEX_ROUTER_CALLER_KEY"), before);
+});
+
+test("several harness records with the same fields preserve separate mappings", () => {
+  // A second stored record repeats `kind` and `payload`. Read as the section's
+  // own fields they collided, and every publication was refused again.
+  const records =
+    "records:\n" +
+    "  client-connection/browser-session:\n" +
+    "    kind: grant\n" +
+    "    payload:\n" +
+    "      secret: first\n" +
+    "  client-connection/second-session:\n" +
+    "    kind: grant\n" +
+    "    payload:\n" +
+    "      secret: second\n";
+  const before = `${records}refs:\n  OTHER_KEY: existing\nversion: 1\n`;
+  const after = applyCredential(before, "CODEX_ROUTER_CALLER_KEY", "secret-value");
+  assert.equal(
+    after,
+    `${records}refs:\n  OTHER_KEY: existing\n  CODEX_ROUTER_CALLER_KEY: "secret-value"\nversion: 1\n`,
+  );
+  assert.equal(removeCredential(after, "CODEX_ROUTER_CALLER_KEY"), before);
+});
+
+test("only the envelope's own records section is exempt from the nesting rule", () => {
+  // Without `version` or `refs` this is a root-level reference map, where a
+  // nested `records` is as foreign as any other nested key.
+  assert.throws(
+    () => applyCredential("records:\n  scope/id:\n    kind: x\n", "CODEX_ROUTER_CALLER_KEY", "x"),
+    /"records" holds a nested mapping/,
+  );
+  assert.throws(
+    () =>
+      applyCredential("version: 1\nserver:\n  host: example.com\n", "CODEX_ROUTER_CALLER_KEY", "x"),
+    /"server" holds a nested mapping/,
+  );
+});
+
+test("credential edits refuse malformed or duplicate harness records", () => {
+  const prefix = "version: 1\nrefs:\n  CODEX_ROUTER_CALLER_KEY: old\nrecords:\n  client-connection/session:\n    kind: grant\n    payload:\n";
+  const invalid = [
+    prefix + "      token: [unfinished\n",
+    prefix + '      token: "unfinished\n',
+    prefix + "      token: first\n      token: second\n",
+    prefix + "      token: first\n  client-connection/session:\n    kind: grant\n    payload: second\n",
+  ];
+  for (const before of invalid) {
+    assert.throws(() => applyCredential(before, "CODEX_ROUTER_CALLER_KEY", "new"), /ambiguous YAML/);
+    assert.throws(() => removeCredential(before, "CODEX_ROUTER_CALLER_KEY"), /ambiguous YAML/);
+  }
+});
+
 test("an inline refs mapping is refused rather than extended", () => {
   assert.throws(
     () => applyCredential("version: 1\nrefs: {}\n", "CODEX_ROUTER_CALLER_KEY", "x"),
@@ -425,6 +608,7 @@ test("status finds the credential wherever the writer put it, in every shape", (
     "an empty envelope": "version: 1\nrefs:\n",
     "an envelope with the harness's own key": "version: 1\nrefs:\n  DEEPSEEK_API_KEY: sk-aaa\n",
     "an envelope indented four spaces": "version: 1\nrefs:\n    DEEPSEEK_API_KEY: sk-aaa\n",
+    "an envelope with tagged records": "version: 1\nrefs:\n  DEEPSEEK_API_KEY: sk-aaa\nrecords:\n  client-connection/session:\n    kind: grant\n    payload:\n      token: test-only-session\n  provider/example:\n    kind: api-key\n    key: test-only-key\n",
     "a legacy root-level document": "DEEPSEEK_API_KEY: sk-aaa\n",
     "an empty file": "",
   };
@@ -459,6 +643,7 @@ test("status finds the credential wherever the writer put it, in every shape", (
       if (initial?.includes("DEEPSEEK_API_KEY")) {
         assert.ok(remaining.includes("DEEPSEEK_API_KEY: sk-aaa"), `${name}: lost another key`);
       }
+      if (initial?.includes("records:")) assert.equal(remaining, initial, `${name}: changed records`);
     } finally {
       rmSync(box.dshHome, { recursive: true, force: true });
       rmSync(box.stateDir, { recursive: true, force: true });

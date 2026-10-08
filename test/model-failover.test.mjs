@@ -4,6 +4,9 @@ import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 
+import { flattenNamespaceTools } from "../src/namespace-relay.mjs";
+import { subagentToolAvailable } from "../src/subagent-completion.mjs";
+
 const stateDir = mkdtempSync(path.join(os.tmpdir(), "model-failover-test-"));
 process.env.CODEX_ROUTER_STATE_DIR = stateDir;
 
@@ -81,6 +84,19 @@ test("classifyRoutedFailure swaps only a marked provider transport 5xx", () => {
     classifyRoutedFailure({ status: 502, bodyText: "provider unavailable" }),
     { swap: false },
   );
+});
+
+test("classifyRoutedFailure never swaps a local tool-argument conversion", () => {
+  const bodyText = JSON.stringify({
+    error: {
+      message:
+        "Failed to parse tool call arguments for tool 'exec_command' (Anthropic tool invoke). " +
+        "Error: Unterminated string starting at: line 1 column 8 (char 7).\n" +
+        "usage limit reached for your GLM Coding Plan. Upgrade your plan.",
+    },
+  });
+  assert.deepEqual(classifyRoutedFailure({ status: 400, bodyText, now: NOW }), { swap: false });
+  assert.deepEqual(classifyRoutedFailure({ status: 429, bodyText, now: NOW }), { swap: false });
 });
 
 test("classifyRoutedFailure recognizes the observed Z.ai five-hour window message", () => {
@@ -408,6 +424,63 @@ test("rankFailoverCandidates orders a tier by the registry's own preference", ()
   );
 });
 
+test("rankFailoverCandidates admits a same-family 1M sibling only when asked", () => {
+  const from = model("opencode-go-messages/minimax-m3", "opencode-go-messages", {
+    contextWindow: 262_144,
+  });
+  const largeSibling = model("opencode-go/glm-5.3-flash", "opencode-go", {
+    contextWindow: 1_000_000,
+    priority: 29,
+  });
+  const smallSibling = model("opencode-go-messages/qwen3.8-max", "opencode-go-messages", {
+    contextWindow: 262_144,
+    priority: 42,
+  });
+  const other = model("kimi/k3", "kimi", { contextWindow: 1_000_000, priority: 10 });
+  const models = [largeSibling, smallSibling, other];
+
+  const blocked = rankFailoverCandidates(models, {
+    from,
+    estimatedTokens: 434983,
+  });
+  assert.deepEqual(
+    blocked.map((entry) => entry.model.slug),
+    ["kimi/k3"],
+  );
+
+  const allowed = rankFailoverCandidates(models, {
+    from,
+    estimatedTokens: 434983,
+    allowSameFamily: true,
+  });
+  assert.ok(allowed.some((entry) => entry.model.slug === largeSibling.slug));
+  assert.equal(
+    allowed.some((entry) => entry.model.slug === smallSibling.slug),
+    false,
+  );
+  assert.ok(allowed.some((entry) => entry.model.slug === other.slug));
+});
+
+test("classifyRoutedFailure does not swap a Console Go context-length 400", () => {
+  const inner = JSON.stringify({
+    type: "error",
+    error: {
+      type: "invalid_request_error",
+      message:
+        "Error from provider (Console Go): Upstream request failed: [invalid_request_error] "
+        + "Prompt too long: about 434983 tokens estimated, but the maximum context length is 262144 tokens including the completion. "
+        + "Reduce the length of the messages.",
+    },
+  });
+  const bodyText = JSON.stringify({
+    error: {
+      message:
+        `litellm.BadRequestError: AnthropicException - ${inner}. Received Model Group=opencode-go-messages-minimax-m3\nAvailable Model Group Fallbacks=None`,
+    },
+  });
+  assert.equal(classifyRoutedFailure({ status: 400, bodyText, now: NOW }).swap, false);
+});
+
 test("rankFailoverCandidates never routes back into the same quota", () => {
   const ranked = rankFailoverCandidates(
     [
@@ -421,6 +494,35 @@ test("rankFailoverCandidates never routes back into the same quota", () => {
   assert.deepEqual(
     ranked.map((entry) => entry.model.slug),
     ["kimi/k3"],
+  );
+});
+
+test("rankFailoverCandidates offers separately billed Zen after Go exhaustion", () => {
+  const from = model("opencode-go/glm-5.3", "opencode-go");
+  const ranked = rankFailoverCandidates(
+    [
+      model("opencode-go-messages/minimax-m3", "opencode-go-messages"),
+      model("opencode-go-responses/gpt-5.6-luna", "opencode-go-responses"),
+      model("opencode-zen/glm-5.3", "opencode-zen"),
+    ],
+    { from },
+  );
+  assert.deepEqual(
+    ranked.map((entry) => entry.model.slug),
+    ["opencode-zen/glm-5.3"],
+  );
+
+  const reverse = rankFailoverCandidates(
+    [
+      model("opencode-zen-messages/claude-sonnet-4-5", "opencode-zen-messages"),
+      model("opencode-zen-responses/muse-spark-1.2", "opencode-zen-responses"),
+      model("opencode-go/glm-5.3", "opencode-go"),
+    ],
+    { from: model("opencode-zen/glm-5.3", "opencode-zen") },
+  );
+  assert.deepEqual(
+    reverse.map((entry) => entry.model.slug),
+    ["opencode-go/glm-5.3"],
   );
 });
 
@@ -482,6 +584,49 @@ test("rankFailoverCandidates keeps a collaboration turn on a v2 model", () => {
     ranked.map((entry) => entry.model.slug),
     ["deepseek/v4"],
   );
+});
+
+test("rankFailoverCandidates keeps colliding native lifecycle namespaces on v2", () => {
+  const namespaces = flattenNamespaceTools([
+    {
+      type: "namespace",
+      name: "collaboration",
+      tools: [
+        { type: "function", name: "spawn_agent" },
+        { type: "function", name: "interrupt_agent" },
+      ],
+    },
+    {
+      type: "namespace",
+      name: "agents",
+      tools: [
+        { type: "function", name: "spawn_agent" },
+        { type: "function", name: "interrupt_agent" },
+      ],
+    },
+  ]).namespaces;
+  const candidates = [
+    model("kimi/k3", "kimi", { multiAgentVersion: "v1" }),
+    model("deepseek/v4", "deepseek", { multiAgentVersion: "v2" }),
+  ];
+  const ranked = rankFailoverCandidates(
+    candidates,
+    { from: FROM, needsMultiAgentV2: subagentToolAvailable(namespaces) },
+  );
+
+  assert.deepEqual(
+    ranked.map((entry) => entry.model.slug),
+    ["deepseek/v4"],
+  );
+  const partial = new Map([
+    ["agents", new Set(["interrupt_agent"])],
+    ["collaboration", new Set(["spawn_agent", "wait_agent"])],
+  ]);
+  const partialRanked = rankFailoverCandidates(
+    candidates,
+    { from: FROM, needsMultiAgentV2: subagentToolAvailable(partial) },
+  );
+  assert.deepEqual(partialRanked.map((entry) => entry.model.slug), ["deepseek/v4"]);
 });
 
 test("rankFailoverCandidates preserves the selected search execution mode", () => {
@@ -662,4 +807,37 @@ test("setFailoverChain accepts comma-separated slugs and auto clears it", () => 
     "c/three",
   ]);
   assert.deepEqual(setFailoverChain([]).chain, []);
+});
+
+test("rankFailoverCandidates never offers a model marked failoverCandidate: false", () => {
+  const ranked = rankFailoverCandidates(
+    [
+      model("kimi/k3", "kimi", { priority: 10 }),
+      model("browser/web-high", "browser", { priority: 1, failoverCandidate: false }),
+    ],
+    { from: FROM },
+  );
+  assert.deepEqual(ranked.map((entry) => entry.model.slug), ["kimi/k3"]);
+});
+
+test("a named failover chain cannot bring back a model marked failoverCandidate: false", () => {
+  const ranked = rankFailoverCandidates(
+    [
+      model("kimi/k3", "kimi", { priority: 10 }),
+      model("browser/web-high", "browser", { priority: 1, failoverCandidate: false }),
+    ],
+    { from: FROM, chain: ["browser/web-high", "kimi/k3"] },
+  );
+  assert.deepEqual(ranked.map((entry) => entry.model.slug), ["kimi/k3"]);
+});
+
+test("failoverCandidate absent or true ranks exactly as before", () => {
+  const plain = [model("kimi/k3", "kimi", { priority: 60 }), model("deepseek/v4", "deepseek", { priority: 20 })];
+  const flagged = [
+    model("kimi/k3", "kimi", { priority: 60, failoverCandidate: true }),
+    model("deepseek/v4", "deepseek", { priority: 20 }),
+  ];
+  const slugs = (models) => rankFailoverCandidates(models, { from: FROM }).map((entry) => entry.model.slug);
+  assert.deepEqual(slugs(flagged), slugs(plain));
+  assert.deepEqual(slugs(plain), ["deepseek/v4", "kimi/k3"]);
 });

@@ -59,7 +59,12 @@ catalog, router, gateway generator, API forwarder, and doctor.
 It controls routed picker visibility and dispatcher access. `model-picker.json`
 stores the durable per-model decision, including explicit show choices, and the
 Codex, DeepSeek Harness, Gemini, and Cursor publishers all consume that same state for
-external models. In a signed-in Codex install, the native GPT catalog and its
+external models. The same file carries the Codex picker `order`: `native-first`
+(the default, routed models publish after the highest visible native GPT
+priority) or `routed-first` (every routed model publishes ahead of the natives,
+in vendor-group order, and the natives shift after them). Set it with
+`./bin/model-router codex picker-order routed-first|native-first|status`; the
+command republishes the catalog, and Codex reloads the picker on its next start. In a signed-in Codex install, the native GPT catalog and its
 base-entry visibility remain Codex-owned, so a router "hide all" action cannot
 erase the original native picker. A known namespaced model whose provider is hidden receives a local
 `provider_not_enabled` error; it is never mistaken for a native model or

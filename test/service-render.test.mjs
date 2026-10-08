@@ -56,6 +56,32 @@ function render(script, platform, testRoot, target = "codex", sourceRoot = root)
   return serviceCommand(script, platform, testRoot, "render", target, sourceRoot);
 }
 
+test("all service platforms persist a bounded Z.ai idle override", () => {
+  const testRoot = mkdtempSync(path.join(os.tmpdir(), "zai-idle-service-"));
+  try {
+    for (const [platform, script] of [["darwin", "service-macos.mjs"], ["linux", "service-linux.mjs"], ["win32", "service-windows.mjs"]]) {
+      const absent = serviceCommand(script, platform, testRoot, "render", "codex", root, {
+        CODEX_ROUTER_ZAI_CODING_STREAM_STALL_MS: undefined,
+      });
+      assert.doesNotMatch(absent, /CODEX_ROUTER_ZAI_CODING_STREAM_STALL_MS/, platform);
+      for (const [setting, expected] of [["90000", "90000"], ["invalid;value", "180000"]]) {
+        const output = serviceCommand(script, platform, testRoot, "render", "codex", root, {
+          CODEX_ROUTER_ZAI_CODING_STREAM_STALL_MS: setting,
+        });
+        const expectedLine = platform === "darwin"
+          ? `<key>CODEX_ROUTER_ZAI_CODING_STREAM_STALL_MS</key>\n    <string>${expected}</string>`
+          : platform === "linux"
+            ? `Environment="CODEX_ROUTER_ZAI_CODING_STREAM_STALL_MS=${expected}"`
+            : `set "CODEX_ROUTER_ZAI_CODING_STREAM_STALL_MS=${expected}"`;
+        assert.ok(output.includes(expectedLine), `${platform}: ${expectedLine}`);
+        assert.doesNotMatch(output, /invalid;value/, platform);
+      }
+    }
+  } finally {
+    rmSync(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("service regeneration retains persisted hook opt-in on all platforms", () => {
   const testRoot = mkdtempSync(path.join(os.tmpdir(), "router-hook-service-"));
   const stateDir = path.join(testRoot, "codex router state");
@@ -216,6 +242,68 @@ test("the Windows service persists standalone Task Manager mode only while its p
     );
     const enabled = render("service-windows.mjs", "win32", testRoot);
     assert.match(enabled, /set "CODEX_ROUTER_TASK_MANAGER_STANDALONE=1"/);
+  } finally {
+    rmSync(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("Windows service renders startup defaults unless valid operator overrides are set", () => {
+  const testRoot = mkdtempSync(path.join(os.tmpdir(), "codex-router-startup-timeouts-"));
+  const settings = [
+    ["CODEX_ROUTER_VENV_PROBE_TIMEOUT_MS", "300000"],
+    ["CODEX_ROUTER_VENV_PROBE_RETRY_TIMEOUT_MS", "300000"],
+    ["CODEX_ROUTER_WINDOWS_PROCESS_PROBE_TIMEOUT_MS", "900000"],
+    ["CODEX_ROUTER_WINDOWS_PRIVATE_SYNC_TIMEOUT_MS", "900000"],
+    ["CODEX_ROUTER_STARTUP_HEALTH_TIMEOUT_MS", "300000"],
+    ["CODEX_ROUTER_GATEWAY_HEALTH_TIMEOUT_MS", "900000"],
+  ];
+  const unset = Object.fromEntries(settings.map(([name]) => [name, undefined]));
+  try {
+    const absent = serviceCommand(
+      "service-windows.mjs",
+      "win32",
+      testRoot,
+      "render",
+      "codex",
+      root,
+      unset,
+    );
+    for (const [name] of settings) {
+      assert.doesNotMatch(absent, new RegExp(`set "${name}=`), `${name} must use its consumer default`);
+    }
+
+    const configured = serviceCommand(
+      "service-windows.mjs",
+      "win32",
+      testRoot,
+      "render",
+      "codex",
+      root,
+      Object.fromEntries(settings),
+    );
+    for (const [name, value] of settings) {
+      assert.ok(configured.includes(`set "${name}=${value}"`), `${name} override was not rendered`);
+    }
+
+    for (const invalid of ["12ms", "1.5", "900001", "0"]) {
+      const rejected = serviceCommand(
+        "service-windows.mjs",
+        "win32",
+        testRoot,
+        "render",
+        "codex",
+        root,
+        {
+          ...unset,
+          CODEX_ROUTER_VENV_PROBE_TIMEOUT_MS: invalid,
+        },
+      );
+      assert.doesNotMatch(
+        rejected,
+        /set "CODEX_ROUTER_VENV_PROBE_TIMEOUT_MS=/,
+        `invalid override ${JSON.stringify(invalid)} must not be rendered`,
+      );
+    }
   } finally {
     rmSync(testRoot, { recursive: true, force: true });
   }
@@ -546,9 +634,10 @@ test("the Windows scheduled task runs the VBS launcher through wscript.exe", () 
     );
 
     assert.equal(action.execute, "wscript.exe");
-    // //B and //NoLogo keep the windowless host quiet; the launcher path takes a
-    // single quote pair because wscript.exe uses the standard argument parser.
-    assert.equal(action.argument, `//B //NoLogo "${launcherPath}"`);
+    // The explicit engine keeps unrelated `.vbs` file associations from
+    // disabling the launcher. //B and //NoLogo keep the windowless host quiet;
+    // the path takes one quote pair because wscript.exe uses the standard parser.
+    assert.equal(action.argument, `//E:VBScript //B //NoLogo "${launcherPath}"`);
     // The console-visible cmd.exe action is what issue #98 reported.
     assert.doesNotMatch(`${action.execute} ${action.argument}`, /cmd\.exe/);
   } finally {
@@ -578,11 +667,11 @@ test("Windows explicit stop disables heartbeat while start and restart re-enable
   assert.match(source, /function setTaskEnabled\(enabled\)/);
   assert.match(
     source,
-    /command === "stop"\) \{[\s\S]*?setTaskEnabled\(false\);[\s\S]*?endTask\(\);/,
+    /command === "stop"\) \{[\s\S]*?setTaskEnabled\(false\);[\s\S]*?endTask\(\{ taskDisabled: registered \}\);/,
   );
   assert.match(
     source,
-    /if \(command === "restart"\) endTask\(\);[\s\S]*?setTaskEnabled\(true\);[\s\S]*?schtasks\(\["\/Run"/,
+    /if \(command === "restart"\) \{\s*endTask\(\);\s*resetStartupAttempts\(\);\s*\}[\s\S]*?setTaskEnabled\(true\);[\s\S]*?schtasks\(\["\/Run"/,
   );
 });
 
@@ -600,8 +689,8 @@ test("Windows explicit stop disables heartbeat while start and restart re-enable
 // launcher reports the parse or runtime error on stderr instead of arriving as
 // an unexplained exit code.
 const WINDOWS_SCRIPT_HOSTS = [
-  { name: "cscript.exe", args: ["//NoLogo"] },
-  { name: "wscript.exe", args: ["//B", "//NoLogo"] },
+  { name: "cscript.exe", args: ["//E:VBScript", "//NoLogo"] },
+  { name: "wscript.exe", args: ["//E:VBScript", "//B", "//NoLogo"] },
 ];
 
 // Resolved absolutely: these live in the system directory, and naming them
@@ -720,13 +809,20 @@ test(
       const stateDir = windowsStateDir(testRoot);
       const wrapperPath = path.join(stateDir, "start-codex-router.cmd");
       const launcherPath = path.join(stateDir, "start-codex-router-hidden.vbs");
+      const stubs = schedulerStubs(path.join(testRoot, "absent"), {
+        schtasksFail: "/Create /Query", powershellFail: "Register-ScheduledTask", registrationState: "absent",
+      });
       const run = (command) =>
-        JSON.parse(serviceCommand("service-windows.mjs", "win32", testRoot, command));
+        JSON.parse(serviceCommand("service-windows.mjs", "win32", testRoot, command, "codex", root, { PATH: stubs.path }));
 
-      // schtasks.exe and powershell.exe are absent off Windows. The launchers
-      // are still generated, but the service is not truthfully reported as
-      // installed when no Task Scheduler definition exists.
-      assert.equal(run("install").installed, false);
+      // A successful enumeration proves the task absent and registration is
+      // blocked. The launchers are generated without claiming an installed task.
+      const first = run("install");
+      assert.equal(first.installed, false);
+      // The launchers really were written despite blocked registration. The
+      // report says so outright instead of leaving `path` to
+      // imply it (issue #760).
+      assert.equal(first.launchers, true);
       assert.equal(existsSync(wrapperPath), true);
       assert.equal(existsSync(launcherPath), true);
       assert.equal(statSync(wrapperPath).mode & 0o777, 0o600);
@@ -768,6 +864,7 @@ function schedulerStubs(directory, options = {}) {
     runningQueries = 0,
     authoritativeState = "0|0|0",
     authoritativeFail = false,
+    registrationState = "present",
   } = options;
   mkdirSync(directory, { recursive: true });
   const logPath = path.join(directory, "calls.log");
@@ -794,6 +891,9 @@ function schedulerStubs(directory, options = {}) {
       authoritativeFail
         ? "    exit 1"
         : `    printf '%s' ${JSON.stringify(authoritativeState)}`,
+      "    ;;",
+      "  *'Get-ScheduledTask -ErrorAction Stop'*)",
+      `    printf '%s' ${JSON.stringify(registrationState)}`,
       "    ;;",
       "  *Get-ScheduledTask*)",
       "    count=0",
@@ -877,6 +977,49 @@ test(
           if (command === "restart") {
             const end = calls.findIndex((line) => line.includes("/End"));
             assert.ok(end >= 0 && end < enable, `restart must end before enabling:\n${calls.join("\n")}`);
+          }
+        } finally {
+          rmSync(testRoot, { recursive: true, force: true });
+        }
+      });
+    }
+  },
+);
+
+test(
+  "Windows start and restart refuse an unregistered task instead of relaying schtasks",
+  { skip: process.platform === "win32" },
+  async (context) => {
+    for (const command of ["start", "restart"]) {
+      await context.test(command, () => {
+        const testRoot = mkdtempSync(path.join(os.tmpdir(), `codex-router-win-${command}-absent-`));
+        try {
+          // A task that is not registered: every /Query against it fails, which
+          // is exactly what schtasks.exe does for a name it cannot find.
+          const stubs = schedulerStubs(path.join(testRoot, "scheduler"), {
+            schtasksFail: "/Query",
+            registrationState: "absent",
+          });
+          const result = runWindowsService(testRoot, command, { PATH: stubs.path });
+
+          // Issue #760: this used to be schtasks.exe's own error from /Change,
+          // naming neither the task nor anything to do about it.
+          assert.equal(result.status, 1, result.stdout || result.stderr);
+          assert.equal(result.stdout.trim(), "", "a refused start must not claim a running service");
+          assert.match(result.stderr, /"Codex Router" scheduled task is not registered/);
+          assert.match(result.stderr, new RegExp(`nothing to ${command}`));
+          assert.match(result.stderr, /service\.mjs install/);
+
+          // Nothing may be mutated on the way out. /Change against a missing
+          // task is the reported failure; /Run and /End would fail the same way
+          // and an /End would stop a task the operator still has.
+          const calls = stubs.calls();
+          for (const verb of ["/Change", "/Run", "/End", "/Create", "/Delete"]) {
+            assert.equal(
+              calls.some((line) => line.includes(verb)),
+              false,
+              `${command} must not reach ${verb} with no task registered:\n${calls.join("\n")}`,
+            );
           }
         } finally {
           rmSync(testRoot, { recursive: true, force: true });
@@ -1054,8 +1197,9 @@ test(
       // The surviving definition is queried before it is started: /Run against
       // a name that failed to register recovers nothing and reports its own
       // error over the one that actually matters.
+      const recoveryQuery = calls.findIndex((line, index) => index > at("/Create") && line.includes("/Query"));
       assert.ok(
-        at("/Create") < at("/Query") && at("/Query") < at("/Run"),
+        at("/Create") < recoveryQuery && recoveryQuery < at("/ENABLE") && at("/ENABLE") < at("/Run"),
         `the recovery must query before it runs:\n${calls.join("\n")}`,
       );
       assert.equal(calls.filter((line) => line.includes("/Run")).length, 1);
@@ -1074,6 +1218,7 @@ test(
       const stubs = schedulerStubs(path.join(testRoot, "gone"), {
         schtasksFail: "/Create /Query",
         powershellFail: "Register-ScheduledTask",
+        registrationState: "absent",
       });
       const result = runWindowsService(testRoot, "install", { PATH: stubs.path });
       // Still best effort: the launchers are written and the caller retries,
@@ -1087,6 +1232,61 @@ test(
         calls.some((line) => line.includes("/Run")),
         false,
         `nothing survived to start, so /Run must not be issued:\n${calls.join("\n")}`,
+      );
+    } finally {
+      rmSync(testRoot, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "an install that wrote no launcher fails instead of reporting a path that is not there",
+  { skip: process.platform === "win32" },
+  () => {
+    const testRoot = mkdtempSync(path.join(os.tmpdir(), "codex-router-win-no-launcher-"));
+    try {
+      // A scheduler that answers every query, so a surviving task name cannot
+      // be what makes this install look successful.
+      const stubs = schedulerStubs(path.join(testRoot, "scheduler"));
+      // A regular file where the state directory's parent belongs makes
+      // writeLaunchers() throw before anything reaches disk. On Windows the
+      // same shape arrives as a blocked ACL hardening (Windows PowerShell in
+      // ConstrainedLanguage cannot construct a FileSecurity), a sharing
+      // violation on the rename, or a denied write into an elevated install's
+      // ACLs -- none of which POSIX can reproduce. What is under test is the
+      // report, not the cause: install used to swallow the exception whole and
+      // still print `path`, so the operator was told a file existed that did
+      // not, and the install went on to fail 300 seconds later inside the
+      // readiness wait with the health probe's bare "fetch failed" (#760).
+      const blocker = path.join(testRoot, "blocked");
+      writeFileSync(blocker, "not a directory\n");
+      const result = runWindowsService(testRoot, "install", {
+        PATH: stubs.path,
+        MODEL_ROUTER_STATE_DIR: path.join(blocker, "state"),
+      });
+      assert.notEqual(
+        result.status,
+        0,
+        `an install with no launcher on disk must fail:\nstdout: ${result.stdout}\nstderr: ${result.stderr}`,
+      );
+      const report = JSON.parse(result.stdout);
+      assert.equal(report.launchers, false);
+      assert.equal(report.installed, false, "a task with no launcher to run is not installed");
+      assert.equal(
+        existsSync(report.path),
+        false,
+        "the fixture must actually leave the reported path absent",
+      );
+      // The swallowed write error is the entire diagnosis. Without it the
+      // operator has a failed install and no named cause anywhere.
+      assert.match(result.stderr, /Failed to write the service launchers/);
+      assert.match(result.stderr, /ENOTDIR|ENOENT|EEXIST|EACCES|EPERM/);
+      // Registration must not have been attempted: writeLaunchers() throws
+      // ahead of it, and a task whose action does not exist is worse than none.
+      assert.equal(
+        stubs.calls().some((line) => line.includes("/Create") || line.includes("Register-ScheduledTask")),
+        false,
+        `no task may be registered for a launcher that was never written:\n${stubs.calls().join("\n")}`,
       );
     } finally {
       rmSync(testRoot, { recursive: true, force: true });
@@ -1164,10 +1364,12 @@ test(
   () => {
     const testRoot = mkdtempSync(path.join(os.tmpdir(), "codex-router-win-stop-"));
     try {
-      // No stubs on PATH, so schtasks.exe is missing exactly as it is when the
-      // task does not exist. stop used to throw that straight at the caller
-      // while uninstall and restart tolerated it.
-      const result = runWindowsService(testRoot, "stop");
+      // Failed schtasks queries do not establish absence. A successful empty
+      // enumeration proves there is no heartbeat to disable.
+      const stubs = schedulerStubs(path.join(testRoot, "absent"), {
+        schtasksFail: "/Query", registrationState: "absent",
+      });
+      const result = runWindowsService(testRoot, "stop", { PATH: stubs.path });
       assert.equal(result.status, 0, result.stderr);
       assert.deepEqual(JSON.parse(result.stdout), { state: "stopped" });
     } finally {
@@ -1197,3 +1399,25 @@ test(
     }
   },
 );
+
+test("all service definitions persist only valid startup cooldown settings", () => {
+  const testRoot = mkdtempSync(path.join(os.tmpdir(), "startup-backoff-render-"));
+  try {
+    for (const [platform, script] of [["darwin", "service-macos.mjs"], ["linux", "service-linux.mjs"], ["win32", "service-windows.mjs"]]) {
+      for (const setting of [undefined, "0", "1", "true", "1\nINJECT=value"]) {
+        const output = serviceCommand(script, platform, testRoot, "render", "codex", root, { CODEX_ROUTER_DISABLE_STARTUP_BACKOFF: setting });
+        const valid = setting === "0" || setting === "1";
+        assert.equal(output.includes("CODEX_ROUTER_DISABLE_STARTUP_BACKOFF"), valid, `${platform}: ${setting}`);
+        assert.doesNotMatch(output, /INJECT=value/);
+        if (valid) {
+          const expected = platform === "darwin"
+            ? `<key>CODEX_ROUTER_DISABLE_STARTUP_BACKOFF</key>\n    <string>${setting}</string>`
+            : platform === "linux"
+              ? `Environment="CODEX_ROUTER_DISABLE_STARTUP_BACKOFF=${setting}"`
+              : `set "CODEX_ROUTER_DISABLE_STARTUP_BACKOFF=${setting}"`;
+          assert.ok(output.includes(expected), platform);
+        }
+      }
+    }
+  } finally { rmSync(testRoot, { recursive: true, force: true }); }
+});

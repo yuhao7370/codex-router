@@ -132,28 +132,71 @@ async function stop(child, server) {
   await new Promise((resolve) => server.close(resolve));
 }
 
-test("local LiteLLM routes are single-shot Ollama-native deployments", () => {
+function renderLocalConfig(fixture, options = {}) {
+  const env = { ...process.env, MODEL_ROUTER_USER_MODELS: fixture.userModels };
+  delete env.MODEL_ROUTER_LOCAL_NUM_CTX;
+  delete env.MODEL_ROUTER_LOCAL_TIMEOUT;
+  Object.assign(env, options);
+  return spawnSync(
+    process.execPath,
+    [
+      "-e",
+      "import('./src/litellm-config.mjs').then(({renderLiteLlmConfig}) => process.stdout.write(renderLiteLlmConfig()))",
+    ],
+    { cwd: root, encoding: "utf8", env },
+  );
+}
+
+function localBlock(rendered) {
+  const marker = 'model_name: "' + LOCAL_GATEWAY_MODEL + '"';
+  assert.equal(rendered.split(marker).length - 1, 1, "the local model was deployed twice");
+  return rendered.slice(rendered.indexOf(marker));
+}
+
+test("local LiteLLM defaults preserve 16384 context and 600 second timeouts", () => {
   const fixture = localFixture();
   try {
-    const result = spawnSync(
-      process.execPath,
-      [
-        "-e",
-        "import('./src/litellm-config.mjs').then(({renderLiteLlmConfig}) => process.stdout.write(renderLiteLlmConfig()))",
-      ],
-      {
-        cwd: root,
-        encoding: "utf8",
-        env: { ...process.env, MODEL_ROUTER_USER_MODELS: fixture.userModels },
-      },
-    );
+    const result = renderLocalConfig(fixture);
     assert.equal(result.status, 0, result.stderr);
-    const marker = `model_name: \"${LOCAL_GATEWAY_MODEL}\"`;
-    assert.equal(result.stdout.split(marker).length - 1, 1, "the local model was deployed twice");
-    const block = result.stdout.slice(result.stdout.indexOf(marker));
+    const block = localBlock(result.stdout);
     assert.match(block, /model: "ollama_chat\/qwen3\.8:27b-mlx"/);
-    assert.match(block, /num_ctx: 16384/);
+    assert.match(block, /^      num_ctx: 16384$/m);
+    assert.match(block, /^      timeout: 600$/m);
+    assert.match(block, /^      stream_timeout: 600$/m);
     assert.match(block, /num_retries: 0/);
+  } finally {
+    rmSync(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("local LiteLLM accepts configured context and timeouts", () => {
+  const fixture = localFixture();
+  try {
+    const result = renderLocalConfig(fixture, {
+      MODEL_ROUTER_LOCAL_NUM_CTX: "32768",
+      MODEL_ROUTER_LOCAL_TIMEOUT: "2400",
+    });
+    assert.equal(result.status, 0, result.stderr);
+    const block = localBlock(result.stdout);
+    assert.match(block, /^      num_ctx: 32768$/m);
+    assert.match(block, /^      timeout: 2400$/m);
+    assert.match(block, /^      stream_timeout: 2400$/m);
+    assert.match(block, /num_retries: 0/);
+  } finally {
+    rmSync(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("local LiteLLM rejects invalid context and timeout values explicitly", () => {
+  const fixture = localFixture();
+  try {
+    for (const name of ["MODEL_ROUTER_LOCAL_NUM_CTX", "MODEL_ROUTER_LOCAL_TIMEOUT"]) {
+      for (const value of ["", "0", "-1", "1.5", "abc", "9007199254740992"]) {
+        const result = renderLocalConfig(fixture, { [name]: value });
+        assert.notEqual(result.status, 0, name + "=" + value);
+        assert.match(result.stderr, new RegExp(name + " must be a positive integer"));
+      }
+    }
   } finally {
     rmSync(fixture.directory, { recursive: true, force: true });
   }
@@ -261,6 +304,43 @@ test("an Ollama context rejection reaches Codex once as context_length_exceeded"
     assert.match(payload.error.message, /^Ollama could not run/);
     assert.match(payload.error.message, /269,931 tokens/);
     assert.match(payload.error.message, /not high demand/);
+  } finally {
+    await stop(router, gateway.server);
+    rmSync(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("compaction requests to keyless providers also drop reasoning flags", async () => {
+  const fixture = localFixture();
+  const requests = [];
+  const gateway = await mockServer(async (request, response) => {
+    if (request.method === "GET") {
+      json(response, 200, { ok: true });
+      return;
+    }
+    requests.push(await bodyJson(request));
+    json(response, 200, { id: "resp_compact", object: "response", status: "completed", output: [] });
+  });
+  const routerPort = await openPort();
+  const router = startRouter(fixture, gateway.port, routerPort);
+  try {
+    await waitForRouter(routerPort, router);
+    const response = await fetch(`${callerBaseUrl(routerPort, CALLER_KEY)}/responses/compact`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: LOCAL_SLUG,
+        reasoning: { effort: "high" },
+        reasoning_effort: "high",
+        input: "Compaction test input.",
+      }),
+    });
+    assert.equal(response.status, 200, router.testErrors());
+    assert.equal(requests.length, 1);
+    const forwarded = requests[0];
+    assert.equal(forwarded.reasoning, undefined, "Ollama must not receive Codex's reasoning object on compaction");
+    assert.equal(forwarded.reasoning_effort, undefined, "Ollama must not receive Codex's reasoning_effort on compaction");
+
   } finally {
     await stop(router, gateway.server);
     rmSync(fixture.directory, { recursive: true, force: true });

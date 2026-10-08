@@ -186,6 +186,12 @@ export interface RouterControl {
   addProviderModels(provider: string, modelIds: string[]): Promise<unknown>;
   connectProvider(provider: string): Promise<unknown>;
   saveProviderCredential(provider: string, credential: string): Promise<unknown>;
+  addCustomEndpoint(endpoint: { displayName: string; baseUrl: string; adapter: "openai-chat" | "openai-responses"; credential?: string }): Promise<{ providerId: string; check?: { ok: boolean; status: number; reason?: string } }>;
+  editCustomEndpoint(provider: string, endpoint: { displayName: string; baseUrl: string; adapter: "openai-chat" | "openai-responses" }): Promise<{ providerId: string; check?: { ok: boolean; status: number; reason?: string } }>;
+  removeCustomEndpointModels(provider: string, slugs: string[]): Promise<unknown>;
+  /** Prune locally curated models (the `user-models.json` overlay) on any provider. */
+  removeLocalModels(slugs: string[]): Promise<unknown>;
+  addCustomEndpointModel(provider: string, modelId: string): Promise<unknown>;
   removeProviderCredential(provider: string): Promise<unknown>;
   setSubagentMode(mode: SubagentMode): Promise<unknown>;
   setSubagentModel(slug: string, enabled: boolean): Promise<unknown>;
@@ -229,10 +235,12 @@ export interface RouterControl {
   updateHarness(harnessId: HarnessId | "all"): Promise<unknown>;
   prepareCursorTunnel(): Promise<unknown>;
   connectCursor(hostname?: string): Promise<unknown>;
+  disconnectCursor(): Promise<unknown>;
+  disconnectHarness(harnessId: HarnessId): Promise<unknown>;
   openHarnessSession(harnessId: HarnessId, sessionId: string, surface: HarnessSurface, model?: string): Promise<unknown>;
   openExternal(url: string): Promise<void>;
   onNavigation?(listener: (request: {
-    destination: "usage" | "usage-resets";
+    destination: "usage" | "usage-resets" | "settings";
     sourceId?: string;
   }) => void): () => void;
   onOperation(listener: (event: { id?: string; name?: string; action?: string; status: string; message?: string; error?: string }) => void): () => void;

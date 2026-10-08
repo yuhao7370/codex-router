@@ -38,7 +38,13 @@ import {
 import { readMultiAgentSettings, subagentEligibleModels } from "./multi-agent-state.mjs";
 import { assertStateOwnership } from "./state-owner.mjs";
 import { routedClientModels } from "./routed-client-models.mjs";
-import { scanYamlDocument, spliceYamlBlock, yamlNode, yamlScalar } from "./yaml-structure.mjs";
+import {
+  scanYamlDocument,
+  spliceYamlBlock,
+  unaccountedLines,
+  yamlNode,
+  yamlScalar,
+} from "./yaml-structure.mjs";
 
 const ROUTE_PATH = ["llm-pi-ai", "providers", DSH_ROUTE_ID];
 const DEFAULT_MODEL_PATH = ["agent-default-model"];
@@ -89,6 +95,27 @@ function normalizeTrailing(lines) {
   return copy;
 }
 
+// The mapping we are about to add a key beside must be one the lexer read
+// whole. `children` holds only the mapping keys it could register, so a block
+// sequence, a merge key, or a key the key grammar declines lives inside the
+// node while being invisible there -- and the indent this manager copies off
+// "the first sibling" is then that invisible key's *child*. Publishing into
+// `providers:` holding `openrouter/free:` wrote `codex-router:` two columns
+// too deep, nested inside the user's provider, while every status read agreed
+// it went in cleanly. Refuse with the file untouched, as the rest of this
+// module does.
+function assertReadableMapping(document, node, label) {
+  if (!node) return;
+  const unreadable = unaccountedLines(document, node).filter(
+    (line) => !/^\s*#/.test(line.text),
+  );
+  if (!unreadable.length) return;
+  throw new Error(
+    `Refusing to edit ${label}: line ${unreadable[0].index + 1} `
+      + `(${unreadable[0].text.trim()}) is not a mapping entry this reader can account for.`,
+  );
+}
+
 /**
  * Splices the router's route into the settings document text.
  *
@@ -103,6 +130,7 @@ export function applyRouteToSettings(contents, route) {
       "Refusing to edit llm-pi-ai.providers: it is written as an inline value rather than a block.",
     );
   }
+  assertReadableMapping(document, providers, "llm-pi-ai.providers");
   // Follow whatever indentation the document already uses for a sibling route
   // rather than assuming two spaces: a route indented differently from the
   // ones beside it parses, but reads as though something went wrong.
@@ -132,6 +160,11 @@ export function removeRouteFromSettings(contents) {
   for (let depth = ROUTE_PATH.length - 1; depth > 0; depth -= 1) {
     const parent = yamlNode(document, ROUTE_PATH.slice(0, depth));
     if (!parent || parent.children.size !== 1) break;
+    // One *registered* key is not the same as one key. Stop if anything else
+    // lives here -- a sequence item, a merge key, a key the grammar declined,
+    // or the user's own comment. Leaving an empty `providers:` behind is a
+    // cosmetic cost; splicing the user's routes away is not recoverable.
+    if (unaccountedLines(document, parent).length) break;
     removal = parent;
   }
   const lines = [...document.lines];
@@ -149,6 +182,9 @@ export function removeRouteFromSettings(contents) {
 //
 const CREDENTIAL_REFS_KEY = "refs";
 const CREDENTIAL_VERSION_KEY = "version";
+// The envelope's third section: the harness's own tagged records (a stored
+// browser session, for one). Nested by design and never edited here.
+const CREDENTIAL_RECORDS_KEY = "records";
 
 /**
  * Decides which of the two shapes a credentials document is written in.
@@ -190,8 +226,11 @@ function credentialPath(document, reference) {
 // and rewriting it would be a guess. The envelope adds one legal level of
 // nesting and not one byte more, so its own entries are held to the same rule —
 // a `refs:` holding `server:\n  host: …` is somebody's configuration file, not
-// a reference map, however much the top of it matches.
-function assertCredentialDocument(document, refs) {
+// a reference map, however much the top of it matches. The one exception is
+// the envelope's own `records` section: refusing it blocked every client
+// publication as soon as the harness stored a browser session. A root-level map
+// has no such section, so there it is still a nested mapping.
+function assertCredentialDocument(document, refs, wrapped) {
   const nested = (owner) => {
     throw new Error(
       `Refusing to edit the harness credentials document: "${owner}" holds a nested mapping, ` +
@@ -205,8 +244,18 @@ function assertCredentialDocument(document, refs) {
       }
       continue;
     }
+    if (node.key === CREDENTIAL_RECORDS_KEY) {
+      if (!wrapped && node.children.size) nested(node.key);
+      continue;
+    }
     if (node.children.size) nested(node.key);
   }
+}
+
+// Read the harness's scope/id and JSON payload keys without skipping lexical
+// or duplicate-key validation. Publication never splices inside records.
+function scanCredentials(contents) {
+  return scanYamlDocument(contents, { extendedPlainKeyRoots: [CREDENTIAL_RECORDS_KEY] });
 }
 
 function withoutNode(document, node) {
@@ -224,9 +273,9 @@ function withoutNode(document, node) {
  * mapping inside `refs`, an inline `refs` — is refused with the file untouched.
  */
 export function applyCredential(contents, reference, value) {
-  const initial = scanYamlDocument(contents);
+  const initial = scanCredentials(contents);
   const { wrapped } = credentialEnvelope(initial);
-  assertCredentialDocument(initial, initial.root.children.get(CREDENTIAL_REFS_KEY));
+  assertCredentialDocument(initial, initial.root.children.get(CREDENTIAL_REFS_KEY), wrapped);
 
   // A build of this router from before the envelope was understood wrote our
   // own reference at the root of a document the harness reads through `refs`.
@@ -235,7 +284,7 @@ export function applyCredential(contents, reference, value) {
   // that era would find again. Take it out; nothing else is touched.
   const misplaced = wrapped ? yamlNode(initial, [reference]) : undefined;
   const document = misplaced
-    ? scanYamlDocument(withoutNode(initial, misplaced).join("\n"))
+    ? scanCredentials(withoutNode(initial, misplaced).join("\n"))
     : initial;
 
   const refs = wrapped ? document.root.children.get(CREDENTIAL_REFS_KEY) : undefined;
@@ -247,6 +296,7 @@ export function applyCredential(contents, reference, value) {
   // and that mixed-indent block is not YAML any parser will read back. The
   // whole file is the harness's credential store, so the loss would be every
   // adapter's key, not ours.
+  assertReadableMapping(document, refs, `the harness credentials document's "${CREDENTIAL_REFS_KEY}"`);
   const sibling = refs && [...refs.children.values()][0];
   const indent = wrapped
     ? " ".repeat(sibling ? sibling.indent : (refs ? refs.indent : 0) + 2)
@@ -269,14 +319,20 @@ export function applyCredential(contents, reference, value) {
 export function removeCredential(contents, reference) {
   let text = String(contents ?? "");
   for (;;) {
-    const document = scanYamlDocument(text);
+    const document = scanCredentials(text);
     const node =
       yamlNode(document, [CREDENTIAL_REFS_KEY, reference]) || yamlNode(document, [reference]);
     if (!node) return joinLines(normalizeTrailing(document.lines));
     let removal = node;
     if (node.path.length > 1) {
       const parent = yamlNode(document, [CREDENTIAL_REFS_KEY]);
-      if (parent && parent.children.size === 1) removal = parent;
+      if (
+        parent &&
+        parent.children.size === 1 &&
+        !unaccountedLines(document, parent).length
+      ) {
+        removal = parent;
+      }
     }
     // Each pass removes at least one line, so this terminates.
     text = withoutNode(document, removal).join("\n");
@@ -523,7 +579,7 @@ export function status() {
     // an enveloped document is present on disk and absent to the harness, and
     // reporting that as installed turns a missing credential into a 401 with
     // no diagnostic anywhere.
-    const document = scanYamlDocument(credentials);
+    const document = scanCredentials(credentials);
     credentialPresent = Boolean(yamlNode(document, credentialPath(document, DSH_CREDENTIAL_REF)));
   } catch {
     credentialPresent = false;

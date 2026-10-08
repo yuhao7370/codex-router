@@ -150,6 +150,16 @@ test("user models round-trip through the protected state file", () => {
   assert.ok(USER_MODELS_PATH.startsWith(stateDir));
 });
 
+test("readUserModels accepts a file saved with a UTF-8 byte-order mark", () => {
+  // PowerShell and Notepad on Windows write UTF-8 with a BOM (#887); a failed
+  // parse here would silently drop every curated model.
+  const entries = [
+    userModelEntry({ providerId: "deepseek", upstreamId: "deepseek-bom-test", priority: 100 }),
+  ];
+  writeFileSync(USER_MODELS_PATH, `﻿${JSON.stringify({ version: 1, models: entries }, null, 2)}\n`);
+  assert.deepEqual(readUserModels(), entries);
+});
+
 test("readUserModels returns an empty list when the file is absent or invalid", () => {
   writeFileSync(USER_MODELS_PATH, "not-json\n");
   assert.deepEqual(readUserModels(), []);
@@ -438,4 +448,15 @@ test("legacy curation labels are cleaned without changing stored routing identit
   assert.equal(model.slug, entry.slug);
   assert.equal(model.gatewayModel, entry.gatewayModel);
   assert.equal(model.upstreamModel, entry.upstreamModel);
+});
+
+
+test("Windows BOM overlays retain routes while cleaning legacy curation labels", () => {
+  const entry = userModelEntry({providerId:"local-router",upstreamId:"bom-preserved",priority:100});
+  writeFileSync(USER_MODELS_PATH, "\uFEFF" + JSON.stringify({version:1,models:[{...entry,displayName:"BOM model (curated)"}]}));
+  const [model] = readUserModels();
+  assert.equal(model.slug,entry.slug);
+  assert.equal(model.upstreamModel,entry.upstreamModel);
+  assert.equal(model.gatewayModel,entry.gatewayModel);
+  assert.equal(model.displayName,"BOM model");
 });

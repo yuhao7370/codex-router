@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import http from "node:http";
+import net from "node:net";
 import test from "node:test";
 
 import * as nativeProxy from "../src/native-proxy.mjs";
@@ -132,5 +133,31 @@ test("native proxy fetch bypasses loopback targets", async () => {
   } finally {
     await close(proxy);
     await close(upstream);
+  }
+});
+
+// A TCP peer that never answers the TLS handshake makes the proxy's connect
+// bound observable without DNS, an external host or a trusted test certificate.
+test("native proxy connects use the configured bounded timeout", async () => {
+  const sockets = new Set();
+  const proxy = net.createServer((socket) => {
+    sockets.add(socket);
+    socket.once("close", () => sockets.delete(socket));
+  });
+  const proxyPort = await listen(proxy);
+  try {
+    const fetchNative = nativeProxy.nativeProxyFetch({
+      CODEX_ROUTER_NATIVE_PROXY_URL: `https://127.0.0.1:${proxyPort}`,
+      CODEX_ROUTER_CONNECT_TIMEOUT_MS: "500",
+    });
+    // A missing override reaches the safety abort instead of the expected
+    // connect error: neither Undici's 10s nor the shared 3s default fits here.
+    await assert.rejects(
+      fetchNative("https://native.test/health", { signal: AbortSignal.timeout(2_500) }),
+      (error) => error?.cause?.code === "UND_ERR_CONNECT_TIMEOUT",
+    );
+  } finally {
+    for (const socket of sockets) socket.destroy();
+    await close(proxy);
   }
 });

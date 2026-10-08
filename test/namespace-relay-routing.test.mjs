@@ -1381,7 +1381,7 @@ test("Groq rejects a known history overflow before spending a vision or gateway 
   }
 });
 
-test("non-Groq routes preserve the full expanded and discovered tool surface", async () => {
+test("non-Groq discovery routes preserve the reduced client and discovered tool surface", async () => {
   const result = await scenario(false, {
     requestPayload: (stream, model) => groqToolSurfacePayload(stream, model, {
       plainTools: 110,
@@ -1392,10 +1392,13 @@ test("non-Groq routes preserve the full expanded and discovered tool surface", a
   });
   assert.equal(result.gatewayBodies.length, 1);
   const outgoing = result.gatewayBodies[0];
-  assert.equal(outgoing.tools.length, 149);
+  assert.equal(outgoing.tools.length, 134);
   const names = new Set(outgoing.tools.map((tool) => tool.name));
-  assert.ok(names.has("codex_app__create_thread"));
-  assert.ok(names.has("plugin_management__uninstall_plugin"));
+  assert.ok(names.has("codex_app__load_workspace_dependencies"));
+  assert.ok(names.has("codex_app__navigate_to_codex_page"));
+  assert.ok(names.has("codex_app__read_thread_terminal"));
+  assert.equal(names.has("codex_app__create_thread"), false);
+  assert.equal(names.has("plugin_management__uninstall_plugin"), false);
   for (let index = 0; index < 20; index += 1) {
     assert.ok(names.has(`discovered_tool_${index}`));
   }
@@ -1656,8 +1659,92 @@ test("bounded routes preserve one alias for pre-flattened MCP definitions and hi
   }
 });
 
+test("OpenRouter Muse preserves bounded aliases through MCP history and streamed or JSON responses", async () => {
+  const namespace = "mcp__neon__apm__production__snapshot__read_only";
+  const name = "get_monitor_snapshot_with_complete_context";
+  const wireName = `${namespace}__${name}`;
+  for (const stream of [true, false]) {
+    const result = await scenario(stream, {
+      model: "openrouter/muse-spark-1.3-contributor",
+      requestPayload: preflattenedBoundedMcpPayload,
+      sseBody: (outgoing) => {
+        const providerName = outgoing.tools.find(
+          (tool) => tool.description === "Long preflattened MCP fixture.",
+        ).name;
+        return [
+          sseEvent({
+            type: "response.output_item.done",
+            item: {
+              type: "function_call",
+              name: providerName,
+              call_id: "call_snapshot",
+              arguments: "{}",
+            },
+          }),
+          sseEvent({ type: "response.completed" }),
+          "data: [DONE]\n\n",
+        ].join("");
+      },
+      jsonBody: (outgoing) => {
+        const providerName = outgoing.tools.find(
+          (tool) => tool.description === "Long preflattened MCP fixture.",
+        ).name;
+        return {
+          id: "resp_preflattened_bounded",
+          output: [{
+            type: "function_call",
+            name: providerName,
+            call_id: "call_snapshot",
+            arguments: "{}",
+          }],
+        };
+      },
+    });
+    assert.equal(result.gatewayBodies.length, 1);
+    const outgoing = result.gatewayBodies[0];
+    assert.equal(outgoing.client_metadata, undefined);
+    const providerTool = outgoing.tools.find(
+      (tool) => tool.description === "Long preflattened MCP fixture.",
+    );
+    assert.notEqual(providerTool.name, wireName);
+    assert.ok(providerTool.name.length <= 64);
+    const historyCall = outgoing.input.find(
+      (item) => item.call_id === "call_previous_snapshot",
+    );
+    assert.equal(historyCall.name, providerTool.name);
+    assert.equal(historyCall.namespace, undefined);
+
+    const call = stream
+      ? functionCallsFromSse(result.clientBody).get("call_snapshot")
+      : JSON.parse(result.clientBody).output[0];
+    assert.deepEqual(
+      { namespace: call.namespace, name: call.name },
+      { namespace, name },
+    );
+  }
+});
+
 test("non-streaming routed responses restore namespace calls before client dispatch", async () => {
-  const result = await scenario(false);
+  const result = await scenario(false, {
+    requestPayload: (stream, model) => {
+      const payload = routedRequestPayload(stream, model);
+      payload.input.push(
+        {
+          type: "function_call",
+          name: "send_message_to_thread",
+          namespace: "codex_app",
+          call_id: "call_prior_followup",
+          arguments: JSON.stringify({ threadId: "thread_1", prompt: "prior" }),
+        },
+        {
+          type: "function_call_output",
+          call_id: "call_prior_followup",
+          output: "{}",
+        },
+      );
+      return payload;
+    },
+  });
   assert.equal(result.gatewayBodies.length, 1);
   assert.equal(result.gatewayBodies[0].stream, false);
 
@@ -1889,6 +1976,82 @@ test("Responses-native routed providers inherit the model on fresh local thread 
   });
 });
 
+test("Azure routed spawns leave the model default to Codex while explicit overrides survive", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "azure-spawn-default-"));
+  const providersFile = path.join(directory, "generic-providers.json");
+  const userModelsFile = path.join(directory, "user-models.json");
+  const model = "azure-kmamc/gpt-6-sol";
+  writeFileSync(providersFile, JSON.stringify({
+    version: 1,
+    providers: [{
+      id: "azure-kmamc",
+      displayName: "Azure test",
+      baseUrl: "http://127.0.0.1:1/v1",
+      adapter: "openai-responses",
+      headers: {},
+      allowPrivate: true,
+      enabled: true,
+    }],
+  }));
+  writeFileSync(userModelsFile, JSON.stringify({
+    version: 1,
+    models: [{
+      slug: model,
+      gatewayModel: "azure-test-sol",
+      compHash: "azure-test-sol-user-v1",
+      upstreamModel: "gpt-6-sol",
+      provider: "azure-kmamc",
+      listed: true,
+      displayName: "Azure test Sol",
+      description: "Local collaboration fixture.",
+      priority: 100,
+      defaultEffort: "high",
+      reasoningLevels: [{ effort: "high", description: "Deep reasoning" }],
+      contextWindow: 131072,
+      autoCompact: 110000,
+      inputModalities: ["text"],
+    }],
+  }));
+  try {
+    const result = await scenario(false, {
+      model,
+      routerEnv: {
+        MODEL_ROUTER_STATE_DIR: directory,
+        MODEL_ROUTER_GENERIC_PROVIDERS: providersFile,
+        MODEL_ROUTER_USER_MODELS: userModelsFile,
+        CODEX_HOME: path.join(directory, "codex-home"),
+      },
+      requestPayload: (stream, selectedModel) => ({
+        model: selectedModel,
+        stream,
+        input: [{ type: "message", role: "user", content: "Delegate." }],
+        tools: [
+          { type: "namespace", name: "collaboration", tools: [{ type: "function", name: "spawn_agent" }] },
+          { type: "namespace", name: "codex_app", tools: [{ type: "function", name: "create_thread" }] },
+        ],
+      }),
+      jsonBody: () => ({
+        id: "resp_azure_spawn",
+        output: [
+          { type: "function_call", namespace: "collaboration", name: "spawn_agent",
+            call_id: "default", arguments: '{"message":"Default child."}' },
+          { type: "function_call", namespace: "collaboration", name: "spawn_agent",
+            call_id: "explicit", arguments: '{"message":"Explicit child.","model":"azure-kmamc/gpt-6-luna"}' },
+          { type: "function_call", namespace: "codex_app", name: "create_thread",
+            call_id: "local", arguments: '{"prompt":"Local thread.","target":{"type":"projectless"}}' },
+        ],
+      }),
+    });
+    assert.equal(result.gatewayBodies[0].model, "azure-test-sol");
+    const calls = JSON.parse(result.clientBody).output;
+    assert.deepEqual(JSON.parse(calls[0].arguments), { message: "Default child." });
+    assert.equal(JSON.parse(calls[1].arguments).model, "azure-kmamc/gpt-6-luna");
+    assert.equal(JSON.parse(calls[2].arguments).model, model);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 const GO_NAMESPACE = "mcp__codex_apps__github";
 const GO_LONG_TOOL = "list_repository_pull_request_review_comments_for_branch";
 const GO_DISCOVERED_NAMESPACE = "mcp__calendar_connector_with_a_long_namespace";
@@ -2001,11 +2164,17 @@ function goCompatibilityRequestPayload(
       { type: "function_call_output", call_id: "history-discovered", output: "done" },
       {
         type: "custom_tool_call",
+        id: "ctc_history_patch",
         name: "apply_patch",
         call_id: "history-patch",
         input: GO_PATCH,
       },
-      { type: "custom_tool_call_output", call_id: "history-patch", output: "Done!" },
+      {
+        type: "custom_tool_call_output",
+        id: "ctco_history_patch",
+        call_id: "history-patch",
+        output: "Done!",
+      },
       {
         type: "custom_tool_call",
         name: "future_custom",
@@ -2146,6 +2315,14 @@ test("OpenCode Go Responses uses one bounded function-tool contract in both resp
       outgoing.input.find((item) => item.call_id === "history-patch").type,
       "function_call",
     );
+    const patchCall = outgoing.input.find(
+      (item) => item.call_id === "history-patch" && item.type === "function_call",
+    );
+    const patchOutput = outgoing.input.find(
+      (item) => item.call_id === "history-patch" && item.type === "function_call_output",
+    );
+    assert.equal(Object.hasOwn(patchCall, "id"), false);
+    assert.equal(Object.hasOwn(patchOutput, "id"), false);
     const futureCustom = outgoing.input.find(
       (item) => item.call_id === "history-future-custom" && item.type === "function_call",
     );
@@ -2233,6 +2410,107 @@ test("OpenCode Go Muse removes recursive tool refs in both response modes", asyn
       description: "optional child",
     });
   }
+});
+
+// Issue #792 added the cycle-closing repair for the direct Meta Muse Spark 1.3
+// Contributor route, but it ran only in the api-forwarder, which understands
+// top-level `type: "function"` tools. A Responses-native endpoint keeps Codex's
+// `type: "namespace"` entries, so the app and MCP toolset -- where the
+// recursive `$defs` actually lives -- reached Meta unchanged and a tool-bearing
+// turn still came back as HTTP 400 `Recursive JSON schemas are not currently
+// supported`. The route's own `toolSchemaRecursion` flag now opts it into the
+// router-side repair too; the sibling Meta route without that measured proof
+// keeps its payload byte-identical, which is the control below.
+test("direct Meta Muse Spark 1.3 Contributor breaks recursive refs inside namespace tools", async () => {
+  const recursiveNamespaceChild = () => ({
+    type: "function",
+    name: "automation_update",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { $ref: "#/$defs/__schema0" },
+        branch: { type: "string" },
+      },
+      $defs: {
+        __schema0: {
+          anyOf: [
+            { type: "string" },
+            { type: "array", items: { $ref: "#/$defs/__schema0" } },
+            {
+              type: "object",
+              additionalProperties: { $ref: "#/$defs/__schema0" },
+            },
+          ],
+        },
+      },
+    },
+  });
+  const requestPayload = (stream, model) => ({
+    model,
+    stream,
+    input: [
+      {
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: "hi" }],
+      },
+    ],
+    tools: [
+      { type: "namespace", name: "codex_app", tools: [recursiveNamespaceChild()] },
+      {
+        type: "function",
+        name: "inspect",
+        parameters: {
+          type: "object",
+          properties: { child: { $ref: "#/$defs/Row" } },
+          $defs: {
+            Row: {
+              type: "object",
+              properties: { child: { $ref: "#/$defs/Row" } },
+            },
+          },
+        },
+      },
+    ],
+  });
+  const namespaceChildOf = (body) =>
+    body.tools
+      .find((tool) => tool.type === "namespace")
+      .tools.find((tool) => tool.name === "automation_update");
+
+  const verified = await scenario(true, {
+    model: "meta/muse-spark-1.3-contributor",
+    requestPayload,
+  });
+  const outgoing = verified.gatewayBodies[0];
+  const repairedChild = namespaceChildOf(outgoing);
+  // Definitions and acyclic references survive; only the edge that closes the
+  // cycle is blanked.
+  assert.equal(repairedChild.inputSchema.properties.id.$ref, "#/$defs/__schema0");
+  assert.deepEqual(
+    repairedChild.inputSchema.$defs.__schema0.anyOf[1].items,
+    {},
+  );
+  assert.deepEqual(
+    repairedChild.inputSchema.$defs.__schema0.anyOf[2].additionalProperties,
+    {},
+  );
+  const repairedFlatTool = outgoing.tools.find((tool) => tool.name === "inspect");
+  assert.deepEqual(repairedFlatTool.parameters.$defs.Row.properties.child, {});
+
+  const control = await scenario(true, {
+    model: "meta/muse-spark-1.3",
+    requestPayload,
+  });
+  const controlChild = namespaceChildOf(control.gatewayBodies[0]);
+  assert.deepEqual(controlChild.inputSchema.$defs.__schema0.anyOf[1].items, {
+    $ref: "#/$defs/__schema0",
+  });
+  assert.deepEqual(
+    control.gatewayBodies[0].tools.find((tool) => tool.name === "inspect")
+      .parameters.$defs.Row.properties.child,
+    { $ref: "#/$defs/Row" },
+  );
 });
 
 test("OpenCode Go compaction removes native tool history before the strict endpoint", async () => {
@@ -2495,7 +2773,7 @@ test("Grok structured patch opt-in crosses the real Router with collision, choic
     assert.deepEqual(outgoing.tool_choice, { type: "function", name: tool.name });
     const old = outgoing.input.find((item) => item.call_id === "call_history");
     assert.equal(old.name, tool.name);
-    assert.equal(old.id, "ctc_history");
+    assert.equal(Object.hasOwn(old, "id"), false);
     assert.equal(JSON.parse(old.arguments).input, grokApplyPatchPayload(stream, outgoing.model).input[1].input);
     assert.deepEqual(outgoing.input.find((item) => item.type === "function_call_output"), { type: "function_call_output", call_id: "call_history", output: "Done!" });
     const items = stream ? responseItemsFromSse(result.clientBody) : JSON.parse(result.clientBody).output;
@@ -2835,10 +3113,84 @@ test("hy4's prior reasoning is replayed as thinking, never as its own visible pr
     );
   }
 
-  // A chat route with no thinking contract keeps the old shape: reasoning is
-  // merged as text, since LiteLLM would otherwise drop it.
+  // A chat route outside the contract now DROPS the prior reasoning instead of
+  // merging it as visible text. This assertion is the reverse of what it was,
+  // and the reversal is deliberate (#755).
+  //
+  // The old expectation was written to preserve context that LiteLLM would
+  // otherwise drop, and for a model that does not preserve thinking -- k2.6 is
+  // exactly that, which is why chat-reasoning.mjs leaves K2.x out of the
+  // family table -- the merge was harmless. What changed is upstream of this
+  // file: #708 widened the reasoning-lifecycle repair to every
+  // `openai`-protocol provider, so Codex now stores reasoning items on Chat
+  // resellers whose models DO think and are still outside the contract
+  // (`commandcode/qwen3.8-flash`, measured 14 September 2026). Replayed as
+  // prose those loop, and no field on the route separates them from k2.6 here
+  // -- identical requestProfile, reasoningLevels and defaultEffort -- so the
+  // channel is chosen per contract, not per model.
+  //
+  // The cost is real and was accepted rather than overlooked: a thread that
+  // switched models no longer shows the newer model the older one's thinking.
+  // For a model that does not think, that is the only case this can arise in
+  // at all, since it stores no reasoning of its own to carry.
   const plain = await outgoingFor("opencode-go/kimi-k2.6");
   const plainAssistant = plain.input.find((item) => item.type === "message" && item.role === "assistant");
-  assert.equal(plainAssistant.content[0].type, "output_text");
-  assert.equal(plainAssistant.content[0].text, "PRIOR_THINKING: look at the locomotion code first.");
+  assert.deepEqual(
+    plainAssistant.content.map((part) => `${part.type}:${part.text}`),
+    ["output_text:Let me read the locomotion code."],
+    "an off-contract route keeps what the model said and drops what it thought",
+  );
+  assert.equal(
+    plain.input.some((item) => item.type === "reasoning"),
+    false,
+    "the dropped reasoning must not survive as an item either",
+  );
+});
+
+// Console Go's validator rejects Codex's collaboration item by name on the two
+// Muse Contributor routes, so a delegated child died before its first token
+// (`input[5] did not match any supported type`). The handoff payload is
+// recovered first, and the route then presents it as the equivalent user
+// message; a sibling Console Go route, whose upstream accepts the item, keeps
+// the shape it was written for.
+test("Console Go Muse Contributor routes carry Codex handoffs as user messages", async () => {
+  const handoff = {
+    type: "agent_message",
+    author: "/root",
+    recipient: "/root/worker",
+    content: [
+      {
+        type: "input_text",
+        text: "Message Type: NEW_TASK\nTask name: /root/worker\nSender: /root\nPayload:\n",
+      },
+      { type: "encrypted_content", encrypted_content: "Synthetic delegated task." },
+    ],
+  };
+  const outgoingFor = async (model) => {
+    const result = await scenario(true, {
+      model,
+      requestPayload: (stream, slug) => ({ model: slug, stream, input: [handoff] }),
+    });
+    return result.gatewayBodies.at(-1);
+  };
+
+  const expected = {
+    type: "message",
+    role: "user",
+    content: [
+      handoff.content[0],
+      { type: "input_text", text: "Synthetic delegated task." },
+    ],
+  };
+  for (const slug of [
+    "opencode-go-responses/muse-spark-1.3-contributor",
+    "opencode-go-responses/muse-spark-1.2-contributor",
+  ]) {
+    assert.deepEqual((await outgoingFor(slug)).input, [expected], slug);
+  }
+  assert.deepEqual(
+    (await outgoingFor("opencode-go-responses/gpt-5.6-luna")).input,
+    [{ ...handoff, content: expected.content }],
+    "an untouched Console Go route keeps the collaboration item",
+  );
 });

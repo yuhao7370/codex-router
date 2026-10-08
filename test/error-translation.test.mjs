@@ -6,6 +6,7 @@ import {
   extractUpstreamDetail,
   gatewayErrorStatus,
   translateGatewayError,
+  upstreamFailureKind,
 } from "../src/error-translation.mjs";
 
 const LITELLM_503_BODY = JSON.stringify({
@@ -270,6 +271,83 @@ test("a 403 from an OAuth provider also asks for a fresh sign-in", () => {
   assert.equal(payload.error.type, "authentication_error");
 });
 
+test("a known Devin permission denial is distinct from a rejected OAuth session", () => {
+  const payload = translateGatewayError({
+    status: 403,
+    bodyText: JSON.stringify({ error: {
+      code: "devin_permission_denied", type: "permission_error", message: "Cascade access denied.",
+    } }),
+    modelName: "SWE-1", providerId: "devin-cli", providerName: "Devin", providerKind: "oauth",
+  });
+  assert.equal(payload.error.type, "permission_error");
+  assert.match(payload.error.message, /Cascade access denied/);
+  assert.doesNotMatch(payload.error.message, /Sign in|OAuth session|refresh/);
+});
+
+test("Devin's owned permission diagnosis survives LiteLLM JSON and Python-bytes wrappers", () => {
+  const message = "Devin refused this request (devin_permission_denied): the upstream reported an MCP configuration issue.";
+  const inner = JSON.stringify({ error: { message, type: "permission_error", code: "devin_permission_denied" } });
+  for (const wrapped of [message, inner, `b'${inner}'`, `b"${inner}"`, `b${inner}`]) {
+    for (const prefix of [
+      "litellm.AuthenticationError: AuthenticationError: DevinException - ",
+      "litellm.APIError: APIError: OpenAIException - ",
+    ]) {
+      const bodyText = JSON.stringify({ error: {
+        message: `${prefix}${wrapped}. Received Model Group=devin-cli-swe-1\nAvailable Model Group Fallbacks=None`,
+        type: "authentication_error", code: "403",
+      } });
+      const payload = translateGatewayError({
+        status: 403, bodyText, modelName: "SWE-1", providerId: "devin-cli", providerName: "Devin", providerKind: "oauth",
+      });
+      assert.equal(payload.error.type, "permission_error", wrapped);
+      assert.match(payload.error.message, /MCP configuration issue/);
+      assert.doesNotMatch(payload.error.message, /Sign in|OAuth session|litellm|Received Model Group/);
+    }
+  }
+});
+
+test("Devin permission codes do not override authentication or genuine billing evidence", () => {
+  for (const [status, message, type] of [
+    [401, "Devin refused this request (devin_permission_denied): access denied.", "authentication_error"],
+    [403, "Your quota is exhausted.", "billing_error"],
+    [403, "Your plan does not include this API.", "billing_error"],
+  ]) {
+    const payload = translateGatewayError({
+      status, bodyText: JSON.stringify({ error: { code: "devin_permission_denied", message } }),
+      modelName: "SWE-1", providerId: "devin-cli", providerName: "Devin", providerKind: "oauth",
+    });
+    assert.equal(payload.error.type, type);
+  }
+});
+
+test("unknown Devin 403 retains existing OAuth advice", () => {
+  for (const code of [undefined, "permission_denied", "other_permission_denied"]) {
+    const payload = translateGatewayError({
+      status: 403, bodyText: JSON.stringify({ error: { code, message: "Access denied." } }),
+      providerId: "devin-cli",
+      modelName: "Test model", providerName: "Test provider", providerKind: "oauth",
+    });
+    assert.equal(payload.error.type, "authentication_error");
+    assert.match(payload.error.message, /Sign in/);
+  }
+});
+
+test("a Devin code or diagnosis from another provider retains existing OAuth advice", () => {
+  for (const providerId of [undefined, "grok-oauth", "custom"]) {
+    for (const error of [
+      { code: "devin_permission_denied", message: "Access denied." },
+      { code: "403", message: "Devin refused this request (devin_permission_denied): the upstream reported an MCP configuration issue." },
+    ]) {
+      const payload = translateGatewayError({
+        status: 403, bodyText: JSON.stringify({ error }), providerId,
+        modelName: "Test model", providerName: "Test provider", providerKind: "oauth",
+      });
+      assert.equal(payload.error.type, "authentication_error");
+      assert.match(payload.error.message, /Sign in/);
+    }
+  }
+});
+
 test("a 402 points at billing", () => {
   const payload = translateGatewayError({
     status: 402,
@@ -465,6 +543,159 @@ test("a plain rate-limit 429 still gets the retry hint, not the quota message", 
   assert.ok(payload.error.message.includes("rate-limiting"));
 });
 
+function consoleGoNumericOverflowBody() {
+  const inner = JSON.stringify({
+    type: "error",
+    error: {
+      type: "invalid_request_error",
+      message:
+        "Error from provider (Console Go): Upstream request failed: [invalid_request_error] "
+        + "Prompt too long: about 434983 tokens estimated, but the maximum context length is 262144 tokens including the completion. "
+        + "Reduce the length of the messages.",
+    },
+  });
+  return JSON.stringify({
+    error: {
+      message:
+        `litellm.BadRequestError: AnthropicException - ${inner}. Received Model Group=opencode-go-messages-minimax-m3\nAvailable Model Group Fallbacks=None`,
+      type: null,
+      param: null,
+      code: "400",
+    },
+  });
+}
+
+test("a numeric Console Go prompt-too-long keeps both token counts", () => {
+  const bodyText = consoleGoNumericOverflowBody();
+  const detail = extractUpstreamDetail(bodyText);
+  assert.match(detail, /434983/);
+  assert.match(detail, /262144/);
+  assert.doesNotMatch(detail, /Received Model Group|Fallbacks=None/);
+
+  assert.deepEqual(contextLengthFailure(bodyText), {
+    detail,
+    inputTokens: 434983,
+    maximumTokens: 262144,
+  });
+  assert.equal(gatewayErrorStatus({ status: 502, bodyText }), 400);
+
+  const payload = translateGatewayError({
+    status: 400,
+    bodyText,
+    modelName: "MiniMax M3 (opencode Go)",
+    providerName: "opencode",
+  });
+  assert.equal(payload.error.type, "invalid_request_error");
+  assert.equal(payload.error.param, "input");
+  assert.equal(payload.error.code, "context_length_exceeded");
+  assert.match(payload.error.message, /434,983 tokens/);
+  assert.match(payload.error.message, /262,144-token context window/);
+  assert.doesNotMatch(payload.error.message, /run out of usage/);
+  assert.doesNotMatch(payload.error.message, /Received Model Group|Fallbacks=None/);
+  assert.equal(upstreamFailureKind({ status: 400, bodyText }), undefined);
+});
+
+test("an OpenRouter overflow with two input/request occurrences keeps the real total, not a truncated digit", () => {
+  // Regression for the greedy-backtracking bug in SWAPPED_CONTEXT_LENGTH_PATTERN:
+  // "you requested" and "text input" both match the (?:input|request)
+  // alternation, and "150084" contains more digits after wherever a greedy
+  // `.{0,N}` gap would land. A greedy version of this pattern resolved
+  // group 2 to a lone "4" (the last digit of "150084") instead of the real
+  // 282974 total.
+  const bodyText = JSON.stringify({
+    error: {
+      message:
+        "litellm.BadRequestError: OpenAIException - This endpoint's maximum context length "
+        + "is 262144 tokens. However, you requested about 282974 tokens (132890 of text "
+        + "input, 150084 of tool input). Please reduce the length of either one, or use the "
+        + "context-compression plugin to compress your prompt automatically.. Received "
+        + "Model Group=openrouter-minimax-m3\nAvailable Model Group Fallbacks=None",
+      type: null,
+      param: null,
+      code: "400",
+    },
+  });
+
+  const result = contextLengthFailure(bodyText);
+  assert.equal(result.maximumTokens, 262144);
+  assert.equal(result.inputTokens, 282974);
+
+  const payload = translateGatewayError({
+    status: 400,
+    bodyText,
+    modelName: "MiniMax M3 (OpenRouter)",
+    providerName: "openrouter",
+  });
+  assert.match(payload.error.message, /282,974 tokens/);
+  assert.doesNotMatch(payload.error.message, /is 4 tokens/);
+});
+
+test("Console Go prompt-too-long-including-completion is a context error, not quota", () => {
+  const bodyText = JSON.stringify({
+    type: "error",
+    error: {
+      type: "invalid_request_error",
+      message:
+        "Error from provider (Console Go): Upstream request failed: [invalid_request_error] "
+        + "Prompt too long for every available model, including the completion. "
+        + "Reduce the length of the messages.",
+    },
+  });
+
+  assert.deepEqual(contextLengthFailure(bodyText), {
+    detail:
+      "Error from provider (Console Go): Upstream request failed: [invalid_request_error] "
+      + "Prompt too long for every available model, including the completion. "
+      + "Reduce the length of the messages.",
+  });
+  assert.equal(gatewayErrorStatus({ status: 400, bodyText }), 400);
+
+  const payload = translateGatewayError({
+    status: 400,
+    bodyText,
+    modelName: "MiniMax M3 (opencode Go)",
+    providerName: "opencode",
+  });
+  assert.equal(payload.error.type, "invalid_request_error");
+  assert.equal(payload.error.param, "input");
+  assert.equal(payload.error.code, "context_length_exceeded");
+  assert.match(payload.error.message, /context window/);
+  assert.doesNotMatch(payload.error.message, /run out of usage|Top up/);
+  assert.doesNotMatch(payload.error.message, /opencode rejected the request/);
+  assert.equal(upstreamFailureKind({ status: 400, bodyText }), undefined);
+});
+
+test("a LiteLLM-wrapped Console Go prompt-too-long still classifies as context", () => {
+  const inner = JSON.stringify({
+    type: "error",
+    error: {
+      type: "invalid_request_error",
+      message:
+        "Error from provider (Console Go): Upstream request failed: [invalid_request_error] "
+        + "Prompt too long for every available model, including the completion. "
+        + "Reduce the length of the messages.",
+    },
+  });
+  const bodyText = JSON.stringify({
+    error: {
+      message:
+        "litellm.BadRequestError: AnthropicException - "
+        + `b${JSON.stringify(inner)}`,
+      type: null,
+      code: "400",
+    },
+  });
+  assert.ok(contextLengthFailure(bodyText));
+  const payload = translateGatewayError({
+    status: 400,
+    bodyText,
+    modelName: "MiniMax M3 (opencode Go)",
+    providerName: "opencode",
+  });
+  assert.equal(payload.error.code, "context_length_exceeded");
+  assert.doesNotMatch(payload.error.message, /run out of usage/);
+});
+
 test("an unclassified 4xx still names the provider", () => {
   const payload = translateGatewayError({
     status: 422,
@@ -477,6 +708,28 @@ test("an unclassified 4xx still names the provider", () => {
     "alibaba rejected the request for Qwen 3.8 Max. (HTTP 422: bad payload)",
   );
   assert.equal(payload.error.type, "invalid_request_error");
+});
+
+test("a local Anthropic tool-argument conversion is not a provider rejection", () => {
+  const payload = translateGatewayError({
+    status: 400,
+    bodyText: JSON.stringify({
+      error: {
+        message:
+          "Failed to parse tool call arguments for tool 'exec_command' (Anthropic tool invoke). " +
+          "Error: Unterminated string starting at: line 1 column 8 (char 7).\n" +
+          '{"cmd":"usage limit reached for your GLM Coding Plan"}',
+      },
+    }),
+    modelName: "MiniMax M3 (opencode Go)",
+    providerName: "opencode",
+  });
+  assert.equal(payload.error.code, "invalid_function_call_arguments");
+  assert.equal(payload.error.type, "invalid_request_error");
+  assert.match(payload.error.message, /exec_command/);
+  assert.match(payload.error.message, /not a provider rejection/);
+  assert.doesNotMatch(payload.error.message, /opencode rejected the request/);
+  assert.doesNotMatch(payload.error.message, /usage limit reached/);
 });
 
 test("a plan without API access is not reported as a bad credential", () => {

@@ -63,6 +63,7 @@ function emptyDayBucket() {
     inputTokens: 0,
     outputTokens: 0,
     cachedInputTokens: 0,
+    cacheTelemetrySeen: false,
     totalTokens: 0,
     lastUsedAt: "",
   };
@@ -238,6 +239,10 @@ function mergeEntry(entry, event, at, { billed = false } = {}) {
   bucket.inputTokens += inputTokens;
   bucket.outputTokens += outputTokens;
   bucket.cachedInputTokens += cachedInputTokens;
+  // Keep presence separately from the numeric total: zero is a measured
+  // cache miss, while absent/invalid telemetry cannot establish a hit rate.
+  const reportedCached = Number(event.cachedInputTokens);
+  bucket.cacheTelemetrySeen ||= Number.isFinite(reportedCached) && reportedCached >= 0;
   bucket.totalTokens += totalTokens;
   const isoAt = new Date(at).toISOString();
   if (!bucket.lastUsedAt || at >= Date.parse(bucket.lastUsedAt)) {
@@ -253,6 +258,7 @@ function rollUp(entry, fromDay, toDay) {
     inputTokens: 0,
     outputTokens: 0,
     cachedInputTokens: 0,
+    cacheTelemetrySeen: false,
     totalTokens: 0,
     daily: new Map(),
     models: new Map(),
@@ -275,6 +281,7 @@ function rollUp(entry, fromDay, toDay) {
     for (const [day, bucket] of days) {
       if (day < fromDay || day > toDay) continue;
       visible = true;
+      out.cacheTelemetrySeen ||= bucket.cacheTelemetrySeen;
       model.requests += bucket.requests;
       model.successfulRequests += bucket.successfulRequests;
       model.meteredRequests += bucket.meteredRequests;
@@ -364,6 +371,7 @@ export function usageSummarySnapshot({ range = "90d", now = Date.now() } = {}) {
       regularInputTokens: Math.max(0, rollup.inputTokens - rollup.cachedInputTokens),
       outputTokens: rollup.outputTokens,
       cachedInputTokens: rollup.cachedInputTokens,
+      cacheTelemetrySeen: rollup.cacheTelemetrySeen,
       totalTokens: rollup.totalTokens,
       last24hInputTokens: 0,
       last24hRegularInputTokens: 0,

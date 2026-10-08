@@ -16,30 +16,48 @@ function ambiguousYaml(line, detail) {
 // complex `? ` mapping key is legal YAML this lexer will not edit around.
 const PLAIN_KEY = /^[A-Za-z0-9_][A-Za-z0-9_.-]*$/;
 
-function decodeKey(raw, lineNumber) {
+function decodeKey(raw, lineNumber, extendedPlainKeys = false) {
   const trimmed = raw.trim();
   if (!trimmed) return undefined;
   const quote = trimmed[0];
   if (quote === '"' || quote === "'") {
-    if (trimmed.length < 2 || trimmed.at(-1) !== quote) return undefined;
+    if (trimmed.length < 2 || trimmed.at(-1) !== quote) {
+      if (extendedPlainKeys) ambiguousYaml(lineNumber, "a quoted key is malformed");
+      return undefined;
+    }
     const body = trimmed.slice(1, -1);
-    if (quote === "'") return body.replaceAll("''", "'");
+    if (quote === "'") {
+      if (extendedPlainKeys && !/^'(?:[^']|'')*'$/.test(trimmed)) {
+        ambiguousYaml(lineNumber, "a quoted key is malformed");
+      }
+      return body.replaceAll("''", "'");
+    }
     // Escapes in a key are legal and rare. Rather than implement YAML's
     // double-quoted escape table for a case nothing here produces, refuse.
     if (body.includes("\\")) {
       ambiguousYaml(lineNumber, "a double-quoted key uses an escape sequence");
     }
+    if (extendedPlainKeys && body.includes('"')) ambiguousYaml(lineNumber, "a quoted key is malformed");
     return body;
   }
   if (trimmed.startsWith("&") || trimmed.startsWith("*") || trimmed.startsWith("!")) {
     ambiguousYaml(lineNumber, "a key carries an anchor, alias, or tag");
+  }
+  if (extendedPlainKeys) {
+    // Tagged credential records use scope/id keys, and their JSON payloads
+    // may have spaces, Unicode, or punctuation in plain keys. They still use
+    // the same mapping stack and duplicate-key checks as every other block.
+    if (/^[\[\]{},|>%@`]/.test(trimmed) || /^[-?:](?:\s|$)/.test(trimmed)) {
+      ambiguousYaml(lineNumber, "a mapping key uses an unsupported indicator");
+    }
+    return trimmed;
   }
   return PLAIN_KEY.test(trimmed) ? trimmed : undefined;
 }
 
 // Splits `key: value` at the mapping colon, honouring quotes. Returns
 // undefined for a line that is not a mapping entry at all.
-function mappingEntry(line, lineNumber) {
+function mappingEntry(line, lineNumber, extendedPlainKeys = false) {
   const indent = line.length - line.trimStart().length;
   const body = line.slice(indent);
   if (!body || body.startsWith("#")) return undefined;
@@ -52,10 +70,11 @@ function mappingEntry(line, lineNumber) {
     const character = body[index];
     if (quote) {
       if (character === "\\" && quote === '"') index += 1;
+      else if (character === "'" && quote === "'" && body[index + 1] === "'") index += 1;
       else if (character === quote) quote = undefined;
       continue;
     }
-    if (character === '"' || character === "'") {
+    if ((character === '"' || character === "'") && (!extendedPlainKeys || index === 0)) {
       quote = character;
       continue;
     }
@@ -69,14 +88,14 @@ function mappingEntry(line, lineNumber) {
   // which the caller tracks. It is not a mapping entry this line can describe.
   if (quote) return undefined;
   if (colon === -1) return undefined;
-  const key = decodeKey(body.slice(0, colon), lineNumber);
+  const key = decodeKey(body.slice(0, colon), lineNumber, extendedPlainKeys);
   if (key === undefined) return undefined;
   return { indent, key, value: body.slice(colon + 1).trim() };
 }
 
 /**
- * Reports what a line leaves open: unclosed flow-collection depth, and a
- * quoted scalar still running at the end of it.
+ * Reports what a line leaves open: flow-collection depth, and a quoted scalar
+ * still running at the end of it.
  *
  * A quoted scalar legitimately spans lines, and the harness's own writer
  * produces one: it folds a long double-quoted value at its line width and ends
@@ -86,29 +105,86 @@ function mappingEntry(line, lineNumber) {
  * flow collection can hold a key this lexer owns, so tracking both is enough to
  * skip past them safely.
  */
-function scanValue(value, openQuote) {
-  let depth = 0;
+function scanValue(value, { depth = 0, openQuote, startsNode = true } = {}) {
+  let flowDepth = depth;
   let quote = openQuote;
+  // A quote is a quoting indicator only where a node can begin. Everywhere
+  // else it is an ordinary character of a plain scalar -- `don't`, `5" wide`,
+  // `he said "hi"` -- and reading one as an opening quote swallowed the rest
+  // of the document into a scalar that never ends.
+  let nodeStart = quote ? false : startsNode;
   for (let index = 0; index < value.length; index += 1) {
     const character = value[index];
     if (quote) {
       if (character === "\\" && quote === '"') index += 1;
-      else if (character === quote) quote = undefined;
-      continue;
-    }
-    if (character === '"' || character === "'") {
-      quote = character;
+      else if (character === "'" && quote === "'" && value[index + 1] === "'") index += 1;
+      else if (character === quote) {
+        quote = undefined;
+        nodeStart = false;
+      }
       continue;
     }
     if (character === "#" && (index === 0 || /\s/.test(value[index - 1]))) break;
-    if (character === "[" || character === "{") depth += 1;
-    else if (character === "]" || character === "}") depth -= 1;
+    // Whitespace separates tokens without ending a plain scalar, so it leaves
+    // the node position exactly as it found it.
+    if (/\s/.test(character)) continue;
+    if (character === '"' || character === "'") {
+      if (nodeStart) quote = character;
+      nodeStart = false;
+      continue;
+    }
+    if (character === "[" || character === "{") {
+      flowDepth += 1;
+      nodeStart = true;
+      continue;
+    }
+    if (character === "]" || character === "}") {
+      flowDepth -= 1;
+      nodeStart = false;
+      continue;
+    }
+    // Inside a flow collection a comma and a mapping colon each begin the next
+    // node. In block context only `: ` does, because a plain scalar may not
+    // contain one; a `- ` with nothing but indentation before it begins a
+    // sequence entry.
+    if (character === "," && flowDepth > 0) {
+      nodeStart = true;
+      continue;
+    }
+    const separated = index + 1 === value.length || /\s/.test(value[index + 1]);
+    if (character === ":" && (separated || (flowDepth > 0 && /[,\]}]/.test(value[index + 1])))) {
+      nodeStart = true;
+      continue;
+    }
+    if (character === "-" && nodeStart && separated) continue;
+    nodeStart = false;
   }
-  return { depth, openQuote: quote };
+  return { depth: flowDepth, openQuote: quote };
 }
 
 function blockScalarIndicator(value) {
   return /^[|>][+-]?\d*\s*(#.*)?$/.test(value);
+}
+
+// Sequence payloads can hold literal strings, directly or under a mapping
+// key. Keep their text out of quote/flow scanning just like ordinary scalars.
+function sequenceValue(line, lineNumber) {
+  let indent = line.length - line.trimStart().length;
+  let body = line.trimStart();
+  let sequenceIndent;
+  for (;;) {
+    const prefix = /^-(?: +|$)/.exec(body);
+    if (!prefix) break;
+    sequenceIndent = indent;
+    indent += prefix[0].length;
+    body = body.slice(prefix[0].length);
+  }
+  const entry = /^[\[{]/.test(body) ? undefined : mappingEntry(body, lineNumber, true);
+  return {
+    value: entry ? entry.value : body,
+    indent: entry ? indent : (sequenceIndent ?? indent),
+    startsNode: entry !== undefined || sequenceIndent !== undefined,
+  };
 }
 
 /**
@@ -119,7 +195,7 @@ function blockScalarIndicator(value) {
  * key is that key's annotation, and taking it with the node above would delete
  * somebody's note about a route the router does not own.
  */
-export function scanYamlDocument(contents) {
+export function scanYamlDocument(contents, { extendedPlainKeyRoots = [] } = {}) {
   const lines = String(contents ?? "").split("\n");
   const root = { path: [], indent: -1, index: -1, endIndex: lines.length - 1, children: new Map() };
   const stack = [root];
@@ -131,16 +207,40 @@ export function scanYamlDocument(contents) {
   // anything in the surrounding document, and registering them was how two
   // list entries with the same field read as one mapping with a duplicate key.
   let sequenceIndent;
+  let sequencePlainScalarIndent;
   // A double-quoted scalar the harness folded across lines. Its continuation
   // lines are not mapping entries however much they look like one.
   let openQuote;
+  const extendedRoots = new Set(extendedPlainKeyRoots);
 
-  const consume = (text, lineNumber) => {
-    const scanned = scanValue(text, openQuote);
+  const consume = (text, lineNumber, startsNode = true) => {
+    const scanned = scanValue(text, { depth: flowDepth, openQuote, startsNode });
     openQuote = scanned.openQuote;
-    flowDepth += scanned.depth;
+    flowDepth = scanned.depth;
     if (flowDepth < 0) {
       ambiguousYaml(lineNumber, "an unmatched flow-collection close was found");
+    }
+  };
+
+  const consumeSequence = (line, lineNumber, extendedPlainKeys) => {
+    if (!extendedPlainKeys || openQuote || flowDepth > 0) {
+      consume(line, lineNumber);
+      return;
+    }
+    const scalar = sequenceValue(line, lineNumber);
+    if (blockScalarIndicator(scalar.value)) {
+      blockScalar = scalar.indent;
+      sequencePlainScalarIndent = undefined;
+    } else if (scalar.startsNode) {
+      sequencePlainScalarIndent = scalar.value && !/^[\[\]{},'"|>!&*#]/.test(scalar.value)
+        ? scalar.indent
+        : undefined;
+      consume(scalar.value, lineNumber);
+    } else {
+      // A folded plain scalar can continue with a literal quote. It becomes
+      // an indicator only when a new node starts, not on a continuation line.
+      const indent = line.length - line.trimStart().length;
+      consume(line, lineNumber, !(sequencePlainScalarIndent !== undefined && indent > sequencePlainScalarIndent));
     }
   };
 
@@ -159,6 +259,8 @@ export function scanYamlDocument(contents) {
     }
     const indent = line.length - line.trimStart().length;
     const trimmed = line.trim();
+    const extendedRoot = stack[1] && extendedRoots.has(stack[1].key) ? stack[1] : undefined;
+    const extendedPlainKeys = extendedRoot !== undefined && indent > extendedRoot.indent;
 
     if (blockScalar !== undefined) {
       if (!trimmed || indent > blockScalar) {
@@ -166,6 +268,11 @@ export function scanYamlDocument(contents) {
         continue;
       }
       blockScalar = undefined;
+    }
+    if (extendedRoot && !extendedPlainKeys && trimmed) {
+      // Do not swallow a following root key into a malformed record value.
+      if (openQuote) ambiguousYaml(lineNumber, "a quoted scalar is unterminated");
+      if (flowDepth > 0 && !trimmed.startsWith("#")) ambiguousYaml(lineNumber, "a flow collection is unterminated");
     }
     if (sequenceIndent !== undefined) {
       // A block sequence may be indented level with its own key, so the column
@@ -177,13 +284,14 @@ export function scanYamlDocument(contents) {
       if (!trimmed || insideSequence) {
         if (trimmed) {
           lastContentIndex = index;
-          consume(line, lineNumber);
+          consumeSequence(line, lineNumber, extendedPlainKeys);
         }
         continue;
       }
       if (flowDepth > 0) ambiguousYaml(lineNumber, "a flow collection is unterminated");
       if (openQuote) ambiguousYaml(lineNumber, "a quoted scalar is unterminated");
       sequenceIndent = undefined;
+      sequencePlainScalarIndent = undefined;
     }
     // A folded quoted scalar or an open flow collection swallows the line
     // whole: it extends the node it sits inside and registers no key.
@@ -208,11 +316,17 @@ export function scanYamlDocument(contents) {
     }
     if (trimmed.startsWith("#")) continue;
 
-    const entry = mappingEntry(line, lineNumber);
+    const entry = mappingEntry(line, lineNumber, extendedPlainKeys);
     if (!entry) {
       // A continuation of a multi-line plain scalar, or something this lexer
       // does not model. It cannot introduce a key, so it only extends the
       // node it sits inside.
+      if (extendedPlainKeys) {
+        if (!stack.at(-1).inline && /^[?:](?:\s|$)/.test(trimmed)) {
+          ambiguousYaml(lineNumber, "a mapping key uses an unsupported indicator");
+        }
+        consume(line, lineNumber, !stack.at(-1).inline);
+      }
       lastContentIndex = index;
       continue;
     }
@@ -224,7 +338,7 @@ export function scanYamlDocument(contents) {
       // popped: its lines extend that key's range and register no children.
       sequenceIndent = entry.indent;
       lastContentIndex = index;
-      consume(line, lineNumber);
+      consumeSequence(line, lineNumber, extendedPlainKeys);
       continue;
     }
 
@@ -317,6 +431,41 @@ export function spliceYamlBlock(document, path, rendered) {
   // the document on every write.
   lines.splice(anchor.endIndex + 1, 0, ...block);
   return lines;
+}
+
+/**
+ * Lines inside `node`'s indented region that none of its registered children
+ * account for.
+ *
+ * Two separate blind spots make `children.size` an unsafe proxy for "this node
+ * holds nothing but ours":
+ *
+ *   - `children` is this lexer's map of mapping keys it was able to register. A
+ *     block sequence, a merge key, or a key `PLAIN_KEY` declines is invisible
+ *     there while still living inside the node. This is how removal came to
+ *     splice away a whole `providers:` sequence and leave a zero-byte file.
+ *   - `endIndex` deliberately stops before a trailing comment block, so a
+ *     comment the publish step pushed below our key sits outside the node's
+ *     own range while still being spliced away with it.
+ *
+ * So the region is walked by indentation -- every following line that is blank
+ * or indented deeper than the node -- rather than read off `endIndex`.
+ */
+export function unaccountedLines(document, node) {
+  const covered = new Set();
+  for (const child of node.children.values()) {
+    for (let index = child.index; index <= child.endIndex; index += 1) covered.add(index);
+  }
+  const rest = [];
+  for (let index = node.index + 1; index < document.lines.length; index += 1) {
+    const text = String(document.lines[index] ?? "");
+    if (/^\s*$/.test(text)) continue;
+    const indent = text.length - text.replace(/^\s*/, "").length;
+    if (indent <= node.indent) break;
+    if (covered.has(index)) continue;
+    rest.push({ index, text });
+  }
+  return rest;
 }
 
 /** Renders a string as a YAML scalar. JSON string syntax is valid YAML. */

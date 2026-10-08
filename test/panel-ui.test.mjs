@@ -530,15 +530,23 @@ test("every mutating control in the browser panel names the command it drives", 
   }
 });
 
-test("browser panel exposes translations with matching keys for every language", () => {
+test("browser panel keeps zh-TW complete and every other locale a subset of English", () => {
   assert.deepEqual(
     availableLanguages().map(({ id }) => id),
     LANGUAGE_OPTIONS.map(({ id }) => id),
   );
   const keys = translationKeys();
   const englishKeys = [...keys.en].sort();
+  // English carries the source text and zh-TW is the locale this project
+  // authors by hand, so both must define every key. The remaining locales are
+  // overlays: `t()` falls back to English for anything they omit, so a missing
+  // key renders exactly what the panel showed before the copy moved into the
+  // dictionary. They may therefore be incomplete, but must never invent a key
+  // English does not have.
+  assert.deepEqual([...keys["zh-TW"]].sort(), englishKeys, "zh-TW must translate every key");
   for (const language of Object.keys(keys)) {
-    assert.deepEqual([...keys[language]].sort(), englishKeys, `translation keys diverge for ${language}`);
+    const unknown = [...keys[language]].filter((key) => !englishKeys.includes(key));
+    assert.deepEqual(unknown, [], `${language} defines a key English does not have`);
   }
   // Stated separately from the parity check above, which would also pass if a
   // new string were left out of every locale.

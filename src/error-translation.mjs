@@ -4,6 +4,11 @@
 // reads like a router bug. These helpers name the provider that actually
 // failed and keep only the innermost upstream message as detail.
 
+import {
+  isLocalToolArgumentConversionFailure,
+  localToolArgumentConversionError,
+} from "./invalid-function-call.mjs";
+
 const DETAIL_LIMIT = 300;
 
 // LiteLLM appends its routing state after the upstream message; neither line
@@ -24,7 +29,8 @@ const WRAPPER_PREFIXES = [
 // Providers disagree on where the human-readable message lives: OpenAI-style
 // error.message, bare error strings, top-level message (Alibaba), FastAPI
 // detail, or MiniMax's base_resp.status_msg. The type-ish field (OpenAI type,
-// Google status) rides along for quota classification.
+// Google status) rides along for quota classification; a provider-specific
+// code distinguishes Devin's permission refusal from an OAuth rejection.
 function parseUpstreamError(bodyText) {
   if (typeof bodyText !== "string" || !bodyText) return { message: "", type: undefined };
   try {
@@ -38,11 +44,28 @@ function parseUpstreamError(bodyText) {
       (typeof parsed?.detail === "string" && parsed.detail) ||
       bodyText;
     const type = [error?.type, error?.status].find((value) => typeof value === "string");
-    return { message, type };
+    const code = typeof error?.code === "string" ? error.code : undefined;
+    return { message, type, code };
   } catch {
     // Non-JSON bodies (HTML gateway pages, plain text) pass through as-is.
     return { message: bodyText, type: undefined };
   }
+}
+
+// LiteLLM sometimes leaves the provider JSON as the remainder, either as a
+// bare object or as a Python bytes literal (`b'{...}'` / `b"{...}"`). Unwrap
+// that before DETAIL_LIMIT so a nested Console Go sentence is not truncated
+// out of the context-length classifier.
+function unwrapNestedUpstreamMessage(message) {
+  let text = String(message || "").trim();
+  const quotedBytes = /^b(['"])([\s\S]*)\1$/.exec(text);
+  if (quotedBytes) text = quotedBytes[2];
+  else if (/^b[{[]/.test(text)) text = text.slice(1);
+  text = text.trim();
+  if (!(text.startsWith("{") || text.startsWith("["))) return message;
+  const nested = parseUpstreamError(text);
+  if (!nested.message || nested.message === text) return message;
+  return nested.message.trim();
 }
 
 export function extractUpstreamDetail(bodyText) {
@@ -53,7 +76,7 @@ export function extractUpstreamDetail(bodyText) {
     previous = message;
     for (const pattern of WRAPPER_PREFIXES) message = message.replace(pattern, "");
   } while (message !== previous);
-  message = message.trim();
+  message = unwrapNestedUpstreamMessage(message.trim());
   return message.length > DETAIL_LIMIT ? message.slice(0, DETAIL_LIMIT) : message;
 }
 
@@ -127,34 +150,68 @@ function isOutOfUsage(detail, errorType) {
 // Ollama's runner after it has rendered and tokenized the complete chat
 // template, so it is authoritative context evidence even though the status is
 // not.
+const OLLAMA_INPUT_LENGTH_PATTERN =
+  /input length \((\d+) tokens\) exceeds the model's maximum context length \((\d+) tokens\)/i;
+// Both gaps are lazy, not greedy: a greedy `.{0,N}` backtracks from its
+// longest match downward, so it finds the LAST valid position for the
+// following alternation/digit run within budget rather than the first. Against
+// a message with more than one "input"/"request" occurrence, or a multi-digit
+// number followed by more digits later in the string, that lands the capture
+// mid-token -- e.g. "you requested about 282974 tokens (132890 of text input,
+// 150084 of tool input)" greedily resolves group 2 to a lone trailing "4" from
+// "150084" instead of the real total. Lazy quantifiers find the first valid
+// match instead, landing on "request" and "282974" as intended.
+const SWAPPED_CONTEXT_LENGTH_PATTERN =
+  /maximum context length (?:is|of) (\d+)(?: tokens?)?.{0,80}?(?:input|request).{0,40}?(\d+)/i;
+// Console Go names both the estimated prompt and the card. Keep this ahead of
+// the generic "prompt too long" match so those numbers survive into the
+// translated error; the unnumbered sibling still classifies as context.
+const NUMERIC_PROMPT_TOO_LONG_PATTERN =
+  /prompt too long:\s*about\s+(\d+)\s+tokens estimated[\s\S]{0,160}?maximum context length is\s+(\d+)/i;
+
 const CONTEXT_LENGTH_PATTERNS = [
-  /input length \((\d+) tokens\) exceeds the model's maximum context length \((\d+) tokens\)/i,
+  OLLAMA_INPUT_LENGTH_PATTERN,
   /input after truncation exceeds (?:the )?maximum context length/i,
-  /maximum context length (?:is|of) (\d+)(?: tokens?)?.{0,80}(?:input|request).{0,40}(\d+)/i,
+  SWAPPED_CONTEXT_LENGTH_PATTERN,
   /context[_\s-]length[_\s-]exceeded/i,
+  NUMERIC_PROMPT_TOO_LONG_PATTERN,
+  // OpenCode Console Go (and similar stealth routers) refuse a prompt whose
+  // size plus the completion budget does not fit any available backend. This
+  // is not quota, not a truncated tool call, and not a retryable 5xx.
+  /prompt too long(?: for every available model)?(?:, including the completion)?/i,
+  /reduce the length of the messages(?: or completion)?/i,
 ];
 
 export function contextLengthFailure(bodyText) {
   const detail = extractUpstreamDetail(bodyText);
-  if (!detail) return undefined;
-  for (const pattern of CONTEXT_LENGTH_PATTERNS) {
-    const match = detail.match(pattern);
-    if (!match) continue;
-    if (pattern === CONTEXT_LENGTH_PATTERNS[0]) {
-      return {
-        detail,
-        inputTokens: Number(match[1]),
-        maximumTokens: Number(match[2]),
-      };
+  const haystacks = [detail];
+  if (typeof bodyText === "string" && bodyText && bodyText !== detail) {
+    haystacks.push(bodyText);
+  }
+  for (const text of haystacks) {
+    if (!text) continue;
+    for (const pattern of CONTEXT_LENGTH_PATTERNS) {
+      const match = text.match(pattern);
+      if (!match) continue;
+      if (
+        pattern === OLLAMA_INPUT_LENGTH_PATTERN ||
+        pattern === NUMERIC_PROMPT_TOO_LONG_PATTERN
+      ) {
+        return {
+          detail: detail || match[0],
+          inputTokens: Number(match[1]),
+          maximumTokens: Number(match[2]),
+        };
+      }
+      if (pattern === SWAPPED_CONTEXT_LENGTH_PATTERN) {
+        return {
+          detail: detail || match[0],
+          inputTokens: Number(match[2]),
+          maximumTokens: Number(match[1]),
+        };
+      }
+      return { detail: detail || match[0] };
     }
-    if (pattern === CONTEXT_LENGTH_PATTERNS[2]) {
-      return {
-        detail,
-        inputTokens: Number(match[2]),
-        maximumTokens: Number(match[1]),
-      };
-    }
-    return { detail };
   }
   return undefined;
 }
@@ -192,7 +249,9 @@ function describeFailure({
   status,
   detail,
   errorType,
+  errorCode,
   modelName,
+  providerId,
   providerName,
   providerKind,
   providerAuthMode,
@@ -211,6 +270,18 @@ function describeFailure({
     return {
       type: "billing_error",
       message: `You have run out of usage at ${providerName} for ${modelName}. Top up or check the plan on your ${providerName} account.`,
+    };
+  }
+  if (
+    providerId === "devin-cli" && status === 403 &&
+    (errorCode === "devin_permission_denied" ||
+      detail.startsWith("Devin refused this request (devin_permission_denied):"))
+  ) {
+    // LiteLLM may replace the original code/type with AuthenticationError.
+    // The forwarder's fixed prefix carries the distinction through that hop.
+    return {
+      type: "permission_error",
+      message: `${providerName} refused the request for ${modelName}. Check the reported policy or tool configuration.`,
     };
   }
   if (status === 401 || status === 403) {
@@ -277,11 +348,19 @@ export function translateGatewayError({
   status,
   bodyText,
   modelName,
+  providerId,
   providerName,
   providerKind,
   providerAuthMode,
   retryAfterSeconds,
 }) {
+  // LiteLLM raises this locally while converting stored Responses tool calls
+  // into Anthropic `tool_use.input`, before any provider request is sent.
+  // Naming the provider here sent operators looking at the wrong hop and let
+  // quota phrasing inside the argument body trip failover (#796).
+  if (isLocalToolArgumentConversionFailure(bodyText)) {
+    return localToolArgumentConversionError(bodyText);
+  }
   const detail = extractUpstreamDetail(bodyText);
   const context = contextLengthFailure(bodyText);
   if (context) {
@@ -305,7 +384,9 @@ export function translateGatewayError({
     status,
     detail,
     errorType: parseUpstreamError(bodyText).type,
+    errorCode: parseUpstreamError(bodyText).code,
     modelName,
+    providerId,
     providerName,
     providerKind,
     providerAuthMode,

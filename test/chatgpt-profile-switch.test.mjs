@@ -1184,8 +1184,9 @@ test("a published pre-phase journal is abandoned without restoring stale catalog
   }
 });
 
-test("every durable switch crash boundary reconciles idempotently and permits a later switch", async () => {
-  const cases = [
+// Separate cases retain the full crash/recovery assertions without sharing
+// one ten-minute deadline for seven Windows ACL-heavy scenarios.
+for (const [label, hook, targetCommitted] of [
     ["evidence-staged", "afterSwitchTransactionEvidenceStaged", false],
     ["manifest-staged", "afterSwitchTransactionManifestStaged", false],
     ["preparing", "afterSwitchPreparing", true],
@@ -1193,9 +1194,9 @@ test("every durable switch crash boundary reconciles idempotently and permits a 
     ["primary-installed", "afterSwitchInstall", true],
     ["installed", "afterSwitchInstalled", true],
     ["idle-before-removal", "afterSwitchIdleBeforeTransactionRemoval", true],
-  ];
-  const moduleUrl = pathToFileURL(path.resolve("src/chatgpt-profile-switch.mjs")).href;
-  for (const [label, hook, targetCommitted] of cases) {
+]) {
+  test(`durable switch crash boundary ${label} reconciles idempotently and permits a later switch`, async () => {
+    const moduleUrl = pathToFileURL(path.resolve("src/chatgpt-profile-switch.mjs")).href;
     const root = mkdtempSync(path.join(os.tmpdir(), `codex-profile-crash-${label}-`));
     const primaryHome = path.join(root, "primary");
     const homesDir = path.join(root, "accounts");
@@ -1295,8 +1296,8 @@ test("every durable switch crash boundary reconciles idempotently and permits a 
     for (const [key, contents] of Object.entries(laterCatalog)) {
       assert.equal(readFileSync(catalog[key], "utf8"), contents, `${label}: later ${key} mismatch`);
     }
-  }
-});
+  });
+}
 
 test("malformed switch state retains durable rollback evidence and fails closed", async () => {
   const root = mkdtempSync(path.join(os.tmpdir(), "codex-profile-corrupt-state-"));

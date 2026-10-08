@@ -333,7 +333,7 @@ test("the service delegates its full readiness budget to the guarded wait", () =
   assert.match(source, /CODEX_ROUTER_OPERATION_DEADLINE_MS/);
   assert.match(
     source,
-    /\[path\.join\(SOURCE_ROOT, "src", script\), \.\.\.args\],[\s\S]{0,100}\{ stdio: "inherit", env: childEnvironment \}/,
+    /\[path\.join\(SOURCE_ROOT, "src", script\), \.\.\.args\],[\s\S]{0,100}\{ stdio: "inherit", env: childEnvironment, windowsHide: true \}/,
   );
   assert.doesNotMatch(source, /waitForRouterHealth/);
 });
@@ -384,4 +384,140 @@ test("the Linux restart-count query is bounded inside the readiness deadline", (
   assert.match(service, /timeout: Math\.min\(RESTART_QUERY_TIMEOUT_MS, remainingMs\)/);
   assert.match(service, /killSignal: "SIGKILL"/);
   assert.match(service, /if \(!\(remainingMs > 0\)\) return undefined;/);
+});
+
+// #760: a first install on a clean Windows machine wrote its launchers and
+// registered its task correctly, then a cold-starting LiteLLM gateway overran
+// the 300 s health wait. The installer's rollback ran `service.mjs uninstall`,
+// which deletes the task *and* unlinks both launchers -- so the operator found
+// `installed:true` in the log and no `start-codex-router.cmd` on disk. The
+// distinction the rollback needs is "still starting" versus "broken", and only
+// the readiness layer can draw it.
+test("a health wait that runs out is marked retryable", async () => {
+  await assert.rejects(
+    waitForServiceReadiness({
+      platform: "linux",
+      timeoutMs: 50,
+      pollMs: 10,
+      waitForHealth: () => Promise.resolve({ ok: false, error: "connect ECONNREFUSED" }),
+    }),
+    (error) => {
+      assert.equal(
+        error.readinessTimeout,
+        true,
+        "a router that never answered is still starting, not broken",
+      );
+      return true;
+    },
+  );
+});
+
+test("a crash loop and a dead launcher are not marked retryable", async () => {
+  // Both of these are genuinely broken, so the installer's rollback must still
+  // tear the service out. Tagging them would keep a task that relaunches a
+  // failing router at every logon.
+  let restarts = 0;
+  await assert.rejects(
+    waitForServiceReadiness({
+      platform: "linux",
+      timeoutMs: 60_000,
+      pollMs: 10,
+      getServiceRestarts: () => ++restarts,
+      waitForHealth: () => new Promise(() => {}),
+    }),
+    (error) => {
+      assert.match(error.message, /restarted 3 times/);
+      assert.notEqual(error.readinessTimeout, true);
+      return true;
+    },
+  );
+  await assert.rejects(
+    waitForServiceReadiness({
+      platform: "win32",
+      timeoutMs: 60_000,
+      pollMs: 10,
+      launchGraceMs: 0,
+      getWindowsTaskState: () => ({ instanceCount: 0, lastTaskResult: 1, launcherAlive: false }),
+      waitForHealth: () => new Promise(() => {}),
+    }),
+    (error) => {
+      assert.match(error.message, /no running launcher process/);
+      assert.notEqual(error.readinessTimeout, true);
+      return true;
+    },
+  );
+});
+
+test("service.mjs turns only a retryable timeout into its own exit code", () => {
+  const service = readFileSync(path.join(root, "src", "service.mjs"), "utf8");
+  // 75 is EX_TEMPFAIL. Both installers branch on this exact number, so it is
+  // part of their contract rather than an internal detail.
+  assert.match(service, /READINESS_TIMEOUT_EXIT_CODE = 75/);
+  assert.match(service, /return READINESS_TIMEOUT_EXIT_CODE;/);
+  // A crash loop must keep rejecting so the caller's rollback still runs.
+  assert.match(service, /if \(error\?\.readinessTimeout !== true\) throw error;/);
+});
+
+test("only a dead cooldown-skipped Windows launch with a current cache is deferred", async () => {
+  const options = {
+    platform: "win32", timeoutMs: 250, launchGraceMs: 5, pollMs: 5,
+    getWindowsTaskState: () => ({ instanceCount: 0, launcherAlive: false, lastTaskResult: 69 }),
+    waitForHealth: () => new Promise(() => {}),
+  };
+  await assert.rejects(waitForServiceReadiness({ ...options, getStartupBackoffRemainingMs: () => 60_000 }), error => {
+    assert.equal(error.startupDeferred, true);
+    assert.notEqual(error.readinessTimeout, true);
+    return true;
+  });
+  for (const getter of [undefined, () => 0, () => -1, () => Infinity, () => { throw new Error("record unavailable"); }]) {
+    await assert.rejects(waitForServiceReadiness({ ...options, getStartupBackoffRemainingMs: getter }), error => {
+      assert.match(error.message, /LastTaskResult=0x45/);
+      assert.notEqual(error.startupDeferred, true);
+      return true;
+    });
+  }
+  await assert.rejects(waitForServiceReadiness({
+    ...options, getWindowsTaskState: () => ({ instanceCount: 0, launcherAlive: false, lastTaskResult: 1 }),
+    getStartupBackoffRemainingMs: () => 60_000,
+  }), error => { assert.notEqual(error.startupDeferred, true); return true; });
+});
+
+test("live and freshly healthy Windows launches beat stale cooldown results", async () => {
+  for (const alive of [true, false]) {
+    let resolveHealth;
+    const health = new Promise(resolve => { resolveHealth = resolve; });
+    const result = await waitForServiceReadiness({
+      platform: "win32", timeoutMs: 250, launchGraceMs: 5, pollMs: 5,
+      getWindowsTaskState: () => { resolveHealth({ ok: true }); return { instanceCount: alive ? 1 : 0, launcherAlive: alive, lastTaskResult: 69 }; },
+      getStartupBackoffRemainingMs: () => 60_000, waitForHealth: () => health,
+    });
+    assert.deepEqual(result, { ok: true });
+  }
+});
+
+test("fresh Linux cooldown restarts are deferred, while genuine crash loops remain fatal", async () => {
+  for (const active of [true, false]) {
+    let query = 0;
+    await assert.rejects(waitForServiceReadiness({
+      platform: "linux", timeoutMs: 250, pollMs: 5,
+      getServiceRestarts: () => query++ === 0 ? 10 : 13,
+      getStartupBackoffRemainingMs: () => active ? 60_000 : 0,
+      waitForHealth: () => new Promise(() => {}),
+    }), error => {
+      assert.equal(error.startupDeferred === true, active);
+      if (!active) assert.match(error.message, /crash-looping/);
+      return true;
+    });
+  }
+});
+
+test("health settling during the Linux restart query beats an active cooldown", async () => {
+  let query = 0;
+  let resolveHealth;
+  const health = new Promise(resolve => { resolveHealth = resolve; });
+  assert.deepEqual(await waitForServiceReadiness({
+    platform: "linux", timeoutMs: 250, pollMs: 5,
+    getServiceRestarts: () => { if (query++ === 0) return 0; resolveHealth({ ok: true }); return 3; },
+    getStartupBackoffRemainingMs: () => 60_000, waitForHealth: () => health,
+  }), { ok: true });
 });

@@ -3,6 +3,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { SOURCE_ROOT } from "./paths.mjs";
+import { readStartupAttempts, resetStartupAttempts, startupBackoffDisabled, startupBackoffRemainingMs } from "./startup-attempts.mjs";
 import { stopManagedOllama } from "./ollama-runtime.mjs";
 import { waitForServiceReadiness } from "./service-readiness.mjs";
 import { withServiceOperationLock } from "./service-operation-lock.mjs";
@@ -28,6 +29,11 @@ const shutdownCommands = new Set(["stop", "uninstall"]);
 // service and reverts the app config out from under a router that goes on to
 // come up healthy seconds later.
 const READINESS_TIMEOUT_MS = 300_000;
+// The service is installed and running; only the health wait ran out. Both
+// installers read this to skip the service teardown in their rollback, so a
+// slow cold start no longer uninstalls a working install (#760). 75 is
+// EX_TEMPFAIL -- "try again", which is exactly the contract here.
+export const READINESS_TIMEOUT_EXIT_CODE = 75;
 // router-restart.mjs reserves this phase before the readiness wait. Check it
 // again in the child before the service-manager mutation so an independently
 // invoked or stale inherited deadline cannot make a restart deterministically
@@ -60,6 +66,10 @@ export async function runServiceCommandUnlocked(
     ...process.env,
     ...(environmentProxyOptedIn() ? { NODE_USE_ENV_PROXY: "1" } : {}),
   };
+  // Fail a required reset before any platform mutation. A second reset inside
+  // each replacement branch follows the stop barrier, after old writers drain.
+  if (command === "start" || command === "restart") resetStartupAttempts();
+  if (command === "install") resetStartupAttempts({ required: false });
   // Synchronous service renderers can own grandchildren. Do not apply a
   // direct-child timeout here: it could orphan those descendants and let them
   // mutate the service after the UI reports failure. The outer desktop runner
@@ -96,6 +106,11 @@ export async function runServiceCommandUnlocked(
   }
   const health = await waitForServiceReadiness({
     timeoutMs: READINESS_TIMEOUT_MS,
+    ...(command === "install" ? {
+      getStartupBackoffRemainingMs: () => startupBackoffDisabled(childEnvironment)
+        ? 0
+        : startupBackoffRemainingMs(readStartupAttempts()),
+    } : {}),
     // Only the Linux service manager exposes an automatic-restart counter
     // this guard can read; Windows readiness carries its own task-state
     // guard, and launchd has no equivalent counter.
@@ -125,8 +140,34 @@ export async function runServiceCommandUnlocked(
           },
         }
       : {}),
+  }).catch((error) => {
+    // A crash loop or a dead launcher is broken and keeps rejecting, so the
+    // caller's rollback still runs for it. A readiness timeout or confirmed
+    // automatic cooldown preserves the installed service with status 75.
+    if (error?.startupDeferred === true) return { ok: false, startupDeferred: true, error: error.message };
+    if (error?.readinessTimeout !== true) throw error;
+    return { ok: false, readinessTimeout: true, error: error.message };
   });
   if (health.ok) return 0;
+  if (health.startupDeferred) {
+    console.error(`The background service remains installed; automatic startup is deferred by its cooldown. ${health.error}`);
+    console.error("Inspect the service log, then use `service start` or `service restart` to reset the cooldown.");
+    return READINESS_TIMEOUT_EXIT_CODE;
+  }
+  if (health.readinessTimeout) {
+    // Distinct from 1 so an installer can tell "the service is installed and
+    // still starting" from "the install failed". Uninstalling here deletes a
+    // registered task and its launchers out from under a router that goes on
+    // to come up seconds later -- which is what left #760's reporter with a
+    // start-codex-router.cmd that the install had correctly written.
+    console.error(
+      `Router did not become healthy within ${READINESS_TIMEOUT_MS / 1_000} seconds: ${health.error}`,
+    );
+    console.error(
+      "The background service is installed and still starting. Leave it in place and check `service status`; a first cold start with a large model set can exceed this wait.",
+    );
+    return READINESS_TIMEOUT_EXIT_CODE;
+  }
   console.error(
     `Router did not become healthy within ${READINESS_TIMEOUT_MS / 1_000} seconds: ${health.error}`,
   );

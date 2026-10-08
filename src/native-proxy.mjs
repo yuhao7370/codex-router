@@ -1,5 +1,7 @@
 import { fetch as undiciFetch, ProxyAgent } from "undici";
 
+import { fetchDispatcherOptions } from "./fetch-transport.mjs";
+
 const NATIVE_PROXY_ERROR =
   "CODEX_ROUTER_NATIVE_PROXY_URL must be a valid credential-free HTTP or HTTPS proxy URL.";
 const GENERIC_PROXY_VARIABLES = [
@@ -55,7 +57,9 @@ export function withoutGenericProxyEnvironment(environment = process.env) {
 export function nativeProxyFetch(environment = process.env) {
   const proxy = configuredNativeProxyUrl(environment);
   if (!proxy) return fetch;
-  const dispatcher = new ProxyAgent(proxy);
+  // This scoped pool bypasses the global dispatcher, so it must retain the
+  // same connect bound the native retry budget is derived from.
+  const dispatcher = new ProxyAgent({ uri: proxy, ...fetchDispatcherOptions(environment) });
   return (target, init) =>
     isLoopbackTarget(target)
       ? fetch(target, init)

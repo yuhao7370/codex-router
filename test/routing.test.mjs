@@ -129,6 +129,56 @@ async function closeServer(server) {
   await new Promise((resolve) => server.close(resolve));
 }
 
+test("native image histories over 128 MiB can grow without losing the current batch", async () => {
+  const received = [];
+  const native = await mockServer(async (request, response) => {
+    received.push(await bodyJson(request));
+    json(response, 200, { id: "resp_visual", output: [], usage: { input_tokens: 100, output_tokens: 1 } });
+  });
+  const routerPort = await openPort();
+  const router = run("router.mjs", {
+    CODEX_ROUTER_PORT: String(routerPort),
+    CODEX_NATIVE_BASE_URL: `http://127.0.0.1:${native.port}`,
+  });
+  try {
+    await waitFor(`${routerBase(routerPort)}/models`, router);
+    const oldImage = { type: "input_image", image_url: `data:image/png;base64,${"A".repeat(3 * 1024 * 1024)}`, detail: "original" };
+    const history = [];
+    for (let index = 0; index < 47; index++) {
+      history.push(
+        { type: "function_call", call_id: `call_${index}`, name: "view_image", arguments: "{}" },
+        { type: "function_call_output", call_id: `call_${index}`, output: [oldImage] },
+      );
+    }
+    const current = Array.from({ length: 6 }, (_, index) => ({
+      type: "input_image", image_url: `data:image/png;base64,${Buffer.from(`current-${index}`).toString("base64")}`, detail: "original",
+    }));
+    history.push(
+      { type: "function_call", call_id: "current", name: "view_image", arguments: "{}" },
+      { type: "function_call_output", call_id: "current", output: current },
+    );
+    for (let round = 0; round < 2; round++) {
+      const response = await fetch(`${routerBase(routerPort)}/responses`, {
+        method: "POST", headers: { Authorization: "Bearer native-test", "Content-Type": "application/json" },
+        body: JSON.stringify({ model: "native-visual-test", input: history, stream: false }),
+      });
+      assert.equal(response.status, 200, `${await response.text()} ${router.testErrors()}`);
+      assert.deepEqual(received.at(-1).input.at(-1).output, current);
+      assert.ok(JSON.stringify(received.at(-1)).length < 35 * 1024 * 1024);
+      assert.ok(received.at(-1).input.some((item) => item.output?.[0]?.text?.includes("image omitted")));
+      history.unshift(
+        { type: "function_call", call_id: "older", name: "view_image", arguments: "{}" },
+        { type: "function_call_output", call_id: "older", output: [oldImage] },
+      );
+    }
+    assert.match(router.testErrors(), /bounded incoming image history/);
+    assert.doesNotMatch(router.testErrors(), /current-0/);
+  } finally {
+    await stopChild(router);
+    await closeServer(native.server);
+  }
+});
+
 test("router health waits for enabled dependencies and ignores disabled forwarders", async () => {
   const testRoot = mkdtempSync(path.join(os.tmpdir(), "router-health-selection-"));
   writeFileSync(
@@ -1163,6 +1213,7 @@ test("router preserves native auth and isolates every external route", async () 
             workspace: "caller-owned",
             "x-codex-turn-metadata": "native-canonical-turn-metadata",
           },
+          access_programs: { cyber: "standard" },
         }),
       ),
     );
@@ -1195,6 +1246,7 @@ test("router preserves native auth and isolates every external route", async () 
             "x-codex-turn-metadata": "routed-canonical-turn-metadata",
             "x-codex-turn-state": "routed-turn-state",
           },
+          access_programs: { cyber: "standard" },
         }),
       });
       assert.equal(response.status, 200);
@@ -1215,10 +1267,14 @@ test("router preserves native auth and isolates every external route", async () 
     assert.equal(nativeRequests[0].body.previous_response_id, undefined);
     assert.equal(nativeRequests[0].body.prompt_cache_retention, undefined);
     assert.deepEqual(nativeRequests[0].body.prompt_cache_options, { ttl: "30m" });
-    // Native OpenAI traffic owns client_metadata; only routed traffic drops it.
+    // Native OpenAI traffic owns client_metadata and access_programs; only
+    // routed traffic drops them.
     assert.deepEqual(nativeRequests[0].body.client_metadata, {
       workspace: "caller-owned",
       "x-codex-turn-metadata": "native-canonical-turn-metadata",
+    });
+    assert.deepEqual(nativeRequests[0].body.access_programs, {
+      cyber: "standard",
     });
     for (const request of routedRequests) {
       assert.equal(request.headers.authorization, `Bearer ${INTERNAL_KEY}`);
@@ -1229,6 +1285,7 @@ test("router preserves native auth and isolates every external route", async () 
       assert.equal(request.headers["x-openai-internal-codex-responses-lite"], undefined);
       assert.equal(request.headers["x-private-header"], undefined);
       assert.equal(request.body.client_metadata, undefined);
+      assert.equal(request.body.access_programs, undefined);
     }
   } finally {
     await stopChild(router);
@@ -1351,11 +1408,92 @@ test("substituted native compaction omits the ordinary Responses store policy", 
   }
 });
 
+test("native passthrough clamps a stale effort after a model switch", async () => {
+  const nativeRequests = [];
+  const native = await mockServer(async (request, response) => {
+    nativeRequests.push(await bodyJson(request));
+    json(response, 200, { id: "native-ok", output: [] });
+  });
+  const testRoot = mkdtempSync(path.join(os.tmpdir(), "native-effort-switch-"));
+  const stateDir = path.join(testRoot, "state");
+  const codexHome = path.join(testRoot, "codex");
+  mkdirSync(stateDir, { recursive: true });
+  mkdirSync(codexHome, { recursive: true });
+  writeFileSync(
+    path.join(stateDir, "native-models.json"),
+    JSON.stringify({
+      models: [{
+        slug: "gpt-6-astra",
+        supported_reasoning_levels: ["low", "medium", "high", "xhigh", "max"].map(
+          (effort) => ({ effort, description: effort }),
+        ),
+      }],
+    }),
+  );
+  const authPath = path.join(testRoot, "auth.json");
+  writeFileSync(
+    authPath,
+    JSON.stringify({
+      auth_mode: "chatgpt",
+      tokens: {
+        access_token: "test-native-session-token",
+        account_id: "test-native-account",
+      },
+    }),
+    { mode: 0o600 },
+  );
+  const routerPort = await openPort();
+  const router = run("router.mjs", {
+    CODEX_ROUTER_PORT: String(routerPort),
+    CODEX_NATIVE_BASE_URL: `http://127.0.0.1:${native.port}/backend-api/codex`,
+    CODEX_ROUTER_NATIVE_SESSION_FALLBACK: "1",
+    MODEL_ROUTER_CODEX_AUTH: authPath,
+    MODEL_ROUTER_STATE_DIR: stateDir,
+    CODEX_HOME: codexHome,
+    CODEX_ROUTER_QUIET: "1",
+  });
+  const headers = {
+    Authorization: `Bearer ${CALLER_KEY}`,
+    "Content-Type": "application/json",
+  };
+
+  try {
+    await waitFor(`${routerBase(routerPort)}/models`, router);
+    for (const effort of ["minimal", "high", "future"]) {
+      const response = await fetch(`${routerBase(routerPort)}/responses`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          model: "gpt-6-astra",
+          input: "hello",
+          reasoning: { effort, summary: "auto" },
+        }),
+      });
+      assert.equal(response.status, 200, await response.text());
+    }
+
+    assert.equal(nativeRequests[0].reasoning.effort, "low");
+    assert.equal(nativeRequests[0].reasoning.summary, "auto");
+    assert.equal(nativeRequests[1].reasoning.effort, "high");
+    assert.equal(nativeRequests[2].reasoning.effort, "future");
+    assert.match(
+      router.testErrors(),
+      /normalized stale native reasoning effort model=gpt-6-astra .*from=minimal to=low/,
+    );
+  } finally {
+    await stopChild(router);
+    await closeServer(native.server);
+    rmSync(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("router permits a compressed context larger than the encoded request limit", async () => {
   let receivedInputLength = 0;
   const native = await mockServer(async (request, response) => {
     const payload = await bodyJson(request);
-    receivedInputLength = payload.input.length;
+    // A substituted caller's string input reaches the backend as the one user
+    // message it stands for (#862); the text itself is what must survive.
+    receivedInputLength = payload.input[0].content[0].text.length;
     json(response, 200, { id: "large-context-ok", output: [] });
   });
   const routerPort = await openPort();
@@ -1388,6 +1526,61 @@ test("router permits a compressed context larger than the encoded request limit"
 
     assert.equal(response.status, 200, await response.text());
     assert.equal(receivedInputLength, input.length);
+  } finally {
+    await stopChild(router);
+    await closeServer(native.server);
+  }
+});
+
+test("Responses ingress preserves explicit wire and staged decoded limits", async () => {
+  const seen = [];
+  const native = await mockServer(async (request, response) => {
+    seen.push(await bodyJson(request));
+    json(response, 200, { id: "within-limits", output: [] });
+  });
+  const routerPort = await openPort();
+  const router = run("router.mjs", {
+    CODEX_ROUTER_PORT: String(routerPort),
+    CODEX_NATIVE_BASE_URL: `http://127.0.0.1:${native.port}`,
+    MODEL_ROUTER_MAX_BODY_BYTES: "256",
+    MODEL_ROUTER_MAX_DECODED_BODY_BYTES: "4096",
+    CODEX_ROUTER_QUIET: "1",
+  });
+  function sendChunked(body, encoding) {
+    return new Promise((resolve, reject) => {
+      const request = http.request(`${routerBase(routerPort)}/responses`, {
+        method: "POST", headers: { "Content-Type": "application/json", ...(encoding ? { "Content-Encoding": encoding } : {}) },
+      }, (response) => {
+        response.resume();
+        response.on("end", () => resolve(response.statusCode));
+      });
+      request.on("error", reject);
+      for (let offset = 0; offset < body.length; offset += 32) request.write(body.subarray(offset, offset + 32));
+      request.end();
+    });
+  }
+  try {
+    await waitFor(`${routerBase(routerPort)}/models`, router);
+    const uncompressed = Buffer.from(JSON.stringify({ model: "native-limit-test", input: "x".repeat(300) }));
+    assert.equal(await sendChunked(uncompressed), 413);
+    const incompressible = gzipSync(Buffer.from(JSON.stringify({
+      model: "native-limit-test", input: Array.from({ length: 120 }, (_, index) => `${index}: abc`).join("|"),
+    })));
+    assert.ok(incompressible.length > 256);
+    assert.equal(await sendChunked(incompressible, "gzip"), 413);
+    const accepted = gzipSync(Buffer.from(JSON.stringify({ model: "native-limit-test", input: "x".repeat(1_000) })));
+    assert.ok(accepted.length < 256);
+    assert.equal(await sendChunked(accepted, "gzip"), 200);
+    assert.equal(seen.length, 1);
+    const small = gzipSync(Buffer.from('{"model":"native-limit-test","input":"small"}'));
+    const header = Buffer.from(small.subarray(0, 10));
+    header[3] |= 0x10;
+    const intermediate = Buffer.concat([header, Buffer.alloc(65_536, 65), Buffer.from([0]), small.subarray(10)]);
+    const bomb = gzipSync(intermediate);
+    assert.ok(bomb.length < 256);
+    assert.equal(await sendChunked(bomb, "gzip, gzip"), 413);
+    assert.equal(seen.length, 1, "every rejection must happen before an upstream request");
+    assert.equal((await fetch(`${routerBase(routerPort)}/models`)).status, 200);
   } finally {
     await stopChild(router);
     await closeServer(native.server);
@@ -1468,7 +1661,11 @@ test("a small native turn is sent unencoded, exactly as it always was", async ()
     });
     assert.equal(response.status, 200, await response.text());
     assert.equal(seen[0].encoding, undefined);
-    assert.equal(seen[0].body.input, "hello");
+    // Unencoded, with the substituted caller's string shorthand in the list
+    // form the backend requires (#862).
+    assert.deepEqual(seen[0].body.input, [
+      { type: "message", role: "user", content: [{ type: "input_text", text: "hello" }] },
+    ]);
   } finally {
     await stopChild(router);
     await closeServer(native.server);
@@ -2915,7 +3112,7 @@ test("native replay omits incompatible item IDs without changing call-result pai
   }
 });
 
-test("router drops foreign reasoning items before stateless native replay", async () => {
+test("router normalizes reasoning and removes only redundant native references", async () => {
   const nativeRequests = [];
   const native = await mockServer(async (request, response) => {
     nativeRequests.push({ url: request.url, headers: request.headers, body: await bodyJson(request) });
@@ -2941,6 +3138,7 @@ test("router drops foreign reasoning items before stateless native replay", asyn
     CODEX_ROUTER_NATIVE_SESSION_FALLBACK: "1",
     MODEL_ROUTER_CODEX_AUTH: authPath,
     MODEL_ROUTER_STATE_DIR: path.join(testRoot, "state"),
+    CODEX_HOME: path.join(testRoot, "codex"),
     CODEX_ROUTER_QUIET: "1",
   });
   const headers = {
@@ -3009,16 +3207,16 @@ test("router drops foreign reasoning items before stateless native replay", asyn
       type: "item_reference",
       id: "rs_external_reference",
     };
-    const explicitlyUnstoredReasoning = {
+    const storedReasoningWithRedundantReference = {
       type: "reasoning",
-      id: "rs_private_unstored",
-      summary: [{ type: "summary_text", text: "private draft" }],
+      id: "rs_stored_inline",
+      summary: [{ type: "summary_text", text: "stored draft" }],
       content: null,
       encrypted_content: null,
     };
-    const explicitlyUnstoredReference = {
+    const redundantStoredReasoningReference = {
       type: "item_reference",
-      id: "rs_private_unstored",
+      id: "rs_stored_inline",
     };
     const nonReasoningReference = {
       type: "item_reference",
@@ -3157,9 +3355,10 @@ test("router drops foreign reasoning items before stateless native replay", asyn
           futureOpaqueReasoning,
           mixedSummaryReasoning,
           missingStatelessPayload,
+          ...invalidStatelessPayloads,
           staleReasoningReference,
-          explicitlyUnstoredReasoning,
-          explicitlyUnstoredReference,
+          storedReasoningWithRedundantReference,
+          redundantStoredReasoningReference,
           userMessage,
         ],
         store: true,
@@ -3180,13 +3379,24 @@ test("router drops foreign reasoning items before stateless native replay", asyn
       stored.input.find((item) => item?.id === "rs_unstored_without_ciphertext"),
       missingStatelessPayload,
     );
+    for (const item of invalidStatelessPayloads) {
+      const { encrypted_content: _encryptedContent, ...storedItem } = item;
+      assert.deepEqual(
+        stored.input.filter((candidate) => candidate?.id === item.id),
+        [storedItem],
+      );
+    }
     assert.deepEqual(
       stored.input.find((item) => item?.id === "rs_external_reference"),
       staleReasoningReference,
     );
-    assert.equal(
-      stored.input.some((item) => item?.id === explicitlyUnstoredReasoning.id),
-      false,
+    const {
+      encrypted_content: _encryptedContent,
+      ...storedInlineReasoning
+    } = storedReasoningWithRedundantReference;
+    assert.deepEqual(
+      stored.input.filter((item) => item?.id === storedReasoningWithRedundantReference.id),
+      [storedInlineReasoning],
     );
     assert.deepEqual(
       stored.input.find((item) => item?.id === unknownOpaqueReasoning.id),
@@ -3200,6 +3410,102 @@ test("router drops foreign reasoning items before stateless native replay", asyn
       stored.input.find((item) => item?.id === mixedSummaryReasoning.id),
       mixedSummaryReasoning,
     );
+    assert.equal(
+      existsSync(path.join(testRoot, "state", "signed-provider-mode.json")),
+      false,
+    );
+  } finally {
+    await stopChild(router);
+    await closeServer(native.server);
+    rmSync(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("native replay carries routed visible reasoning as text instead of dropping it", async () => {
+  const nativeRequests = [];
+  const native = await mockServer(async (request, response) => {
+    nativeRequests.push({ url: request.url, body: await bodyJson(request) });
+    json(response, 200, { route: "native" });
+  });
+  const testRoot = mkdtempSync(path.join(os.tmpdir(), "native-visible-reasoning-"));
+  const authPath = path.join(testRoot, "auth.json");
+  writeFileSync(
+    authPath,
+    JSON.stringify({
+      auth_mode: "chatgpt",
+      tokens: {
+        access_token: "test-native-session-token",
+        account_id: "test-native-account",
+      },
+    }),
+    { mode: 0o600 },
+  );
+  const routerPort = await openPort();
+  const router = run("router.mjs", {
+    CODEX_ROUTER_PORT: String(routerPort),
+    CODEX_NATIVE_BASE_URL: `http://127.0.0.1:${native.port}/backend-api/codex`,
+    CODEX_ROUTER_NATIVE_SESSION_FALLBACK: "1",
+    MODEL_ROUTER_CODEX_AUTH: authPath,
+    MODEL_ROUTER_STATE_DIR: path.join(testRoot, "state"),
+    CODEX_HOME: path.join(testRoot, "codex"),
+    CODEX_ROUTER_QUIET: "1",
+  });
+
+  try {
+    await waitFor(`${routerBase(routerPort)}/models`, router);
+    // The shape a routed thinking provider leaves behind: visible reasoning in
+    // `content`, a provider-minted id, and a ciphertext the native backend
+    // cannot decrypt. All three are illegal on native input, so the text has to
+    // survive as a visible message rather than be forwarded or dropped.
+    const foreignReasoning = {
+      type: "reasoning",
+      id: "6f1c2a10-1111-4222-8333-444455556666",
+      summary: [],
+      content: [{ type: "reasoning_text", text: "The passphrase is ORANGE-77." }],
+      encrypted_content: "843fdef5-0e65-4e05-ab7a-1234567890ab",
+    };
+    // A native item keeps its exact shape and continuation token.
+    const nativeReasoning = {
+      type: "reasoning",
+      id: "rs_native_keep",
+      summary: [{ type: "summary_text", text: "native draft" }],
+      content: null,
+      encrypted_content: "gAAAAABkZmtM7cT9w_XY_zThisIsAnOpaqueBlobWithNoWhitespace",
+    };
+    const userMessage = {
+      type: "message",
+      role: "user",
+      content: [{ type: "input_text", text: "continue" }],
+    };
+
+    // Codex brings its own upstream credential, so this is the non-stateless
+    // path the desktop app takes.
+    const replay = await fetch(`${routerBase(routerPort)}/responses`, {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer DIRECT_NATIVE_CALLER_TOKEN",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gpt-5.6-sol",
+        input: [foreignReasoning, nativeReasoning, userMessage],
+      }),
+    });
+    assert.equal(replay.status, 200);
+    assert.deepEqual(nativeRequests[0].body.input, [
+      {
+        type: "message",
+        role: "assistant",
+        content: [
+          {
+            type: "output_text",
+            text: "[internal reasoning from an earlier turn]\nThe passphrase is ORANGE-77.",
+          },
+        ],
+      },
+      nativeReasoning,
+      userMessage,
+    ]);
   } finally {
     await stopChild(router);
     await closeServer(native.server);
@@ -3283,6 +3589,85 @@ test("router inlines an external parent's plaintext task before replaying to nat
     assert.equal(sentExternal.recipient, "/root/reviewer");
     // Genuine OpenAI ciphertext must reach the backend untouched.
     assert.deepEqual(sentNative, nativeParentTask);
+  } finally {
+    await stopChild(router);
+    await closeServer(native.server);
+  }
+});
+
+test("native router recovers a deferred agents namespace from history", async () => {
+  const nativeRequests = [];
+  const native = await mockServer(async (request, response) => {
+    nativeRequests.push(await bodyJson(request));
+    json(response, 200, { id: "resp_native_close", output: [] });
+  });
+  const routerPort = await openPort();
+  const router = run("router.mjs", {
+    CODEX_ROUTER_PORT: String(routerPort),
+    CODEX_NATIVE_BASE_URL: `http://127.0.0.1:${native.port}/backend-api/codex`,
+    CODEX_ROUTER_QUIET: "1",
+  });
+  const headers = {
+    Authorization: "Bearer native-session-token",
+    "chatgpt-account-id": "native-test-account",
+    "Content-Type": "application/json",
+  };
+  const finishedChild = {
+    type: "agent_message",
+    author: "/root/native_regression_probe",
+    recipient: "/root",
+    content: [{
+      type: "input_text",
+      text:
+        "Message Type: FINAL_ANSWER\n" +
+        "Task name: /root\n" +
+        "Sender: /root/native_regression_probe\n" +
+        "Payload:\nfinished",
+    }],
+  };
+
+  try {
+    await waitFor(`${routerBase(routerPort)}/models`, router);
+    const replay = await fetch(`${routerBase(routerPort)}/responses`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: "gpt-5.6-sol",
+        stream: false,
+        tools: [],
+        input: [
+          {
+            type: "function_call",
+            name: "spawn_agent",
+            namespace: "agents",
+            call_id: "call_spawn",
+            arguments: "{}",
+          },
+          {
+            type: "function_call",
+            name: "wait_agent",
+            namespace: "agents",
+            call_id: "call_wait",
+            arguments: "{}",
+          },
+          finishedChild,
+        ],
+      }),
+    });
+    const replayBody = await replay.text();
+    assert.equal(replay.status, 200, replayBody);
+    const replayed = JSON.parse(replayBody);
+    const injected = replayed.output.find((item) => item?.type === "function_call");
+    assert.deepEqual(
+      { name: injected?.name, namespace: injected?.namespace },
+      { name: "interrupt_agent", namespace: "agents" },
+    );
+    assert.deepEqual(JSON.parse(injected.arguments), {
+      target: "/root/native_regression_probe",
+    });
+
+    assert.equal(nativeRequests.length, 1);
+    assert.deepEqual(nativeRequests[0].tools, []);
   } finally {
     await stopChild(router);
     await closeServer(native.server);
@@ -3714,6 +4099,60 @@ test("API forwarder validates Copilot auth, sets identity headers, and retries r
     assert.equal(upstreamRequests[1].headers["chatgpt-account-id"], undefined);
     assert.equal(upstreamRequests[1].body.model, "gpt-test");
     assert.equal(upstreamRequests[1].body.service_tier, undefined);
+  } finally {
+    await stopChild(forwarder);
+    await closeServer(upstream.server);
+    rmSync(curated.dir, { recursive: true, force: true });
+  }
+});
+
+test("API forwarder pins Copilot's per-event Responses ids to the created response (#814)", async () => {
+  const upstream = await mockServer(async (request, response) => {
+    if (request.url === "/user") {
+      json(response, 200, { endpoints: {} });
+      return;
+    }
+    await bodyJson(request);
+    response.writeHead(200, { "Content-Type": "text/event-stream" });
+    const events = [
+      { type: "response.created", response: { id: "resp_a" } },
+      { type: "response.in_progress", response: { id: "resp_b" } },
+      { type: "response.output_text.delta", output_index: 0, delta: "OK" },
+      { type: "response.completed", response: { id: "resp_c", output: [] } },
+    ];
+    response.end(events.map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join(""));
+  });
+  const curated = curatedCopilotModel();
+  const forwarderPort = await openPort();
+  const forwarder = run("api-forwarder.mjs", {
+    CODEX_ROUTER_API_PORT: String(forwarderPort),
+    MODEL_ROUTER_USER_MODELS: curated.file,
+    GITHUB_COPILOT_BASE_URL: `http://127.0.0.1:${upstream.port}`,
+    GITHUB_COPILOT_USER_URL: `http://127.0.0.1:${upstream.port}/user`,
+    COPILOT_GITHUB_TOKEN: "github_pat_TEST_GITHUB_SOURCE_TOKEN",
+    CODEX_ROUTER_QUIET: "1",
+  });
+
+  try {
+    await waitFor(`http://127.0.0.1:${forwarderPort}/health`, forwarder, {
+      Authorization: `Bearer ${INTERNAL_KEY}`,
+    });
+    const response = await fetch(`http://127.0.0.1:${forwarderPort}/v1/responses`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${INTERNAL_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ model: `responses/${curated.gatewayModel}`, input: "Reply with exactly OK.", stream: true }),
+    });
+    assert.equal(response.status, 200, forwarder.testErrors());
+    const events = (await response.text())
+      .split("\n\n")
+      .filter((frame) => frame.includes("data: "))
+      .map((frame) => JSON.parse(frame.slice(frame.indexOf("data: ") + 6)));
+    assert.deepEqual(
+      events.map((event) => event.type),
+      ["response.created", "response.in_progress", "response.output_text.delta", "response.completed"],
+    );
+    assert.equal(events[1].response.id, "resp_a");
+    assert.equal(events[3].response.id, "resp_a");
   } finally {
     await stopChild(forwarder);
     await closeServer(upstream.server);
@@ -5288,6 +5727,167 @@ test("caller embeddings stay capability-gated, bounded, cancelable, and credenti
   }
 });
 
+test("caller Decisions stay capability-gated, bounded, cancelable, and credential-isolated", async () => {
+  const curated = curatedOpenRouterModels();
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), "routing-decisions-state-"));
+  writeFileSync(
+    path.join(stateDir, "enabled-providers.json"),
+    `${JSON.stringify({ version: 1, providers: ["openrouter-decisions"] })}\n`,
+    { mode: 0o600 },
+  );
+  const upstreamRequests = [];
+  let canceledUpstream = false;
+  let redirectedProviderRequests = 0;
+  const providerRedirectSink = await mockServer(async (request, response) => {
+    redirectedProviderRequests += 1;
+    request.resume();
+    json(response, 200, { stolen: true });
+  });
+  const upstream = await mockServer(async (request, response) => {
+    const body = await bodyJson(request);
+    upstreamRequests.push({ url: request.url, headers: request.headers, body });
+    const input = body.state?.input;
+    if (input === "hold") {
+      response.on("close", () => {
+        if (!response.writableEnded) canceledUpstream = true;
+      });
+      return;
+    }
+    if (input === "oversize-response") {
+      json(response, 200, { ok: true, padding: "x".repeat(2_048) });
+      return;
+    }
+    if (input === "provider-redirect") {
+      response.writeHead(307, {
+        Location: `http://127.0.0.1:${providerRedirectSink.port}/replayed`,
+      });
+      response.end();
+      return;
+    }
+    json(response, 200, {
+      id: "jev-test",
+      model: "~typesafe/jev-latest",
+      decisions: [{ keep: true }],
+    });
+  });
+  const forwarderPort = await openPort();
+  const routerPort = await openPort();
+  const forwarder = run("api-forwarder.mjs", {
+    CODEX_ROUTER_API_PORT: String(forwarderPort),
+    CODEX_ROUTER_STATE_DIR: stateDir,
+    MODEL_ROUTER_USER_MODELS: curated.file,
+    OPENROUTER_DECISIONS_API_BASE_URL: `http://127.0.0.1:${upstream.port}`,
+    OPENROUTER_API_KEY: "TEST_OPENROUTER_API_KEY",
+    CODEX_ROUTER_QUIET: "1",
+  });
+  const router = run("router.mjs", {
+    CODEX_ROUTER_PORT: String(routerPort),
+    CODEX_ROUTER_STATE_DIR: stateDir,
+    MODEL_ROUTER_USER_MODELS: curated.file,
+    CODEX_ROUTER_API_BASE_URL: `http://127.0.0.1:${forwarderPort}/v1`,
+    CODEX_ROUTER_API_HEALTH_URL: `http://127.0.0.1:${forwarderPort}/health`,
+    CODEX_ROUTER_DECISIONS_MAX_BODY_BYTES: "512",
+    CODEX_ROUTER_DECISIONS_MAX_RESPONSE_BYTES: "512",
+    CODEX_ROUTER_QUIET: "1",
+  });
+  const headers = {
+    Authorization: `Bearer ${CALLER_KEY}`,
+    "Content-Type": "application/json",
+  };
+  const decision = (input) => ({
+    model: "openrouter-decisions/jev-latest",
+    state: { input },
+    questions: [{ id: "keep", prompt: "Keep this item?" }],
+  });
+  try {
+    await waitFor(`http://127.0.0.1:${forwarderPort}/health`, forwarder, {
+      Authorization: `Bearer ${INTERNAL_KEY}`,
+    });
+    await waitFor(`${routerBase(routerPort)}/models`, router);
+
+    const response = await fetch(`${routerBase(routerPort)}/decisions?trace=one`, {
+      method: "POST",
+      headers: { ...headers, "X-Request-Id": "decision-request-1" },
+      body: JSON.stringify(decision("hello")),
+    });
+    assert.equal(response.status, 200, `${router.testErrors()}\n${forwarder.testErrors()}`);
+    assert.equal((await response.json()).id, "jev-test");
+    assert.equal(upstreamRequests.length, 1);
+    assert.equal(upstreamRequests[0].url, "/decisions");
+    assert.equal(upstreamRequests[0].headers.authorization, "Bearer TEST_OPENROUTER_API_KEY");
+    assert.equal(upstreamRequests[0].headers["x-request-id"], "decision-request-1");
+    assert.equal(upstreamRequests[0].headers.authorization.includes(CALLER_KEY), false);
+    assert.equal(upstreamRequests[0].headers.authorization.includes(INTERNAL_KEY), false);
+    assert.equal(upstreamRequests[0].body.model, "~typesafe/jev-latest");
+
+    const wrongSurface = await fetch(`${routerBase(routerPort)}/chat/completions`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ model: "openrouter-decisions/jev-latest", messages: [] }),
+    });
+    assert.equal(wrongSurface.status, 404);
+    assert.equal(upstreamRequests.length, 1);
+
+    const wrongCapability = await fetch(
+      `http://127.0.0.1:${routerPort}/_codex-router/${"x".repeat(40)}/v1/decisions`,
+      { method: "POST", headers, body: JSON.stringify(decision("wrong-key")) },
+    );
+    assert.equal(wrongCapability.status, 401);
+    assert.equal(upstreamRequests.length, 1);
+
+    const tooLarge = await fetch(`${routerBase(routerPort)}/decisions`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(decision("x".repeat(1_024))),
+    });
+    assert.equal(tooLarge.status, 413);
+    assert.equal(upstreamRequests.length, 1);
+
+    const largeResponse = await fetch(`${routerBase(routerPort)}/decisions`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(decision("oversize-response")),
+    });
+    assert.equal(largeResponse.status, 502);
+    assert.equal(upstreamRequests.length, 2);
+
+    const abort = new AbortController();
+    const held = fetch(`${routerBase(routerPort)}/decisions`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(decision("hold")),
+      signal: abort.signal,
+    });
+    const deadline = Date.now() + 5_000;
+    while (upstreamRequests.length < 3 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.equal(upstreamRequests.length, 3);
+    abort.abort();
+    await assert.rejects(held, /abort/i);
+    while (!canceledUpstream && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.equal(canceledUpstream, true);
+
+    const providerRedirect = await fetch(`${routerBase(routerPort)}/decisions`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(decision("provider-redirect")),
+    });
+    assert.equal(providerRedirect.status, 502);
+    assert.equal(upstreamRequests.length, 4);
+    assert.equal(redirectedProviderRequests, 0);
+  } finally {
+    await stopChild(router);
+    await stopChild(forwarder);
+    await closeServer(upstream.server);
+    await closeServer(providerRedirectSink.server);
+    rmSync(curated.dir, { recursive: true, force: true });
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
 test("caller embeddings never follow a redirect from the internal API hop", async () => {
   const curated = curatedOpenRouterModels();
   const stateDir = mkdtempSync(path.join(os.tmpdir(), "routing-embedding-api-redirect-state-"));
@@ -6271,6 +6871,80 @@ test("API forwarder routes GLM coding-plan models with thinking enabled", async 
     await closeServer(upstream.server);
   }
 }));
+
+test("API forwarder gives DeepSeek tool calls without reasoning an empty reasoning_content (#809)", async () => {
+  const upstreamRequests = [];
+  const upstream = await mockServer(async (request, response) => {
+    upstreamRequests.push({ url: request.url, body: await bodyJson(request) });
+    json(response, 200, { choices: [] });
+  });
+  const forwarderPort = await openPort();
+  const forwarder = run("api-forwarder.mjs", {
+    CODEX_ROUTER_API_PORT: String(forwarderPort),
+    OPENCODE_GO_BASE_URL: `http://127.0.0.1:${upstream.port}`,
+    OPENCODE_GO_API_KEY: "TEST_OPENCODE_GO_API_KEY",
+    CODEX_ROUTER_QUIET: "1",
+  });
+  const history = (model) => ({
+    model,
+    messages: [
+      { role: "user", content: "read the probe result" },
+      {
+        role: "assistant",
+        content: null,
+        tool_calls: [{
+          id: "call_probe",
+          type: "function",
+          function: { name: "codex_router_probe", arguments: "{\"value\":\"pending\"}" },
+        }],
+      },
+      { role: "tool", tool_call_id: "call_probe", content: "MARKER" },
+      {
+        role: "assistant",
+        content: [{ type: "thinking", text: "kept" }],
+        tool_calls: [{
+          id: "call_two",
+          type: "function",
+          function: { name: "codex_router_probe", arguments: "{}" },
+        }],
+      },
+      { role: "tool", tool_call_id: "call_two", content: "done" },
+    ],
+    tools: [{
+      type: "function",
+      function: { name: "codex_router_probe", parameters: { type: "object", properties: {} } },
+    }],
+  });
+
+  try {
+    await waitFor(`http://127.0.0.1:${forwarderPort}/health`, forwarder, {
+      Authorization: `Bearer ${INTERNAL_KEY}`,
+    });
+    for (const model of ["opencode-go-deepseek-v4-1-flash", "opencode-go-glm-5-3"]) {
+      const response = await fetch(`http://127.0.0.1:${forwarderPort}/v1/chat/completions`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${INTERNAL_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(history(model)),
+      });
+      assert.equal(response.status, 200, model);
+    }
+    const [deepseek, glm] = upstreamRequests.map((entry) => entry.body.messages);
+    assert.equal(deepseek[1].reasoning_content, "");
+    assert.equal(deepseek[1].content, null);
+    assert.equal(deepseek[1].tool_calls.length, 1);
+    assert.equal(deepseek[3].reasoning_content, "kept");
+    assert.equal(deepseek[0].reasoning_content, undefined);
+    // Only the DeepSeek contract needs the field on every tool call.
+    assert.equal(glm[1].reasoning_content, undefined);
+    assert.equal(glm[3].reasoning_content, "kept");
+  } finally {
+    await stopChild(forwarder);
+    await closeServer(upstream.server);
+  }
+});
 
 test("API forwarder preserves Z.ai cached-token telemetry before the LiteLLM bridge", async () => {
   const upstream = await mockServer(async (request, response) => {
@@ -7387,6 +8061,15 @@ test("router replays verified search history without exposing a new search tool"
     id: "completed-search-history",
     status: "completed",
     action: { type: "search", query: "router contract" },
+  }, {
+    type: "web_search_call", id: "batched-history", status: "completed",
+    action: { type: "search", queries: ["router defaults", "router overrides"] },
+  }, {
+    type: "web_search_call", id: "opened-history", status: "completed",
+    action: { type: "open_page", url: "https://example.com/router" },
+  }, {
+    type: "web_search_call", id: "find-history", status: "failed",
+    action: { type: "find_in_page", url: "https://example.com/router", pattern: "override" },
   }];
 
   try {
@@ -7404,6 +8087,16 @@ test("router replays verified search history without exposing a new search tool"
       request.model === fixture.historyCompatible.gatewayModel &&
       (!Array.isArray(request.tools) || request.tools.every((tool) => tool.type !== "web_search"))
     )));
+    const markers = gatewayRequests[0].input.filter((item) => item.type === "message" && item.role === "assistant");
+    assert.deepEqual(markers.map((item) => item.content[0].text), [
+      "[completed web search: router contract]",
+      '[completed web search: queries=["router defaults","router overrides"]]',
+      "[completed web page open: https://example.com/router]",
+      '[web page find (failed): url="https://example.com/router", pattern="override"]',
+    ]);
+    // Compaction has its own quoted source catalog, which already preserves
+    // action details. Its original structured history remains unchanged.
+    assert.deepEqual(gatewayRequests[1].input.slice(0, history.length), history);
   } finally {
     await stopChild(router);
     await closeServer(gateway.server);
@@ -7551,6 +8244,7 @@ test("API forwarder strips web_search_options for OpenCode Go chat models", asyn
         body: JSON.stringify({
           model: "opencode-go-glm-5-3",
           web_search_options: { search_context_size: "medium" },
+          access_programs: { cyber: "standard" },
           messages: [{ role: "user", content: "test" }],
         }),
       },
@@ -7558,6 +8252,7 @@ test("API forwarder strips web_search_options for OpenCode Go chat models", asyn
     assert.equal(response.status, 200, forwarder.testErrors());
     assert.equal(upstreamRequests[0].model, "glm-5.3");
     assert.equal(upstreamRequests[0].web_search_options, undefined);
+    assert.equal(upstreamRequests[0].access_programs, undefined);
   } finally {
     await stopChild(forwarder);
     await closeServer(upstream.server);
@@ -7746,12 +8441,14 @@ test("router strips Fireworks web_search_options on routed and compaction reques
         input: "routed test",
         web_search_options: { search_context_size: "medium" },
         client_metadata: { workspace: "caller-owned" },
+        access_programs: { cyber: "standard" },
       }),
     });
     assert.equal(routed.status, 200, router.testErrors());
     assert.equal(gatewayRequests[0].model, curated.gatewayModel);
     assert.equal(gatewayRequests[0].web_search_options, undefined);
     assert.equal(gatewayRequests[0].client_metadata, undefined);
+    assert.equal(gatewayRequests[0].access_programs, undefined);
 
     const compact = await fetch(`${routerBase(routerPort)}/responses/compact`, {
       method: "POST",
@@ -7767,12 +8464,14 @@ test("router strips Fireworks web_search_options on routed and compaction reques
         ],
         web_search_options: { search_context_size: "medium" },
         client_metadata: { workspace: "caller-owned" },
+        access_programs: { cyber: "standard" },
       }),
     });
     assert.equal(compact.status, 200, router.testErrors());
     assert.equal(gatewayRequests[1].model, curated.gatewayModel);
     assert.equal(gatewayRequests[1].web_search_options, undefined);
     assert.equal(gatewayRequests[1].client_metadata, undefined);
+    assert.equal(gatewayRequests[1].access_programs, undefined);
   } finally {
     await stopChild(router);
     await closeServer(gateway.server);
@@ -7916,6 +8615,70 @@ test("router normalizes forced tool choices before LiteLLM for auto-tool-choice 
       const sibling = await route(slug, "required");
       assert.equal(sibling.tool_choice, "required");
     }
+  } finally {
+    await stopChild(router);
+    await closeServer(gateway.server);
+  }
+});
+
+test("router omits tool_choice before LiteLLM for omit-tool-choice models", async () => {
+  const gatewayRequests = [];
+  const gateway = await mockServer(async (request, response) => {
+    gatewayRequests.push(await bodyJson(request));
+    json(response, 200, { id: "resp_test", object: "response", output: [] });
+  });
+  const routerPort = await openPort();
+  const router = run("router.mjs", {
+    CODEX_ROUTER_PORT: String(routerPort),
+    CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${gateway.port}/v1`,
+    CODEX_ROUTER_QUIET: "1",
+  });
+  const headers = {
+    Authorization: `Bearer ${CALLER_KEY}`,
+    "Content-Type": "application/json",
+  };
+  const tools = [{
+    type: "function",
+    name: "exec_command",
+    parameters: { type: "object", properties: { command: { type: "string" } } },
+  }];
+
+  async function route(model, toolChoice) {
+    const response = await fetch(`${routerBase(routerPort)}/responses`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model,
+        input: "test",
+        tools,
+        ...(toolChoice === undefined ? {} : { tool_choice: toolChoice }),
+      }),
+    });
+    assert.equal(response.status, 200, router.testErrors());
+    return gatewayRequests.at(-1);
+  }
+
+  try {
+    await waitFor(`${routerBase(routerPort)}/models`, router);
+
+    const required = await route("opencode-go-messages/qwen3.8-flash", "required");
+    assert.equal(required.model, "opencode-go-messages-qwen3-8-flash");
+    assert.equal("tool_choice" in required, false);
+    assert.ok(Array.isArray(required.tools) && required.tools.length > 0);
+    assert.ok(required.tools.some((tool) => tool.name === "exec_command"));
+
+    const auto = await route("opencode-go-messages/qwen3.8-flash", "auto");
+    assert.equal("tool_choice" in auto, false);
+    assert.ok(Array.isArray(auto.tools) && auto.tools.length > 0);
+
+    const none = await route("opencode-go-messages/qwen3.8-flash", "none");
+    assert.equal("tool_choice" in none, false);
+    assert.equal("tools" in none, false);
+
+    // MiniMax on the same Messages route still accepts the field.
+    const sibling = await route("opencode-go-messages/minimax-m3", "required");
+    assert.equal(sibling.tool_choice, "required");
+    assert.ok(sibling.tools.some((tool) => tool.name === "exec_command"));
   } finally {
     await stopChild(router);
     await closeServer(gateway.server);
@@ -8092,6 +8855,177 @@ test("native redirect falls back to native when the target cannot route", async 
   } finally {
     await stopChild(router);
     await closeServer(native.server);
+    rmSync(testRoot, { recursive: true, force: true });
+  }
+});
+
+// #787. Codex's "Approve for me" always runs on its own hidden native slug, so
+// with `Use Router with ChatGPT` on, an exhausted ChatGPT plan leaves a routed
+// session proposing commands it cannot execute. These two cover both halves of
+// the contract: the fallback engages on a quota refusal, and on nothing else.
+test("an exhausted native reviewer moves later approvals to the configured reviewer (#787)", async () => {
+  const nativeRequests = [];
+  const native = await mockServer(async (request, response) => {
+    nativeRequests.push(await bodyJson(request));
+    response.writeHead(429, { "content-type": "application/json", "retry-after": "1800" });
+    response.end(JSON.stringify({ error: { message: "You have hit your usage limit." } }));
+  });
+  const gatewayRequests = [];
+  const gateway = await mockServer(async (request, response) => {
+    gatewayRequests.push(await bodyJson(request));
+    json(response, 200, { route: "external-reviewer" });
+  });
+  const routerPort = await openPort();
+  const testRoot = mkdtempSync(path.join(os.tmpdir(), "codex-router-auto-review-"));
+  const stateDir = path.join(testRoot, "state");
+  mkdirSync(stateDir, { recursive: true });
+  writeFileSync(
+    path.join(stateDir, "auto-review-fallback.json"),
+    `${JSON.stringify({ version: 1, model: "kimi-oauth/k3" })}\n`,
+  );
+  const router = run("router.mjs", {
+    CODEX_ROUTER_PORT: String(routerPort),
+    CODEX_NATIVE_BASE_URL: `http://127.0.0.1:${native.port}/backend-api/codex`,
+    CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${gateway.port}/v1`,
+    CODEX_ROUTER_STATE_DIR: stateDir,
+    CODEX_ROUTER_QUIET: "1",
+  });
+
+  const review = () => fetch(`${routerBase(routerPort)}/responses`, {
+    method: "POST",
+    headers: { Authorization: "Bearer CODEX_CALLER_SECRET", "Content-Type": "application/json" },
+    body: JSON.stringify({ model: "codex-auto-review", input: "approve this command?" }),
+  });
+
+  try {
+    await waitFor(`${routerBase(routerPort)}/models`, router);
+
+    // The first approval still goes native and still fails. Nothing is rescued
+    // mid-flight: the refusal is relayed exactly as ChatGPT wrote it.
+    const first = await review();
+    assert.equal(first.status, 429);
+    // The classifier reads this body through `upstream.clone()` precisely so
+    // the relay keeps ChatGPT's own words. Assert the bytes survived the tee,
+    // because a consumed body would relay an empty error and the status alone
+    // would not notice.
+    assert.deepEqual(await first.json(), {
+      error: { message: "You have hit your usage limit." },
+    });
+    assert.equal(first.headers.get("retry-after"), "1800");
+    assert.equal(nativeRequests.length, 1);
+    assert.equal(nativeRequests[0].model, "codex-auto-review");
+    assert.equal(gatewayRequests.length, 0);
+
+    // Criterion 2: the next one is answered by the configured reviewer. And
+    // the "ideally" of the issue -- the known-to-fail native request is not
+    // sent again while the window the upstream named is open.
+    const second = await review();
+    assert.equal(second.status, 200);
+    assert.equal(nativeRequests.length, 1, "a known-empty reviewer must not be asked again");
+    assert.equal(gatewayRequests.length, 1);
+    assert.equal(gatewayRequests[0].model, "kimi-oauth-k3");
+
+    const third = await review();
+    assert.equal(third.status, 200);
+    assert.equal(nativeRequests.length, 1);
+    assert.equal(gatewayRequests.length, 2);
+
+    // Criterion 6: the state is readable.
+    const recorded = JSON.parse(
+      readFileSync(path.join(stateDir, "auto-review-fallback.json"), "utf8"),
+    );
+    assert.equal(recorded.model, "kimi-oauth/k3");
+    assert.equal(recorded.reason, "rate_limited");
+    assert.ok(Date.parse(recorded.exhaustedUntil) > Date.now());
+  } finally {
+    await stopChild(router);
+    await closeServer(native.server);
+    await closeServer(gateway.server);
+    rmSync(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("a native reviewer that answers keeps every approval native, deny included (#787)", async () => {
+  const nativeRequests = [];
+  // A `deny` is a successful review. Reading it as the provider failing would
+  // hand the operator's refused command to another model for a second opinion,
+  // which is the one thing the issue says must never happen.
+  const native = await mockServer(async (request, response) => {
+    nativeRequests.push(await bodyJson(request));
+    json(response, 200, { decision: "deny", reason: "This command deletes the repository." });
+  });
+  const gatewayRequests = [];
+  const gateway = await mockServer(async (request, response) => {
+    gatewayRequests.push(await bodyJson(request));
+    json(response, 200, { route: "external-reviewer" });
+  });
+  const routerPort = await openPort();
+  const testRoot = mkdtempSync(path.join(os.tmpdir(), "codex-router-auto-review-deny-"));
+  const stateDir = path.join(testRoot, "state");
+  mkdirSync(stateDir, { recursive: true });
+  // Configured, and with a window already open from an earlier exhaustion --
+  // so this also covers criterion 5: the first native answer ends the window.
+  writeFileSync(
+    path.join(stateDir, "auto-review-fallback.json"),
+    `${JSON.stringify({
+      version: 1,
+      model: "kimi-oauth/k3",
+      exhaustedUntil: new Date(Date.now() + 3_600_000).toISOString(),
+      reason: "out_of_usage",
+    })}\n`,
+  );
+  const router = run("router.mjs", {
+    CODEX_ROUTER_PORT: String(routerPort),
+    CODEX_NATIVE_BASE_URL: `http://127.0.0.1:${native.port}/backend-api/codex`,
+    CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${gateway.port}/v1`,
+    CODEX_ROUTER_STATE_DIR: stateDir,
+    CODEX_ROUTER_QUIET: "1",
+  });
+
+  const review = () => fetch(`${routerBase(routerPort)}/responses`, {
+    method: "POST",
+    headers: { Authorization: "Bearer CODEX_CALLER_SECRET", "Content-Type": "application/json" },
+    body: JSON.stringify({ model: "codex-auto-review", input: "approve rm -rf /?" }),
+  });
+
+  try {
+    await waitFor(`${routerBase(routerPort)}/models`, router);
+
+    // The open window sends this one to the reviewer, which is the whole point
+    // of the window -- but that reviewer answering is not what is under test.
+    const first = await review();
+    assert.equal(first.status, 200);
+    assert.equal(gatewayRequests.length, 1);
+
+    // Let the window lapse the way a reset would, and the native reviewer is
+    // primary again with no command run by anyone.
+    writeFileSync(
+      path.join(stateDir, "auto-review-fallback.json"),
+      `${JSON.stringify({ version: 1, model: "kimi-oauth/k3" })}\n`,
+    );
+
+    const second = await review();
+    assert.equal(second.status, 200);
+    assert.deepEqual(await second.json(), {
+      decision: "deny",
+      reason: "This command deletes the repository.",
+    }, "a native deny must reach Codex verbatim");
+    assert.equal(nativeRequests.length, 1);
+    assert.equal(gatewayRequests.length, 1, "a deny must never be retried through another model");
+
+    const third = await review();
+    assert.equal(third.status, 200);
+    assert.equal(nativeRequests.length, 2);
+    assert.equal(gatewayRequests.length, 1);
+
+    const recorded = JSON.parse(
+      readFileSync(path.join(stateDir, "auto-review-fallback.json"), "utf8"),
+    );
+    assert.equal(recorded.exhaustedUntil, undefined, "an answering reviewer leaves no window");
+  } finally {
+    await stopChild(router);
+    await closeServer(native.server);
+    await closeServer(gateway.server);
     rmSync(testRoot, { recursive: true, force: true });
   }
 });
@@ -9069,6 +10003,164 @@ test("RTK shaping is reserved for routed compaction and ordinary turns keep newe
     rmSync(stateDir, { recursive: true, force: true });
   }
 });
+
+// Compaction runs when a conversation is at its largest and replays every
+// image it holds. Unbounded, a screenshot-heavy session's compaction hit
+// OpenRouter's 413 ("Downloaded image content cannot exceed 30MB") on every
+// retry and the session could never take another turn.
+test("routed compaction bounds the image payload like a routed turn", async () => {
+  const gatewayBodies = [];
+  const gateway = await mockServer(async (request, response) => {
+    gatewayBodies.push(await bodyJson(request));
+    json(response, 200, {
+      output: [
+        {
+          type: "message",
+          role: "assistant",
+          content: [{ type: "output_text", text: "compact summary" }],
+        },
+      ],
+    });
+  });
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), "routing-compaction-images-"));
+  const routerPort = await openPort();
+  const router = run("router.mjs", {
+    CODEX_ROUTER_PORT: String(routerPort),
+    CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${gateway.port}/v1`,
+    CODEX_ROUTER_QUIET: "1",
+    MODEL_ROUTER_STATE_DIR: stateDir,
+  });
+  // 40 images at the resold 4096-token bound is 160K image tokens, over the
+  // 128K budget, so the oldest 8 have to become receipts.
+  const images = Array.from({ length: 40 }, (_, index) => ({
+    type: "message",
+    role: "user",
+    content: [
+      { type: "input_text", text: `screenshot ${index}` },
+      { type: "input_image", image_url: `data:image/png;base64,${"A".repeat(64)}${index}` },
+    ],
+  }));
+  images.push({ type: "message", role: "assistant", content: [{ type: "output_text", text: "Earlier screenshots were examined." }] });
+
+  try {
+    await waitFor(`${routerBase(routerPort)}/models`, router);
+    const compact = await fetch(`${routerBase(routerPort)}/responses/compact`, {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer CODEX_CALLER_SECRET",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ model: "kimi-oauth/k3", input: images }),
+    });
+    assert.equal(compact.status, 200, await compact.text());
+
+    assert.equal(gatewayBodies.length, 1);
+    const parts = gatewayBodies[0].input.flatMap((item) =>
+      Array.isArray(item.content) ? item.content : []);
+    const sent = parts.filter((part) => part.type === "input_image");
+    const receipts = parts.filter((part) => /image omitted by Codex Router/u.test(part.text ?? ""));
+    assert.equal(sent.length, 32);
+    assert.equal(receipts.length, 8);
+    // Oldest first: the newest screenshot is still the one the model sees.
+    assert.match(sent.at(-1).image_url, /39$/u);
+    assert.match(sent[0].image_url, /8$/u);
+
+    const [event] = await waitForUsageEvents(stateDir, 1, router);
+    assert.equal(event.imageReferencesSeen, 40);
+    assert.equal(event.imageReferencesDropped, 8);
+    assert.equal(event.imageTokensSaved, 8 * 4096);
+  } finally {
+    await stopChild(router);
+    await closeServer(gateway.server);
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+// The byte budget is a measurement of one provider on one day. A provider that
+// still refuses the image content must get the same model again with fewer
+// images - on a turn and on compaction - rather than a refusal the session can
+// never get past.
+for (const endpoint of ["responses", "responses/compact"]) {
+  test(`a refused image payload is resent with fewer images on /${endpoint}`, async () => {
+    const gatewayImageCounts = [];
+    const gateway = await mockServer(async (request, response) => {
+      const body = await bodyJson(request);
+      const count = body.input
+        .flatMap((item) => (Array.isArray(item.content) ? item.content : []))
+        .filter((part) => part.type === "input_image").length;
+      gatewayImageCounts.push(count);
+      if (count > 5) {
+        // What LiteLLM relays for OpenRouter's ceiling.
+        json(response, 413, {
+          error: {
+            message:
+              "litellm.APIError: APIError: OpenAIException - Downloaded image content cannot exceed 30MB",
+            type: null,
+            param: null,
+            code: "413",
+          },
+        });
+        return;
+      }
+      json(response, 200, {
+        output: [
+          {
+            type: "message",
+            role: "assistant",
+            content: [{ type: "output_text", text: "ok" }],
+          },
+        ],
+      });
+    });
+    const stateDir = mkdtempSync(path.join(os.tmpdir(), "routing-image-rejection-"));
+    const routerPort = await openPort();
+    const router = run("router.mjs", {
+      CODEX_ROUTER_PORT: String(routerPort),
+      CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${gateway.port}/v1`,
+      CODEX_ROUTER_QUIET: "1",
+      MODEL_ROUTER_STATE_DIR: stateDir,
+    });
+    // Ten equal images, each far under both budgets, so the first attempt goes
+    // out whole and only the provider's refusal can trim it.
+    const input = Array.from({ length: 10 }, (_, index) => ({
+      type: "message",
+      role: "user",
+      content: [
+        { type: "input_text", text: `screenshot ${index}` },
+        {
+          type: "input_image",
+          image_url: `data:image/png;base64,${"A".repeat(62)}${String(index).padStart(2, "0")}`,
+        },
+      ],
+    }));
+    input.push({ type: "message", role: "assistant", content: [{ type: "output_text", text: "Earlier screenshots were examined." }] });
+
+    try {
+      await waitFor(`${routerBase(routerPort)}/models`, router);
+      const result = await fetch(`${routerBase(routerPort)}/${endpoint}`, {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer CODEX_CALLER_SECRET",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ model: "kimi-oauth/k3", stream: false, input }),
+      });
+      assert.equal(result.status, 200, await result.text());
+      assert.deepEqual(gatewayImageCounts, [10, 5]);
+      await waitForStderr(router, /image payload refused, resending with fewer images 1\/2/u);
+
+      const events = await waitForUsageEvents(stateDir, 1, router);
+      const served = events.at(-1);
+      assert.equal(served.status, 200);
+      assert.equal(served.imageReferencesSeen, 10);
+      assert.equal(served.imageReferencesDropped, 5);
+    } finally {
+      await stopChild(router);
+      await closeServer(gateway.server);
+      rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+}
 
 test("tool-result aging kill switch forwards the same large output", async () => {
   const gatewayBodies = [];
@@ -11432,6 +12524,273 @@ test("router repairs malformed Z.ai message envelopes after LiteLLM Responses tr
   }
 });
 
+// Every text or part event must belong to an item the client already saw
+// open, and every open item needs its own output index. Codex logs
+// `OutputTextDelta without active item` for each delta that breaks the first.
+function assertSequentialMessageEnvelopes(events) {
+  const opened = new Map();
+  const parts = new Set();
+  const indexes = new Set();
+  for (const event of events) {
+    if (event.type === "response.output_item.added") {
+      assert.equal(indexes.has(event.output_index), false, `output_index ${event.output_index} reused`);
+      indexes.add(event.output_index);
+      opened.set(event.item.id, event.output_index);
+    } else if (event.type === "response.content_part.added") {
+      assert.ok(opened.has(event.item_id), `${event.type} before its item opened`);
+      parts.add(`${event.item_id}:${event.content_index}`);
+    } else if (
+      event.type === "response.output_text.delta"
+      || event.type === "response.output_text.done"
+      || event.type === "response.content_part.done"
+    ) {
+      assert.ok(parts.has(`${event.item_id}:${event.content_index}`), `${event.type} without an active item`);
+      assert.equal(event.output_index, opened.get(event.item_id), `${event.type} on a foreign output_index`);
+      if (event.type === "response.content_part.done") assert.equal(event.part?.type, "output_text");
+    } else if (event.type === "response.output_item.done") {
+      assert.equal(event.output_index, opened.get(event.item?.id), `${event.item?.type} closed without opening`);
+    }
+  }
+}
+
+test("router gives OpenRouter Chat Completions text a message envelope after reasoning", async () => {
+  // The exact event shape the pinned LiteLLM (1.96) emits for an
+  // OpenAI-compatible Chat Completions stream whose first chunk carries
+  // reasoning, reproduced live on openrouter/mimo-v2.6-flash: a reasoning item
+  // with hashed per-delta summary ids, then assistant text on the reasoning's
+  // output index with no output_item.added / content_part.added, closed as
+  // reasoning_text. The tool turn closes an empty, never-opened message after
+  // the function call.
+  const testRoot = mkdtempSync(path.join(os.tmpdir(), "openrouter-message-envelope-router-"));
+  const stateDir = path.join(testRoot, "state");
+  mkdirSync(stateDir, { recursive: true });
+  writeFileSync(
+    path.join(stateDir, "enabled-providers.json"),
+    `${JSON.stringify({ version: 1, providers: ["openrouter"] })}\n`,
+  );
+  const reasoning = [
+    { type: "response.created", response: { id: "resp_or", status: "in_progress", output: [] } },
+    { type: "response.in_progress", response: { id: "resp_or", status: "in_progress", output: [] } },
+    { type: "response.output_item.added", output_index: 0, item: { id: "rs_or", type: "reasoning", status: "in_progress" } },
+    { type: "response.reasoning_summary_text.delta", item_id: "rs_-6069218895868931452", output_index: 0, summary_index: 0, delta: "Need exact" },
+    { type: "response.reasoning_summary_text.delta", item_id: "rs_-8666647028025905637", output_index: 0, summary_index: 0, delta: " requested." },
+    { type: "response.reasoning_summary_text.done", item_id: "rs_or", output_index: 0, sequence_number: 4, summary_index: 0, text: "Need exact requested." },
+    { type: "response.reasoning_summary_part.done", item_id: "rs_or", output_index: 0, sequence_number: 5, summary_index: 0, part: { type: "summary_text", text: "Need exact requested." } },
+    { type: "response.output_item.done", output_index: 0, sequence_number: 6, item: { id: "rs_or", type: "reasoning", summary: [{ type: "summary_text", text: "Need exact requested." }] } },
+  ];
+  const answerTurn = [
+    ...reasoning,
+    { type: "response.output_text.delta", item_id: "gen-or", output_index: 0, content_index: 0, delta: "M" },
+    { type: "response.output_text.delta", item_id: "gen-or", output_index: 0, content_index: 0, delta: "IMO-OK PAPAYA" },
+    { type: "response.output_text.done", item_id: "gen-or", output_index: 0, content_index: 0, text: "MIMO-OK PAPAYA" },
+    { type: "response.content_part.done", item_id: "gen-or", output_index: 0, content_index: 0, part: { type: "reasoning_text", reasoning: "Need exact requested." } },
+    { type: "response.output_item.done", output_index: 0, sequence_number: 1, item: { id: "gen-or", status: "completed", type: "message", role: "assistant", content: [{ type: "output_text", text: "MIMO-OK PAPAYA", annotations: [] }] } },
+    { type: "response.completed", response: { id: "resp_or", status: "completed", output: [], usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15 } } },
+  ];
+  const toolTurn = [
+    ...reasoning,
+    { type: "response.output_item.added", output_index: 1, item: { type: "function_call", id: "call_or", call_id: "call_or", name: "exec_command", status: "in_progress", arguments: "" } },
+    { type: "response.function_call_arguments.delta", item_id: "call_or", output_index: 1, delta: "{\"cmd\":\"cat note.txt\"}" },
+    { type: "response.function_call_arguments.done", item_id: "call_or", output_index: 1, arguments: "{\"cmd\":\"cat note.txt\"}" },
+    { type: "response.output_item.done", output_index: 1, sequence_number: 12, item: { type: "function_call", id: "call_or", call_id: "call_or", name: "exec_command", status: "completed", arguments: "{\"cmd\":\"cat note.txt\"}" } },
+    { type: "response.output_text.done", item_id: "gen-or", output_index: 0, content_index: 0, text: "" },
+    { type: "response.content_part.done", item_id: "gen-or", output_index: 0, content_index: 0, part: { type: "reasoning_text", reasoning: "Need exact requested." } },
+    { type: "response.output_item.done", output_index: 0, sequence_number: 1, item: { id: "gen-or", status: "completed", type: "message", role: "assistant", content: [{ type: "output_text", text: "", annotations: [] }] } },
+    { type: "response.completed", response: { id: "resp_or", status: "completed", output: [], usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15 } } },
+  ];
+  let upstreamEvents;
+  const gateway = await mockServer(async (request, response) => {
+    if (request.method === "GET") {
+      json(response, 200, { ok: true, credential_present: true, credential_source: "test" });
+      return;
+    }
+    await bodyJson(request);
+    response.writeHead(200, { "Content-Type": "text/event-stream" });
+    response.end(`${upstreamEvents.map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join("")}data: [DONE]\n\n`);
+  });
+  const routerPort = await openPort();
+  const router = run("router.mjs", {
+    CODEX_ROUTER_PORT: String(routerPort),
+    CODEX_ROUTER_STATE_DIR: stateDir,
+    CODEX_ROUTER_SHOW_ALL_MODELS: "0",
+    CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${gateway.port}/v1`,
+    CODEX_ROUTER_GATEWAY_HEALTH_URL: `http://127.0.0.1:${gateway.port}/health`,
+    CODEX_ROUTER_API_HEALTH_URL: `http://127.0.0.1:${gateway.port}/health`,
+    CODEX_ROUTER_GROK_OAUTH_HEALTH_URL: `http://127.0.0.1:${gateway.port}/health`,
+    CODEX_ROUTER_QUIET: "1",
+  });
+  const relay = async (events) => {
+    upstreamEvents = events;
+    const response = await fetch(`${routerBase(routerPort)}/responses`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "openrouter/mimo-v2.6-flash",
+        input: "Read note.txt",
+        stream: true,
+        tools: [{ type: "function", name: "exec_command", parameters: { type: "object", properties: { cmd: { type: "string" } } } }],
+      }),
+    });
+    const text = await response.text();
+    assert.equal(response.status, 200, text);
+    return {
+      text,
+      events: text.split(/\r?\n/)
+        .filter((line) => line.startsWith("data: {"))
+        .map((line) => JSON.parse(line.slice(5).trim())),
+    };
+  };
+  try {
+    await waitFor(`${routerBase(routerPort)}/models`, router);
+
+    const answer = await relay(answerTurn);
+    assertSequentialMessageEnvelopes(answer.events);
+    const messageAdded = answer.events.find((event) => event.type === "response.output_item.added" && event.item?.type === "message");
+    assert.equal(messageAdded?.item?.id, "gen-or");
+    assert.equal(messageAdded?.output_index, 1);
+    const messageDone = answer.events.find((event) => event.type === "response.output_item.done" && event.item?.type === "message");
+    assert.deepEqual(messageDone?.item?.content, [{ type: "output_text", text: "MIMO-OK PAPAYA", annotations: [] }]);
+    assert.equal(messageDone?.item?.phase, "final_answer");
+    assert.ok(answer.events.some((event) => event.type === "response.output_item.done" && event.item?.type === "reasoning"));
+
+    const tool = await relay(toolTurn);
+    assertSequentialMessageEnvelopes(tool.events);
+    assert.ok(tool.events.some((event) => event.type === "response.output_item.done" && event.item?.type === "function_call"));
+    assert.equal(tool.events.at(-1)?.type, "response.completed");
+    assert.ok(!tool.text.includes("\"reasoning_text\""));
+  } finally {
+    await stopChild(router);
+    await closeServer(gateway.server);
+    rmSync(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("Z.ai Flash forwards the client-deferred app surface when tool_search is available", async () => {
+  const testRoot = mkdtempSync(path.join(os.tmpdir(), "zai-flash-deferred-tools-router-"));
+  const stateDir = path.join(testRoot, "state");
+  mkdirSync(stateDir, { recursive: true });
+  writeFileSync(
+    path.join(stateDir, "enabled-providers.json"),
+    `${JSON.stringify({ version: 1, providers: ["zai-coding"] })}\n`,
+  );
+  let expectedProviderToolSchemaBytes;
+  const gateway = await mockServer(async (request, response) => {
+    if (request.method === "GET") {
+      json(response, 200, { ok: true, credential_present: true, credential_source: "test" });
+      return;
+    }
+    const outgoing = await bodyJson(request);
+    assert.equal(outgoing.model, "zai-coding-glm-5-3-flash");
+    assert.equal(outgoing.reasoning?.effort, "high");
+    assert.deepEqual(outgoing.tool_choice, { type: "function", name: "tool_search" });
+    expectedProviderToolSchemaBytes = Buffer.byteLength(JSON.stringify(outgoing.tools), "utf8");
+    const names = new Set(
+      (outgoing.tools || [])
+        .map((tool) => tool?.name ?? tool?.function?.name)
+        .filter(Boolean),
+    );
+    assert.equal(names.has("tool_search"), true);
+    assert.equal(names.has("exec_command"), true);
+    assert.equal(names.has("codex_app__load_workspace_dependencies"), true);
+    assert.equal(names.has("codex_app__navigate_to_codex_page"), true);
+    assert.equal(names.has("codex_app__read_thread_terminal"), true);
+    assert.equal(names.has("codex_app__create_thread"), false);
+    assert.equal(names.has("codex_app__automation_update"), false);
+    assert.equal(names.has("plugin_management__uninstall_plugin"), false);
+
+    response.writeHead(200, { "Content-Type": "text/event-stream" });
+    response.end([
+      {
+        type: "response.output_text.delta",
+        output_index: 0,
+        content_index: 0,
+        item_id: "msg_tools",
+        model: "zai-coding-glm-5-3-flash",
+        delta: "OK",
+      },
+      {
+        type: "response.output_text.done",
+        output_index: 0,
+        content_index: 0,
+        item_id: "msg_tools",
+        model: "zai-coding-glm-5-3-flash",
+        text: "OK",
+      },
+      {
+        type: "response.completed",
+        response: {
+          id: "resp_tools",
+          status: "completed",
+          output: [],
+          usage: { input_tokens: 5, output_tokens: 1, total_tokens: 6 },
+        },
+      },
+    ].map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""));
+  });
+  const routerPort = await openPort();
+  const router = run("router.mjs", {
+    CODEX_ROUTER_PORT: String(routerPort),
+    CODEX_ROUTER_STATE_DIR: stateDir,
+    CODEX_ROUTER_SHOW_ALL_MODELS: "0",
+    CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${gateway.port}/v1`,
+    CODEX_ROUTER_GATEWAY_HEALTH_URL: `http://127.0.0.1:${gateway.port}/health`,
+    CODEX_ROUTER_API_HEALTH_URL: `http://127.0.0.1:${gateway.port}/health`,
+    CODEX_ROUTER_GROK_OAUTH_HEALTH_URL: `http://127.0.0.1:${gateway.port}/health`,
+    CODEX_ROUTER_QUIET: "1",
+  });
+  try {
+    await waitFor(`${routerBase(routerPort)}/models`, router);
+    const response = await fetch(`${routerBase(routerPort)}/responses`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "zai-coding/glm-5.3-flash",
+        input: "test deferred tools",
+        stream: true,
+        reasoning: { effort: "high" },
+        tool_choice: { type: "tool_search", execution: "client" },
+        tools: [
+          {
+            type: "tool_search",
+            execution: "client",
+            description: "Search deferred tools.",
+            parameters: {
+              type: "object",
+              properties: { query: { type: "string" } },
+              required: ["query"],
+              additionalProperties: false,
+            },
+          },
+          { type: "function", name: "exec_command", parameters: { type: "object" } },
+          {
+            type: "namespace",
+            name: "codex_app",
+            tools: [
+              { type: "function", name: "load_workspace_dependencies" },
+              { type: "function", name: "navigate_to_codex_page" },
+              { type: "function", name: "read_thread_terminal" },
+            ],
+          },
+        ],
+      }),
+    });
+    assert.equal(response.status, 200);
+    await response.text();
+    const usage = await waitForUsageEvent(
+      stateDir,
+      (event) => event.model === "zai-coding/glm-5.3-flash",
+      router,
+    );
+    assert.equal(usage.reasoningEffort, "high");
+    assert.equal(usage?.providerToolCount, 5);
+    assert.equal(usage?.providerToolSchemaBytes, expectedProviderToolSchemaBytes);
+  } finally {
+    await stopChild(router);
+    await closeServer(gateway.server);
+    rmSync(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("router repairs LiteLLM legacy argument events for native Z.ai custom tools", async () => {
   const testRoot = mkdtempSync(path.join(os.tmpdir(), "zai-custom-tool-router-"));
   const stateDir = path.join(testRoot, "state");
@@ -12055,13 +13414,121 @@ test("Zen Free Muse bridges custom tools across JSON, history, and errors", asyn
   }
 });
 
-test("Go Chat/Messages, paid Zen, and other Free routes keep compatibility-sensitive wire shapes", async () => {
+test("Zen Free Muse strips reasoning encrypted_content Console did not issue to this caller", async () => {
+  const testRoot = mkdtempSync(path.join(os.tmpdir(), "routing-muse-encrypted-"));
+  const stateDir = path.join(testRoot, "state");
+  mkdirSync(stateDir, { recursive: true });
+  const muse = {
+    slug: "opencode-free-responses/muse-spark-1.3-contributor-free",
+    gatewayModel: "opencode-free-responses-muse-spark-1-3-contributor-free",
+    upstreamModel: "muse-spark-1.3-contributor-free",
+    provider: "opencode-free-responses",
+    listed: true,
+    displayName: "Muse Spark 1.3 Free",
+    description: "Encrypted-content compatibility fixture.",
+    priority: 48,
+    defaultEffort: "xhigh",
+    reasoningLevels: [{ effort: "xhigh", description: "Max" }],
+    contextWindow: 1048576,
+    autoCompact: 900000,
+    inputModalities: ["text"],
+    compHash: "opencode-free-responses-muse-spark-1-3-contributor-free-encrypted-v1",
+  };
+  writeFileSync(
+    path.join(testRoot, "user-models.json"),
+    JSON.stringify({ version: 1, models: [muse] }),
+    "utf8",
+  );
+  writeFileSync(
+    path.join(stateDir, "enabled-providers.json"),
+    `${JSON.stringify({ version: 1, providers: ["opencode-free"] })}\n`,
+  );
+  const gatewayRequests = [];
+  const gateway = await mockServer(async (request, response) => {
+    if (request.method === "GET") {
+      json(response, 200, { ok: true, credential_present: true });
+      return;
+    }
+    const body = await bodyJson(request);
+    gatewayRequests.push(body);
+    json(response, 200, {
+      id: "resp_muse_encrypted",
+      object: "response",
+      status: "completed",
+      output: [
+        {
+          type: "message",
+          role: "assistant",
+          content: [{ type: "output_text", text: "ok" }],
+        },
+      ],
+      usage: { input_tokens: 8, output_tokens: 1, total_tokens: 9 },
+    });
+  });
+  const routerPort = await openPort();
+  const router = run("router.mjs", {
+    CODEX_ROUTER_PORT: String(routerPort),
+    CODEX_ROUTER_STATE_DIR: stateDir,
+    CODEX_ROUTER_SHOW_ALL_MODELS: "0",
+    MODEL_ROUTER_USER_MODELS: path.join(testRoot, "user-models.json"),
+    CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${gateway.port}/v1`,
+    CODEX_ROUTER_GATEWAY_HEALTH_URL: `http://127.0.0.1:${gateway.port}/health`,
+    CODEX_ROUTER_API_HEALTH_URL: `http://127.0.0.1:${gateway.port}/health`,
+    CODEX_ROUTER_GROK_OAUTH_HEALTH_URL: `http://127.0.0.1:${gateway.port}/health`,
+    CODEX_ROUTER_QUIET: "1",
+  });
+  try {
+    await waitFor(`${routerBase(routerPort)}/models`, router);
+    const response = await fetch(`${routerBase(routerPort)}/responses`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: muse.slug,
+        stream: false,
+        include: ["file_search_call.results", "reasoning.encrypted_content"],
+        input: [
+          { type: "message", role: "user", content: "Continue." },
+          {
+            type: "reasoning",
+            id: "rs_keep",
+            encrypted_content: "gAAAAAforeign",
+            summary: [{ type: "summary_text", text: "prior thought" }],
+          },
+          {
+            type: "reasoning",
+            id: "rs_drop",
+            encrypted_content: "gAAAAAforeign2",
+          },
+        ],
+      }),
+    });
+    assert.equal(response.status, 200, router.testErrors());
+    assert.equal(gatewayRequests.length, 1);
+    assert.equal(gatewayRequests[0].model, muse.gatewayModel);
+    assert.deepEqual(gatewayRequests[0].include, ["file_search_call.results"]);
+    assert.deepEqual(
+      gatewayRequests[0].input.filter((item) => item.type === "reasoning"),
+      [
+        {
+          type: "reasoning",
+          id: "rs_keep",
+          summary: [{ type: "summary_text", text: "prior thought" }],
+        },
+      ],
+    );
+  } finally {
+    await stopChild(router);
+    await closeServer(gateway.server);
+    rmSync(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("Go Chat, paid Zen, and other Free routes keep compatibility-sensitive wire shapes", async () => {
   const testRoot = mkdtempSync(path.join(os.tmpdir(), "routing-opencode-identity-"));
   const stateDir = path.join(testRoot, "state");
   mkdirSync(stateDir, { recursive: true });
   const specs = [
     ["opencode-go", "identity-chat"],
-    ["opencode-go-messages", "identity-messages"],
     ["opencode-zen", "identity-paid-zen"],
     ["opencode-free", "identity-other-free"],
   ].map(([provider, upstreamModel], index) => ({
@@ -12195,6 +13662,101 @@ test("Go Chat/Messages, paid Zen, and other Free routes keep compatibility-sensi
       assert.deepEqual(forwarded.input[1], customCall);
       assert.equal(forwarded.input[2].type, "custom_tool_call_output");
     }
+  } finally {
+    await stopChild(router);
+    await closeServer(gateway.server);
+    rmSync(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("OpenCode Go Messages sanitizes hosted/custom leftovers into named functions", async () => {
+  const testRoot = mkdtempSync(path.join(os.tmpdir(), "routing-opencode-messages-"));
+  const stateDir = path.join(testRoot, "state");
+  mkdirSync(stateDir, { recursive: true });
+  const spec = {
+    slug: "opencode-go-messages/identity-messages",
+    gatewayModel: "opencode-go-messages-identity-messages",
+    upstreamModel: "identity-messages",
+    provider: "opencode-go-messages",
+    listed: true,
+    displayName: "Go Messages identity fixture",
+    description: "Anthropic sanitizer fixture.",
+    priority: 449,
+    defaultEffort: "high",
+    reasoningLevels: [{ effort: "high", description: "Deep reasoning" }],
+    contextWindow: 131072,
+    autoCompact: 110000,
+    inputModalities: ["text"],
+    compHash: "opencode-go-messages-identity-messages-v1",
+  };
+  writeFileSync(path.join(testRoot, "user-models.json"), JSON.stringify({ version: 1, models: [spec] }), "utf8");
+  writeFileSync(
+    path.join(stateDir, "enabled-providers.json"),
+    `${JSON.stringify({ version: 1, providers: ["opencode-go"] })}\n`,
+  );
+  writeFileSync(path.join(stateDir, "opencode-go-api-key.secret"), "TEST_OPENCODE_KEY\n");
+
+  const gatewayRequests = [];
+  const gateway = await mockServer(async (request, response) => {
+    if (request.method === "GET") {
+      json(response, 200, { ok: true, credential_present: true });
+      return;
+    }
+    const body = await bodyJson(request);
+    gatewayRequests.push(body);
+    await writeFragmentedFunctionCallSse(response, {
+      model: body.model,
+      patch: "*** Begin Patch\n*** End Patch",
+    });
+  });
+  const routerPort = await openPort();
+  const router = run("router.mjs", {
+    CODEX_ROUTER_PORT: String(routerPort),
+    CODEX_ROUTER_STATE_DIR: stateDir,
+    MODEL_ROUTER_USER_MODELS: path.join(testRoot, "user-models.json"),
+    CODEX_HOME: path.join(testRoot, "codex"),
+    CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${gateway.port}/v1`,
+    CODEX_ROUTER_GATEWAY_HEALTH_URL: `http://127.0.0.1:${gateway.port}/health`,
+    CODEX_ROUTER_API_HEALTH_URL: `http://127.0.0.1:${gateway.port}/health`,
+    CODEX_ROUTER_GROK_OAUTH_HEALTH_URL: `http://127.0.0.1:${gateway.port}/health`,
+    CODEX_ROUTER_QUIET: "1",
+  });
+
+  try {
+    await waitFor(`${routerBase(routerPort)}/models`, router);
+    const response = await fetch(`${routerBase(routerPort)}/responses`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: spec.slug,
+        stream: true,
+        tool_choice: { type: "custom", name: "apply_patch" },
+        tools: [
+          {
+            type: "custom",
+            name: "apply_patch",
+            format: { type: "grammar", syntax: "lark", definition: "start: /.+/" },
+          },
+          {
+            type: "function",
+            name: "exec_command",
+            parameters: { type: "object", properties: { command: { type: "string" } } },
+          },
+          { type: "web_search", search_content_types: ["text", "image"] },
+        ],
+        input: "run it",
+      }),
+    });
+    assert.equal(response.status, 200, router.testErrors());
+    const forwarded = gatewayRequests.at(-1);
+    assert.equal(forwarded.model, spec.gatewayModel);
+    assert.equal(forwarded.tool_choice, "auto");
+    const forwardedNames = forwarded.tools.map((tool) => tool.name);
+    assert.ok(forwardedNames.includes("exec_command"));
+    assert.equal(forwardedNames.includes("apply_patch"), false);
+    assert.ok(forwarded.tools.every((tool) => tool.type === "function" && tool.name));
+    const execCommand = forwarded.tools.find((tool) => tool.name === "exec_command");
+    assert.deepEqual(execCommand.parameters.properties.command, { type: "string" });
   } finally {
     await stopChild(router);
     await closeServer(gateway.server);
@@ -12572,3 +14134,451 @@ test("an oversize zstd body is refused with 413 before decoding and the router s
     await closeServer(gateway.server);
   }
 });
+
+test("Command Code Gemini repairs nullable schemas after namespace and search expansion only on the affected route", async () => {
+  const captured = [];
+  const gateway = await mockServer(async (request, response) => {
+    captured.push(await bodyJson(request));
+    json(response, 200, {
+      id: "resp-gemini-schema", object: "response",
+      output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "ok" }] }],
+    });
+  });
+  const scratch = mkdtempSync(path.join(os.tmpdir(), "gemini-tool-schemas-"));
+  const routerPort = await openPort();
+  const router = run("router.mjs", {
+    CODEX_HOME: path.join(scratch, "codex"),
+    MODEL_ROUTER_STATE_DIR: path.join(scratch, "state"),
+    CODEX_ROUTER_STATE_DIR: path.join(scratch, "state"),
+    CODEX_ROUTER_PORT: String(routerPort),
+    CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${gateway.port}/v1`,
+    CODEX_ROUTER_QUIET: "1",
+  });
+  const parameters = {
+    type: "object",
+    properties: {
+      prompt: { type: "string" },
+      referenced_image_paths: { type: ["array", "null"], items: { type: "string" } },
+      num_last_images_to_include: { type: ["number", "null"] },
+    },
+    required: ["prompt"],
+  };
+  const namespace = { type: "namespace", name: "image_gen", tools: [
+    { type: "function", name: "imagegen", inputSchema: parameters },
+  ] };
+  const plain = { type: "function", name: "plain", parameters: { type: "object", properties: { value: {type: "string"} } } };
+  try {
+    await waitFor(`${routerBase(routerPort)}/models`, router);
+    for (const model of ["commandcode/gemini-3.8-flash", "commandcode/gemini-3.7-flash", "openrouter/gemini-3.8-flash"]) {
+      for (const deferred of [false, true]) {
+        const input = [{ role: "user", content: "Schema compatibility check." }];
+        if (deferred) input.push(
+          { type: "tool_search_call", call_id: "search-schema", execution: "client", arguments: {query: "imagegen"} },
+          { type: "tool_search_output", call_id: "search-schema", execution: "client", status: "completed", tools: [namespace] },
+          { role: "user", content: "Use the discovered tools." },
+        );
+        const response = await fetch(`${routerBase(routerPort)}/responses`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${CALLER_KEY}` },
+          body: JSON.stringify({ model, input, tools: deferred ? [plain, {type: "tool_search", execution: "client"}] : [plain, namespace] }),
+        });
+        assert.equal(response.status, 200, router.testErrors());
+        await response.arrayBuffer();
+        const sent = captured.at(-1).tools;
+        assert.ok(sent.some(tool => tool.name === "plain"));
+        const imagegen = sent.find(tool => tool.name === "image_gen__imagegen");
+        assert.ok(imagegen, `${model}: image tool must be retained (deferred=${deferred})`);
+        for (const field of ["parameters", "inputSchema"]) {
+          const schema = imagegen[field];
+          assert.ok(schema, `${model}: ${field} must be retained`);
+          assert.deepEqual(schema.required, ["prompt"]);
+          assert.deepEqual(schema.properties.prompt, {type: "string"});
+          if (model === "commandcode/gemini-3.8-flash") {
+            assert.deepEqual(schema.properties.referenced_image_paths, {
+              anyOf: [{ type: "array", items: { type: "string" } }, { type: "null" }],
+            });
+            assert.deepEqual(schema.properties.num_last_images_to_include, {
+              anyOf: [{ type: "number" }, { type: "null" }],
+            });
+          } else {
+            assert.deepEqual(schema, parameters, `${model} must keep its existing schema`);
+          }
+        }
+      }
+    }
+  } finally {
+    await stopChild(router);
+    await closeServer(gateway.server);
+    rmSync(scratch, {recursive: true, force: true});
+  }
+});
+
+// #755. #708 widened the reasoning-lifecycle repair from grok-oauth to every
+// `openai`-protocol provider, so Codex now stores a reasoning item for turns on
+// Chat resellers like Command Code. Most of their thinking models are outside
+// the native-reasoning contract -- `commandcode/qwen3.8-flash` resolves to
+// upstream `Qwen/Qwen3.8-Flash`, which matches no family -- and for those the
+// carry used to convert the stored reasoning into `output_text`. A model that
+// sees its own past thinking replayed as prose moves new thinking into the
+// answer channel and loops on its last progress note (the Hy4 measurements in
+// chat-reasoning.mjs: 2, 4, 5, 8, 16 copies of one sentence). A live two-turn
+// probe on 14 September 2026 confirmed this route really does store reasoning
+// items -- 89 and 69 reasoning tokens, input_tokens 81 -> 419 on the replay --
+// so the path is reached rather than theoretical. Dropping asserts nothing
+// about any vendor's reasoning_content handling, which is what the family
+// table would require evidence for.
+test("an off-contract Chat route drops past reasoning instead of replaying it as prose", async () => {
+  const gatewayBodies = [];
+  const gateway = await mockServer(async (request, response) => {
+    gatewayBodies.push(await bodyJson(request));
+    json(response, 200, { output: [{ type: "message", role: "assistant", content: "ok" }] });
+  });
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), "offcontract-reasoning-"));
+  const routerPort = await openPort();
+  const router = run("router.mjs", {
+    CODEX_ROUTER_PORT: String(routerPort),
+    CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${gateway.port}/v1`,
+    MODEL_ROUTER_STATE_DIR: stateDir,
+    CODEX_ROUTER_QUIET: "1",
+  });
+  const SECRET_THOUGHT = "I should check the config before answering.";
+  const input = [
+    { type: "message", role: "user", content: [{ type: "input_text", text: "is it configured?" }] },
+    {
+      type: "reasoning",
+      id: "rs_offcontract",
+      summary: [{ type: "summary_text", text: SECRET_THOUGHT }],
+      content: null,
+    },
+    { type: "message", role: "assistant", content: [{ type: "output_text", text: "Yes, it is." }] },
+    { type: "message", role: "user", content: [{ type: "input_text", text: "and now?" }] },
+  ];
+
+  try {
+    await waitFor(`${routerBase(routerPort)}/models`, router);
+    const response = await fetch(`${routerBase(routerPort)}/responses`, {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer CODEX_CALLER_SECRET",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ model: "commandcode/qwen3.8-flash", stream: false, input }),
+    });
+    assert.equal(response.status, 200, await response.text());
+    const forwarded = gatewayBodies[0].input;
+    const serialized = JSON.stringify(forwarded);
+
+    // The thought must not reach the model in any channel: not as visible
+    // prose, and not as a surviving reasoning item either.
+    assert.ok(
+      !serialized.includes(SECRET_THOUGHT),
+      `past reasoning reached an off-contract Chat route:\n${serialized}`,
+    );
+    assert.equal(
+      forwarded.some((item) => item?.type === "reasoning"),
+      false,
+      "an unconverted reasoning item must not be left for the Chat translation",
+    );
+
+    // Everything the model actually said is untouched -- only the thinking is
+    // dropped, and the turn structure it needs to answer survives.
+    const assistant = forwarded.filter(
+      (item) => item?.type === "message" && item.role === "assistant",
+    );
+    assert.equal(assistant.length, 1);
+    assert.match(JSON.stringify(assistant[0].content), /Yes, it is\./);
+    assert.equal(forwarded[forwarded.length - 1].role, "user");
+  } finally {
+    await stopChild(router);
+    await closeServer(gateway.server);
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+// The counterpart: a route inside the contract must keep carrying its
+// reasoning, or this fix would silently delete the history those providers
+// require back (#703's HTTP 400, and the interleaved-thinking models that
+// depend on the prior round).
+test("an in-contract Chat route still carries its reasoning as thinking", async () => {
+  const gatewayBodies = [];
+  const gateway = await mockServer(async (request, response) => {
+    gatewayBodies.push(await bodyJson(request));
+    json(response, 200, { output: [{ type: "message", role: "assistant", content: "ok" }] });
+  });
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), "incontract-reasoning-"));
+  const routerPort = await openPort();
+  const router = run("router.mjs", {
+    CODEX_ROUTER_PORT: String(routerPort),
+    CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${gateway.port}/v1`,
+    MODEL_ROUTER_STATE_DIR: stateDir,
+    CODEX_ROUTER_QUIET: "1",
+  });
+  const THOUGHT = "Hunyuan keeps its own reasoning channel.";
+
+  try {
+    await waitFor(`${routerBase(routerPort)}/models`, router);
+    const response = await fetch(`${routerBase(routerPort)}/responses`, {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer CODEX_CALLER_SECRET",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "commandcode/hy4-preview",
+        stream: false,
+        input: [
+          { type: "message", role: "user", content: [{ type: "input_text", text: "ping" }] },
+          {
+            type: "reasoning",
+            id: "rs_incontract",
+            summary: [{ type: "summary_text", text: THOUGHT }],
+            content: null,
+          },
+          { type: "message", role: "assistant", content: [{ type: "output_text", text: "pong" }] },
+          { type: "message", role: "user", content: [{ type: "input_text", text: "again" }] },
+        ],
+      }),
+    });
+    assert.equal(response.status, 200, await response.text());
+    const forwarded = gatewayBodies[0].input;
+    const assistant = forwarded.find(
+      (item) => item?.type === "message" && item.role === "assistant",
+    );
+    // Carried as a `thinking` part, which the API forwarder restores as
+    // reasoning_content -- never as output_text.
+    const thinking = assistant.content.find((part) => part?.type === "thinking");
+    assert.ok(thinking, `in-contract reasoning was not carried:\n${JSON.stringify(assistant)}`);
+    assert.match(thinking.text, /Hunyuan keeps its own reasoning channel\./);
+    assert.equal(
+      assistant.content.some(
+        (part) => part?.type === "output_text" && part.text.includes(THOUGHT),
+      ),
+      false,
+      "in-contract reasoning must not also appear as visible prose",
+    );
+  } finally {
+    await stopChild(router);
+    await closeServer(gateway.server);
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+// #840. The Chat carry is not a no-op with its flags off: on a Responses-native
+// route it rewrote reasoning before a tool call into assistant `output_text`
+// and copied reasoning before an answer into the visible message as well. A
+// thinking model then reads its own past progress note as something it said
+// and repeats it. A Responses route must receive reasoning items unchanged.
+function genericResponsesReasoningFixture() {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "routing-generic-responses-reasoning-"));
+  const providersFile = path.join(dir, "generic-providers.json");
+  const userModelsFile = path.join(dir, "user-models.json");
+  writeFileSync(providersFile, `${JSON.stringify({
+    version: 1,
+    providers: [{
+      id: "responses-gateway",
+      displayName: "Responses Gateway",
+      baseUrl: "https://responses.example.test/v1",
+      adapter: "openai-responses",
+      headers: {},
+      allowPrivate: false,
+      enabled: true,
+    }],
+  })}\n`);
+  writeFileSync(userModelsFile, `${JSON.stringify({
+    version: 1,
+    models: [{
+      slug: "responses-gateway/thinker",
+      gatewayModel: "responses-gateway-thinker",
+      compHash: "responses-gateway-thinker-user-v1",
+      upstreamModel: "thinker",
+      provider: "responses-gateway",
+      listed: true,
+      displayName: "Thinker (curated)",
+      description: "Generic Responses reasoning replay fixture.",
+      priority: 100,
+      defaultEffort: "high",
+      reasoningLevels: [{ effort: "high", description: "Adaptive reasoning" }],
+      contextWindow: 131_072,
+      autoCompact: 110_000,
+      inputModalities: ["text"],
+    }],
+  })}\n`);
+  return { dir, providersFile, userModelsFile };
+}
+
+test("generic openai-responses routes downgrade Codex agent handoffs on turns and compaction", async () => {
+  const gatewayBodies = [];
+  const gateway = await mockServer(async (request, response) => {
+    gatewayBodies.push(await bodyJson(request));
+    json(response, 200, {
+      id: "resp-generic-agent-message",
+      object: "response",
+      status: "completed",
+      output: [
+        {
+          type: "message",
+          role: "assistant",
+          content: [{ type: "output_text", text: "ok" }],
+        },
+      ],
+    });
+  });
+  const fixture = genericResponsesReasoningFixture();
+  const routerPort = await openPort();
+  const router = run("router.mjs", {
+    CODEX_ROUTER_PORT: String(routerPort),
+    CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${gateway.port}/v1`,
+    MODEL_ROUTER_STATE_DIR: fixture.dir,
+    MODEL_ROUTER_GENERIC_PROVIDERS: fixture.providersFile,
+    MODEL_ROUTER_USER_MODELS: fixture.userModelsFile,
+    CODEX_ROUTER_QUIET: "1",
+  });
+  const content = [
+    {
+      type: "input_text",
+      text: "Message Type: NEW_TASK\nTask name: /root/worker\nSender: /root\nPayload:\n",
+    },
+    {
+      type: "encrypted_content",
+      encrypted_content: "Inspect the generic Responses route.",
+    },
+  ];
+
+  try {
+    await waitFor(`${routerBase(routerPort)}/models`, router);
+    for (const endpoint of ["/responses", "/responses/compact"]) {
+      const response = await fetch(`${routerBase(routerPort)}${endpoint}`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${CALLER_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "responses-gateway/thinker",
+          stream: false,
+          input: [
+            {
+              type: "agent_message",
+              id: "amsg_generic",
+              author: "/root",
+              recipient: "/root/worker",
+              content,
+            },
+          ],
+        }),
+      });
+      assert.equal(response.status, 200, `${endpoint}: ${await response.text()}\n${router.testErrors()}`);
+    }
+
+    assert.equal(gatewayBodies.length, 2);
+    for (const [index, body] of gatewayBodies.entries()) {
+      assert.deepEqual(body.input[0], {
+        type: "message",
+        role: "user",
+        content: [
+          content[0],
+          { type: "input_text", text: "Inspect the generic Responses route." },
+        ],
+      });
+      assert.equal(
+        body.input.some((item) => item?.type === "agent_message"),
+        false,
+        index === 0 ? "ordinary turn retained agent_message" : "compaction retained agent_message",
+      );
+    }
+  } finally {
+    await stopChild(router);
+    await closeServer(gateway.server);
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+for (const [label, model, generic] of [
+  ["a generic openai-responses route", "responses-gateway/thinker", true],
+  ["a built-in openai-responses route", "meta/muse-spark-1.3", false],
+]) {
+  test(`${label} replays reasoning items unchanged, never as visible text (#840)`, async () => {
+    const gatewayBodies = [];
+    const gateway = await mockServer(async (request, response) => {
+      gatewayBodies.push(await bodyJson(request));
+      json(response, 200, {
+        id: "resp-840",
+        object: "response",
+        status: "completed",
+        output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "ok" }] }],
+      });
+    });
+    const fixture = generic ? genericResponsesReasoningFixture() : undefined;
+    const stateDir = fixture?.dir ?? mkdtempSync(path.join(os.tmpdir(), "responses-reasoning-"));
+    const routerPort = await openPort();
+    const router = run("router.mjs", {
+      CODEX_ROUTER_PORT: String(routerPort),
+      CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${gateway.port}/v1`,
+      MODEL_ROUTER_STATE_DIR: stateDir,
+      ...(fixture
+        ? {
+            MODEL_ROUTER_GENERIC_PROVIDERS: fixture.providersFile,
+            MODEL_ROUTER_USER_MODELS: fixture.userModelsFile,
+          }
+        : {}),
+      CODEX_ROUTER_QUIET: "1",
+    });
+    const reasoning = (id, text) => ({
+      type: "reasoning",
+      id,
+      summary: [{ type: "summary_text", text }],
+      content: null,
+    });
+    const TOOL_THOUGHT = "I will list the directory first.";
+    const PROSE_THOUGHT = "prior reasoning summary unavailable";
+    const SECOND_THOUGHT = "One file is present.";
+    const input = [
+      { type: "message", role: "user", content: [{ type: "input_text", text: "inspect it" }] },
+      // Reasoning, then a tool call.
+      reasoning("rs_tool", TOOL_THOUGHT),
+      { type: "function_call", call_id: "call_1", name: "shell", arguments: "{\"cmd\":\"ls\"}" },
+      { type: "function_call_output", call_id: "call_1", output: "a.txt" },
+      // Two consecutive reasoning items, then prose.
+      reasoning("rs_prose_a", PROSE_THOUGHT),
+      reasoning("rs_prose_b", SECOND_THOUGHT),
+      { type: "message", role: "assistant", content: [{ type: "output_text", text: "There is a.txt." }] },
+      { type: "message", role: "user", content: [{ type: "input_text", text: "and now?" }] },
+      // Trailing reasoning with nothing after it.
+      reasoning("rs_trailing", "Nothing follows this."),
+    ];
+
+    try {
+      await waitFor(`${routerBase(routerPort)}/models`, router);
+      const response = await fetch(`${routerBase(routerPort)}/responses`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${CALLER_KEY}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ model, stream: false, input }),
+      });
+      assert.equal(response.status, 200, `${await response.text()}\n${router.testErrors()}`);
+      const forwarded = gatewayBodies[0].input;
+
+      // Every reasoning item survives, in place, as a reasoning item.
+      assert.deepEqual(
+        forwarded.filter((item) => item?.type === "reasoning").map((item) => item.id),
+        ["rs_tool", "rs_prose_a", "rs_prose_b", "rs_trailing"],
+      );
+      assert.deepEqual(
+        forwarded.map((item) => item?.type),
+        input.map((item) => item.type),
+        "no item was inserted, merged away, or replaced",
+      );
+      // And no reasoning text leaked into a visible assistant message.
+      const visible = JSON.stringify(
+        forwarded.filter((item) => item?.type === "message" && item.role === "assistant"),
+      );
+      for (const thought of [TOOL_THOUGHT, PROSE_THOUGHT, SECOND_THOUGHT]) {
+        assert.equal(visible.includes(thought), false, `reasoning became visible text: ${visible}`);
+      }
+      assert.match(visible, /There is a\.txt\./);
+    } finally {
+      await stopChild(router);
+      await closeServer(gateway.server);
+      rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+}

@@ -1,4 +1,4 @@
-import test from "node:test";
+import test, { after } from "node:test";
 import assert from "node:assert/strict";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
@@ -16,6 +16,18 @@ const CODEX_ID = "019f7432-43d9-7413-8f18-5f964587f58e";
 const DSH_ID = "session-123e4567-e89b-42d3-a456-426614174000";
 const CURSOR_ID = "223e4567-e89b-42d3-a456-426614174000";
 const CURSOR_AGENT_ID = "323e4567-e89b-42d3-a456-426614174000";
+
+// This suite tests the checked-out Control Center. Keep mutation handlers
+// isolated from any separately installed router whose protocol may be older.
+const previousSourceRoot = process.env.CODEX_ROUTER_SOURCE_ROOT;
+process.env.CODEX_ROUTER_SOURCE_ROOT = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  "..",
+);
+after(() => {
+  if (previousSourceRoot === undefined) delete process.env.CODEX_ROUTER_SOURCE_ROOT;
+  else process.env.CODEX_ROUTER_SOURCE_ROOT = previousSourceRoot;
+});
 
 test("signed routing does not label native Codex sessions as router traffic", () => {
   assert.equal(codexSessionProvider("gpt-6-astra", "codex-router-signed"), "openai");
@@ -575,6 +587,46 @@ test("Connect Cursor resumes through install, login, quit, publish, verify, and 
     else process.env.MODEL_ROUTER_CLOUDFLARED_HOME = priorHome;
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("Disconnect Cursor waits for quit then clears the routed App endpoint", async () => {
+  const handlers = new Map();
+  const events = [];
+  const commands = [];
+  let processReads = 0;
+  let configured = true;
+  registerIpcHandlers({
+    ipcMain: { handle: (name, handler) => handlers.set(name, handler) },
+    BrowserWindow: {
+      getAllWindows: () => [{
+        isDestroyed: () => false,
+        webContents: { send: (_channel, payload) => events.push(payload) },
+      }],
+    },
+    shell: {},
+    cursorProcessReader: () => processReads++ === 0 ? [{ pid: 42 }] : [],
+    cursorWait: async () => {},
+    controlJsonRunner: async (args, options) => {
+      commands.push({ args, options });
+      configured = false;
+      return { removed: true };
+    },
+    harnessSnapshotReader: () => ({
+      harnesses: [{
+        id: "cursor",
+        appConfigured: configured,
+        agentConfigured: false,
+      }],
+    }),
+    senderGuard: () => true,
+  });
+
+  const disconnect = handlers.get("router-control:disconnectCursor");
+  assert.deepEqual(await disconnect({}, {}), { removed: true });
+  assert.deepEqual(commands[0].args, ["client-disconnect", "cursor"]);
+  assert.equal(events.some((event) => /Fully quit Cursor/.test(event.message || "")), true);
+  assert.equal(events.some((event) => /restoring Cursor's own endpoint/.test(event.message || "")), true);
+  assert.equal(events.at(-1).status, "completed");
 });
 
 test("service stop and restart are rejected at the IPC boundary", async () => {

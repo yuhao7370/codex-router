@@ -232,7 +232,7 @@ export async function classifyTaskManagerPortOwner({
   );
   if (
     routerTask?.known === true
-    && scheduledTaskDefinitionIsCanonical(routerTask, routerTaskAction({ stateDir }), { allowRouterHeartbeat: true })
+    && routerTaskIsCanonical(routerTask, { stateDir })
     && routerEntrypointMatches
   ) {
     return "embedded";
@@ -420,6 +420,15 @@ function routerTaskAction({ stateDir = STATE_DIR } = {}) {
   };
 }
 
+function routerTaskIsCanonical(task, { stateDir = STATE_DIR } = {}) {
+  const legacy = routerTaskAction({ stateDir });
+  // New upstream tasks name the VBScript engine explicitly; retain the exact
+  // old action as an upgrade source without relaxing manager task ownership.
+  return [legacy, { ...legacy, argument: `//E:VBScript ${legacy.argument}` }].some(
+    (action) => scheduledTaskDefinitionIsCanonical(task, action, { allowRouterHeartbeat: true }),
+  );
+}
+
 export async function assertRouterTaskReplaceable({
   queryTask = queryScheduledTask,
   stateDir = STATE_DIR,
@@ -428,7 +437,7 @@ export async function assertRouterTaskReplaceable({
   if (task?.known !== true) {
     throw new Error(`Task Scheduler could not identify "${ROUTER_TASK_NAME}"; refusing before snapshots.`);
   }
-  if (task.exists && !scheduledTaskDefinitionIsCanonical(task, routerTaskAction({ stateDir }), { allowRouterHeartbeat: true })) {
+  if (task.exists && !routerTaskIsCanonical(task, { stateDir })) {
     throw new Error(`Refusing to adopt or replace the noncanonical Scheduled Task "${ROUTER_TASK_NAME}".`);
   }
   return task;

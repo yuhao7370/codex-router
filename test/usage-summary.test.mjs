@@ -80,6 +80,7 @@ const events = [
 // it starts from a known-empty store.
 const stateDir = mkdtempSync(path.join(os.tmpdir(), "model-router-summary-"));
 process.env.MODEL_ROUTER_STATE_DIR = stateDir;
+process.env.CODEX_HOME = stateDir;
 const eventsPath = path.join(stateDir, "usage-events.jsonl");
 
 test.after(() => rmSync(stateDir, { recursive: true, force: true }));
@@ -116,6 +117,37 @@ test("incremental summary matches the event-level aggregators", async () => {
     snapshot.providers,
     aggregateProviderUsage(events, { days: 7, now }).providers,
   );
+});
+
+test("summary distinguishes missing cache telemetry from an explicitly measured zero", async () => {
+  for (const [cachedInputTokens, seen] of [[undefined, false], [0, true], [-1, false], ["invalid", false], [500, true]]) {
+    resetRawLog();
+    const { aggregateProviderUsage, summary } = await loadModules();
+    const event = { ...events[0], cachedInputTokens };
+    summary.recordUsageSummaryEvent(event);
+    const native = summary.usageSummarySnapshot({ range: "7d", now }).providers.find((entry) => entry.id === "openai");
+    assert.equal(native.cacheTelemetrySeen, seen, `cache telemetry ${cachedInputTokens}`);
+    const expected = aggregateProviderUsage([event], { days: 7, now }).providers.find((entry) => entry.id === "openai");
+    assert.deepEqual(native, expected);
+  }
+});
+
+test("cache telemetry presence follows the selected range and survives incremental disk reads and restart", async () => {
+  resetRawLog();
+  const old = { ...events[0], at: "2026-07-01T12:00:00Z", cachedInputTokens: 0 };
+  const recent = { ...events[0], cachedInputTokens: undefined };
+  writeFileSync(eventsPath, [old, recent].map((event) => JSON.stringify(event)).join("\n") + "\n");
+  const { summary } = await loadModules();
+  const native = (module, range) => module.usageSummarySnapshot({ range, now }).providers.find((entry) => entry.id === "openai");
+  assert.equal(native(summary, "7d").cacheTelemetrySeen, false);
+  assert.equal(native(summary, "30d").cacheTelemetrySeen, true);
+
+  const measuredZero = { ...recent, model: "second-model", cachedInputTokens: 0 };
+  appendFileSync(eventsPath, `${JSON.stringify(measuredZero)}\n`);
+  assert.equal(native(summary, "7d").cacheTelemetrySeen, true);
+  assert.equal(native(summary, "7d").requests, 2, "repeated snapshots do not replay appended rows");
+  const restarted = (await loadModules()).summary;
+  assert.deepEqual(native(restarted, "7d"), native(summary, "7d"), "raw log replay rebuilds telemetry state after restart");
 });
 
 test("summary rebuilds from the raw event log", async () => {

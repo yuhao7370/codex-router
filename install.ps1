@@ -225,7 +225,7 @@ if (-not $CheckoutInstall) {
     Write-Warning "Setup did not finish configuring; the update was kept. Re-run setup to continue, or ./codex-router.ps1 rollback to return to the previous revision."
   } elseif ($SetupExitCode -ne 0 -and $PreviousRevision) {
     & git -C $Repository switch --detach $PreviousRevision 2>$null | Out-Null
-    Write-Warning "Setup failed; the managed source checkout was restored to $PreviousRevision."
+    Write-Warning "Setup failed; the managed source checkout was restored to $PreviousRevision. Re-run this installer to retry the update from main."
   }
   exit $SetupExitCode
 }
@@ -260,6 +260,13 @@ $ConfigEnableCommand = if ($Target -eq "codex") { "enable" } else { "install" }
 $ConfigDisableCommand = if ($Target -eq "codex") { "disable" } else { "uninstall" }
 $ConfigEnabled = $false
 $ServiceInstalled = $false
+# `service.mjs install` exits 75 when the service is installed and running but
+# the router did not answer /health inside the readiness budget -- a slow cold
+# start, not a failed install. The rollback must then leave both the service
+# and the client config alone: tearing them out strands a router that comes up
+# healthy moments later and deletes the launchers the install correctly wrote,
+# which is the "installed but missing from disk" of #760.
+$ReadinessTimedOut = $false
 $AdoptionPending = $false
 # The foreign-state override below is set only for a full install, but the
 # finally runs for prepare-only and for failures that happen before that point
@@ -571,6 +578,16 @@ try {
     $TaskManagerInstalled = $true
   } else {
     & node src/service.mjs install
+    if ($LASTEXITCODE -eq 75) {
+      # Installed and running, just not healthy yet. Stop without rolling
+      # anything back: the service keeps starting and the operator re-checks
+      # rather than reinstalling. Skipping wait-health matters -- it would spend
+      # a second full budget and fail the same way on the same cold start.
+      $ReadinessTimedOut = $true
+      Write-Host "The background service is installed and still starting; the router did not answer within the health wait."
+      Write-Host "Check './codex-router.ps1 status' in a few minutes. Do not re-run the installer -- nothing was rolled back."
+      throw "The router is still starting."
+    }
     if ($LASTEXITCODE -ne 0) { throw "Background-service installation failed." }
     $ServiceInstalled = $true
   }
@@ -642,6 +659,9 @@ try {
 } catch {
   $InstallFailure = $_
   $RollbackErrors = @()
+  # A direct-service target can still be starting. Codex commits only after
+  # its independent Task Manager transaction has verified both services.
+  if ($ReadinessTimedOut) { throw }
   # Undo only what this run created. The router health wait can time out on a
   # cold-starting gateway with a large model set -- retryable, not broken -- and
   # tearing out a service and disabling a client config that were both working

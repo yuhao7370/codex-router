@@ -84,6 +84,7 @@ function providerUsageRecord(provider) {
     inputTokens: 0,
     regularInputTokens: 0,
     cachedInputTokens: 0,
+    cacheTelemetrySeen: false,
     outputTokens: 0,
     totalTokens: 0,
     last24hInputTokens: 0,
@@ -175,6 +176,7 @@ export function aggregateProviderUsage(events, { days = 90, now = Date.now() } =
     provider.regularInputTokens += regularInput;
     if (cachedInputTokens !== undefined) {
       cacheTelemetrySeen = true;
+      provider.cacheTelemetrySeen = true;
       if (at >= rolling24hCutoff) last24hCachedInputTokens += measuredCached;
       const cachedDay = dailyCachedInputTokens.get(day) || 0;
       dailyCachedInputTokens.set(day, cachedDay + measuredCached);
